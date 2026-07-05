@@ -1,0 +1,19 @@
+idf_component_register(
+    SRCS
+        "main.cpp"
+        "board_peripherals.cpp"
+        "music_screen.cpp"
+        "http_api.cpp"
+        "board_client.cpp"
+    INCLUDE_DIRS "."
+    REQUIRES
+        u8g2_st7305
+        esp_timer
+        nvs_flash
+        esp_wifi
+        esp_event
+        esp_netif
+        esp_http_server
+        driver
+        mdns
+)

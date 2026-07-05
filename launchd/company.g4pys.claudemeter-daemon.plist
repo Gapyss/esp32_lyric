@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>company.g4pys.claudemeter-daemon</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/g4pys/esp-32/daemon/claudemeter_daemon.py</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>CLAWDMETER_DEVICE_URL</key>
+    <string>http://127.0.0.1:8123</string>
+    <key>CLAWDMETER_USAGE_SOURCE</key>
+    <string>off</string>
+    <key>CLAWDMETER_NOWPLAYING_IDLE_TICK</key>
+    <string>20</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/tmp/g4pys.claudemeter-daemon.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/g4pys.claudemeter-daemon.err.log</string>
+</dict>
+</plist>

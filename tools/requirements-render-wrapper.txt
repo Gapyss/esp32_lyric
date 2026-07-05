@@ -1,0 +1,9 @@
+# Install into the interpreter the launchd plist points at (tools/.venv):
+#   /usr/bin/python3 -m venv tools/.venv
+#   tools/.venv/bin/python -m pip install -r tools/requirements-render-wrapper.txt
+# CoreText is a SEPARATE PyObjC distribution in current pyobjc; it is not bundled
+# in pyobjc-framework-Quartz, and the wrapper's `import CoreText` fails without it.
+pyobjc-core<12
+pyobjc-framework-Cocoa<12
+pyobjc-framework-CoreText<12
+pyobjc-framework-Quartz<12

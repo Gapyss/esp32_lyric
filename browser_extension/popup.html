@@ -1,0 +1,106 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      body {
+        margin: 0;
+        width: 280px;
+        font: 13px -apple-system, sans-serif;
+        background: #1b1b1b;
+        color: #eee;
+      }
+      main {
+        padding: 12px;
+      }
+      h1 {
+        font-size: 12px;
+        font-weight: 600;
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
+        opacity: 0.6;
+        margin: 0 0 10px;
+      }
+      .row {
+        display: flex;
+        gap: 6px;
+      }
+      section + section {
+        margin-top: 14px;
+        padding-top: 14px;
+        border-top: 1px solid #333;
+      }
+      label {
+        display: block;
+        margin: 8px 0 4px;
+        color: #cfcfcf;
+        font-size: 12px;
+      }
+      input {
+        box-sizing: border-box;
+        width: 100%;
+        padding: 8px;
+        border: 1px solid #3a3a3a;
+        border-radius: 6px;
+        background: #111;
+        color: inherit;
+        font: inherit;
+      }
+      input:focus {
+        outline: 2px solid #6aa9ff;
+        outline-offset: 1px;
+      }
+      button {
+        flex: 1;
+        padding: 8px 0;
+        border: 1px solid #3a3a3a;
+        border-radius: 6px;
+        background: #262626;
+        color: inherit;
+        cursor: pointer;
+      }
+      button.active {
+        background: #eee;
+        color: #1b1b1b;
+        border-color: #eee;
+      }
+      button.secondary {
+        margin-top: 10px;
+      }
+      button:disabled {
+        cursor: default;
+        opacity: 0.55;
+      }
+      #status {
+        margin-top: 8px;
+        font-size: 11px;
+        opacity: 0.6;
+        min-height: 14px;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <section>
+        <h1>Display Theme</h1>
+        <div class="row">
+          <button id="dark" type="button">Dark</button>
+          <button id="light" type="button">Light</button>
+        </div>
+      </section>
+      <section>
+        <h1>Firmware</h1>
+        <label for="firmwareIp">IP or host</label>
+        <input id="firmwareIp" type="text" inputmode="url" placeholder="192.168.1.42" spellcheck="false" />
+        <label for="firmwareMac">MAC address</label>
+        <input id="firmwareMac" type="text" inputmode="text" placeholder="AA:BB:CC:DD:EE:FF" spellcheck="false" />
+        <div class="row">
+          <button id="saveFirmware" class="secondary" type="button">Save</button>
+          <button id="testFirmware" class="secondary" type="button">Connect</button>
+        </div>
+      </section>
+      <div id="status"></div>
+    </main>
+    <script src="popup.js"></script>
+  </body>
+</html>

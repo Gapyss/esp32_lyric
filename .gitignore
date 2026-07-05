@@ -1,0 +1,23 @@
+# macOS
+.DS_Store
+
+# Secrets (use wifi_secrets.example.h as the template)
+firmware/main/wifi_secrets.h
+
+# ESP-IDF build output & regenerated files
+firmware/build/
+firmware/managed_components/
+firmware/sdkconfig
+firmware/sdkconfig.old
+firmware/dependencies.lock
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+tools/.venv/
+*.egg-info/
+.pytest_cache/
+
+# Build artifacts
+dist/

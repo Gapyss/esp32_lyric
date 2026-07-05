@@ -1,0 +1,5 @@
+build/
+managed_components/
+sdkconfig
+main/wifi_secrets.h
+components/fonts_tahoma/
