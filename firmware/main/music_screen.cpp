@@ -673,6 +673,8 @@ static void render_state_locked(u8g2_t *u8, NowPlaying *state, bool allow_promot
 
     if (!has_title) {
         title_offset = artist_offset = lyric_offset = lyric2_offset = 0;
+        u8g2_DrawBox(u8, 0, 0, width, MUSIC_DISPLAY_HEIGHT);
+        u8g2_SetDrawColor(u8, 0);
         char clock_text[16];
         char env_text[40];
         char connect_text[48];

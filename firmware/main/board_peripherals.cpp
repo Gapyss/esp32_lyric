@@ -1,6 +1,7 @@
 #include "board_peripherals.h"
 
 #include <string.h>
+#include <time.h>
 
 #include "driver/gpio.h"
 #include "driver/i2c.h"
@@ -19,6 +20,23 @@ static const uint8_t SHTC3_ADDR = 0x70;
 static uint8_t bcd_to_int(uint8_t value)
 {
     return (uint8_t)(((value >> 4) * 10) + (value & 0x0F));
+}
+
+static void read_system_time(BoardIdleMetrics *metrics)
+{
+    time_t now = 0;
+    time(&now);
+    if (now < 1700000000) {
+        return;
+    }
+
+    struct tm local = {};
+    if (localtime_r(&now, &local) == NULL) {
+        return;
+    }
+    metrics->hour = local.tm_hour;
+    metrics->minute = local.tm_min;
+    metrics->time_valid = metrics->hour < 24 && metrics->minute < 60;
 }
 
 static uint8_t crc8_shtc3(const uint8_t *data, size_t len)
@@ -111,5 +129,8 @@ void board_peripherals_read(BoardIdleMetrics *metrics)
     }
     memset(metrics, 0, sizeof(*metrics));
     read_rtc(metrics);
+    if (!metrics->time_valid) {
+        read_system_time(metrics);
+    }
     read_shtc3(metrics);
 }

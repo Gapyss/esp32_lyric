@@ -1179,7 +1179,7 @@ class LyricsDisplayDaemon:
         self.renderer = renderer
         self.board_token = board_token
         self.state = AppState()
-        self.theme = "dark"
+        self.theme = "light"
         self.state_lock = asyncio.Lock()
         self.boards: set[WebSocketConnection] = set()
         self.last_frame: bytes | None = None
@@ -1308,6 +1308,9 @@ class LyricsDisplayDaemon:
         frame = self.renderer.render(state)
         return invert_frame(frame) if self.theme == "light" else frame
 
+    def _has_current_track_locked(self) -> bool:
+        return bool(self.state.track.title)
+
     async def set_theme(self, theme: str) -> None:
         theme = theme.strip().lower()
         if theme not in ("dark", "light") or theme == self.theme:
@@ -1354,32 +1357,52 @@ class LyricsDisplayDaemon:
             if self.scheduled_task is not None:
                 self.scheduled_task.cancel()
                 self.scheduled_task = None
-            frame = self._render(self.state)
-            self.state.dirty = False
-            plan = self._next_scheduled_frame_locked()
+            if not self._has_current_track_locked():
+                self.state.dirty = False
+                plan = None
+                frame = None
+            else:
+                frame = self._render(self.state)
+                self.state.dirty = False
+                plan = self._next_scheduled_frame_locked()
+        if frame is None:
+            self.last_frame = None
+            await self.broadcast_clear()
+            return
         self.last_frame = frame
         await self.broadcast_frame(frame, now=True, swap_in_ms=0)
         await self.arm_scheduled_frame(plan, generation)
 
-    async def broadcast_frame(self, frame: bytes, now: bool, swap_in_ms: int) -> None:
+    async def broadcast_clear(self) -> None:
         dead: list[WebSocketConnection] = []
-        # Snapshot: send_frame awaits, during which a board may connect/disconnect
-        # and mutate self.boards, which would raise "Set changed size during iteration".
         for board in list(self.boards):
             try:
-                await self.send_frame(board, frame, now=now, swap_in_ms=swap_in_ms)
+                await self.send_clear(board)
             except OSError:
                 dead.append(board)
         for board in dead:
             self.boards.discard(board)
 
+    async def send_clear(self, conn: WebSocketConnection) -> None:
+        await conn.send_text({"type": "clear"})
+        conn.board_frame_base = None
+
     async def send_current_frame(self, conn: WebSocketConnection, now: bool) -> None:
-        if self.last_frame is None:
-            async with self.state_lock:
-                self.last_frame = self._render(self.state)
-        await self.send_frame(conn, self.last_frame, now=now, swap_in_ms=0)
         async with self.state_lock:
-            plan = self._next_scheduled_frame_locked()
+            has_track = self._has_current_track_locked()
+            if not has_track:
+                self.last_frame = None
+                plan = None
+            elif self.last_frame is None:
+                self.last_frame = self._render(self.state)
+                plan = self._next_scheduled_frame_locked()
+            else:
+                plan = self._next_scheduled_frame_locked()
+            frame = self.last_frame
+        if not has_track or frame is None:
+            await self.send_clear(conn)
+            return
+        await self.send_frame(conn, frame, now=now, swap_in_ms=0)
         if plan is not None:
             await self.send_frame(conn, plan.frame, now=False, swap_in_ms=plan.swap_in_ms)
 
@@ -1430,6 +1453,18 @@ class LyricsDisplayDaemon:
             swap_in_ms=remaining_ms,
             due_monotonic_ms=monotonic_ms() + remaining_ms,
         )
+
+    async def broadcast_frame(self, frame: bytes, now: bool, swap_in_ms: int) -> None:
+        dead: list[WebSocketConnection] = []
+        # Snapshot: send_frame awaits, during which a board may connect/disconnect
+        # and mutate self.boards, which would raise "Set changed size during iteration".
+        for board in list(self.boards):
+            try:
+                await self.send_frame(board, frame, now=now, swap_in_ms=swap_in_ms)
+            except OSError:
+                dead.append(board)
+        for board in dead:
+            self.boards.discard(board)
 
     async def arm_scheduled_frame(self, plan: ScheduledFrame | None, generation: int) -> None:
         if plan is None:

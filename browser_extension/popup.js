@@ -139,7 +139,7 @@
   });
 
   chrome.storage.local.get(["theme", "firmwareIp", "firmwareMac"], (result) => {
-    render(result.theme || "dark");
+    render(result.theme || "light");
     firmwareIpInput.value = result.firmwareIp || "";
     firmwareMacInput.value = result.firmwareMac || "";
   });

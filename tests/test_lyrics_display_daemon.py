@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import tempfile
 import threading
 import unittest
@@ -432,19 +433,20 @@ class ThemeTests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as tmpdir:
                 store = LyricsStore(Path(tmpdir) / "lyrics.sqlite3")
                 daemon = LyricsDisplayDaemon(store, FallbackFrameRenderer())
+                daemon.state.track = TrackInfo(video_id="video-1", title="Song", artist="Artist", duration_sec=120)
 
                 await daemon.handle_extension_message('{"type":"tick","payload":{"positionSec":1}}')
-                dark_frame = daemon.last_frame
-                await daemon.handle_extension_message(
-                    '{"type":"set-theme","payload":{"theme":"light"}}'
-                )
                 light_frame = daemon.last_frame
+                await daemon.handle_extension_message(
+                    '{"type":"set-theme","payload":{"theme":"dark"}}'
+                )
+                dark_frame = daemon.last_frame
 
                 return dark_frame, light_frame, daemon.theme
 
         dark_frame, light_frame, theme = asyncio.run(run())
 
-        self.assertEqual(theme, "light")
+        self.assertEqual(theme, "dark")
         self.assertEqual(light_frame, invert_frame(dark_frame))
 
     def test_unknown_theme_value_is_ignored(self) -> None:
@@ -457,7 +459,7 @@ class ThemeTests(unittest.TestCase):
                 )
                 return daemon.theme
 
-        self.assertEqual(asyncio.run(run()), "dark")
+        self.assertEqual(asyncio.run(run()), "light")
 
 
 class LyricLayoutTests(unittest.TestCase):
@@ -592,6 +594,37 @@ class WebSocketConnectionTests(unittest.TestCase):
         self.assertEqual(envelope["magic"], lyrics_display_daemon.FRAME_ENVELOPE_MAGIC)
         self.assertEqual(envelope["kind"], lyrics_display_daemon.FRAME_KIND_FULL_NOW)
         self.assertEqual(envelope["payload_len"], lyrics_display_daemon.FRAME_BYTES)
+
+    def test_initial_board_sync_without_track_clears_to_firmware_idle_screen(self) -> None:
+        async def run() -> tuple[list[tuple[int, bytes]], bytes | None]:
+            conn = WebSocketConnection(asyncio.StreamReader(), FakeWriter())  # type: ignore[arg-type]
+            conn.board_frame_base = b"stale"
+            with tempfile.TemporaryDirectory() as tmpdir:
+                daemon = LyricsDisplayDaemon(LyricsStore(Path(tmpdir) / "lyrics.sqlite3"), FallbackFrameRenderer())
+                await daemon.send_current_frame(conn, now=True)
+                return server_frame_payloads(b"".join(conn.writer.writes)), conn.board_frame_base
+
+        frames, board_base = asyncio.run(run())
+
+        self.assertEqual([(opcode, json.loads(payload.decode("utf-8"))) for opcode, payload in frames], [(1, {"type": "clear"})])
+        self.assertIsNone(board_base)
+
+    def test_no_track_broadcast_clears_existing_board_framebuffer(self) -> None:
+        async def run() -> tuple[list[tuple[int, bytes]], bytes | None, bytes | None]:
+            conn = WebSocketConnection(asyncio.StreamReader(), FakeWriter())  # type: ignore[arg-type]
+            conn.board_frame_base = b"stale"
+            with tempfile.TemporaryDirectory() as tmpdir:
+                daemon = LyricsDisplayDaemon(LyricsStore(Path(tmpdir) / "lyrics.sqlite3"), FallbackFrameRenderer())
+                daemon.boards.add(conn)
+                daemon.last_frame = b"previous"
+                await daemon.render_and_broadcast()
+                return server_frame_payloads(b"".join(conn.writer.writes)), conn.board_frame_base, daemon.last_frame
+
+        frames, board_base, last_frame = asyncio.run(run())
+
+        self.assertEqual([(opcode, json.loads(payload.decode("utf-8"))) for opcode, payload in frames], [(1, {"type": "clear"})])
+        self.assertIsNone(board_base)
+        self.assertIsNone(last_frame)
 
     def test_board_handshake_auth_accepts_query_token(self) -> None:
         async def run() -> tuple[bool, bool, bool]:

@@ -1,9 +1,12 @@
 #include <string.h>
+#include <stdlib.h>
+#include <time.h>
 
 #include "esp_err.h"
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_netif.h"
+#include "esp_netif_sntp.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
 #include "board_peripherals.h"
@@ -91,6 +94,38 @@ static void mdns_start(void)
     ESP_LOGI(TAG, "mDNS hostname set: g4pys-company.local");
 }
 
+static void time_sync_start(void)
+{
+    setenv("TZ", "ICT-7", 1);
+    tzset();
+
+    esp_sntp_config_t config = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
+    esp_err_t err = esp_netif_sntp_init(&config);
+    if (err == ESP_ERR_INVALID_STATE) {
+        ESP_LOGW(TAG, "SNTP already initialized");
+        return;
+    }
+    ESP_ERROR_CHECK(err);
+
+    err = esp_netif_sntp_sync_wait(pdMS_TO_TICKS(10000));
+    if (err == ESP_OK) {
+        time_t now = 0;
+        time(&now);
+        struct tm local = {};
+        localtime_r(&now, &local);
+        ESP_LOGI(TAG,
+                 "SNTP time synced: %04d-%02d-%02d %02d:%02d:%02d",
+                 local.tm_year + 1900,
+                 local.tm_mon + 1,
+                 local.tm_mday,
+                 local.tm_hour,
+                 local.tm_min,
+                 local.tm_sec);
+    } else {
+        ESP_LOGW(TAG, "SNTP sync not ready yet: %s", esp_err_to_name(err));
+    }
+}
+
 static void display_start(void)
 {
     u8g2_st7305_config_t cfg = u8g2_st7305_default_config();
@@ -163,6 +198,7 @@ extern "C" void app_main(void)
     ESP_ERROR_CHECK(task_ok == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
 
     wifi_start();
+    time_sync_start();
     mdns_start();
     ESP_ERROR_CHECK(http_api_start());
     ESP_ERROR_CHECK(board_client_start());
