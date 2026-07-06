@@ -22,6 +22,7 @@
 #include "mdns.h"
 #include "music_screen.h"
 #include "nvs_flash.h"
+#include "pomodoro_screen.h"
 #include "stats_screen.h"
 #include "u8g2_st7305.h"
 #include "ui_error.h"
@@ -33,7 +34,9 @@ static const int WIFI_CONNECTED_BIT = BIT0;
 static EventGroupHandle_t g_wifi_events;
 static u8g2_st7305_t g_lcd;
 static const gpio_num_t MODE_BUTTON_GPIO = GPIO_NUM_0;
-static const gpio_num_t LOG_DRINK_BUTTON_GPIO = GPIO_NUM_18;
+static const gpio_num_t ACTION_BUTTON_GPIO = GPIO_NUM_18;
+static const int64_t ACTION_BUTTON_DEBOUNCE_US = 350000LL;
+static const int64_t ACTION_BUTTON_LONG_PRESS_US = 800000LL;
 
 static void wifi_event_handler(void *arg,
                                esp_event_base_t event_base,
@@ -162,34 +165,64 @@ static void mode_button_poll(void)
         const AppMode mode = app_mode_toggle();
         last_toggle_us = now_us;
         ESP_LOGI(TAG, "BOOT button toggled mode to %s", app_mode_name(mode));
-        if (mode != APP_MODE_WATER) {
+        if (mode != APP_MODE_WATER && mode != APP_MODE_POMODORO) {
             audio_chime_stop();
         }
     }
     last_level = level;
 }
 
-static void log_drink_button_init(void)
+static void action_button_init(void)
 {
     gpio_config_t cfg = {};
     cfg.intr_type = GPIO_INTR_DISABLE;
     cfg.mode = GPIO_MODE_INPUT;
-    cfg.pin_bit_mask = 1ULL << LOG_DRINK_BUTTON_GPIO;
+    cfg.pin_bit_mask = 1ULL << ACTION_BUTTON_GPIO;
     cfg.pull_down_en = GPIO_PULLDOWN_DISABLE;
     cfg.pull_up_en = GPIO_PULLUP_ENABLE;
     ESP_ERROR_CHECK_WITHOUT_ABORT(gpio_config(&cfg));
 }
 
-static void log_drink_button_poll(void)
+// Meaning depends on the active screen: on Water, a short press logs a
+// drink (no long-press action there). On Pomodoro, short press toggles
+// start/pause and long press resets. Long-press must fire on release for a
+// held-and-released press (short action), but fires immediately once the
+// hold crosses the threshold for a long press -- otherwise a long-press
+// would always trigger the short-press action first.
+static void action_button_poll(void)
 {
     static int last_level = 1;
-    static int64_t last_press_us = 0;
-    const int level = gpio_get_level(LOG_DRINK_BUTTON_GPIO);
+    static int64_t press_started_us = 0;
+    static bool long_press_fired = false;
+    static int64_t last_action_us = 0;
+
+    const int level = gpio_get_level(ACTION_BUTTON_GPIO);
     const int64_t now_us = esp_timer_get_time();
-    if (last_level == 1 && level == 0 && now_us - last_press_us > 350000LL) {
-        water_log_drink();
-        last_press_us = now_us;
-        ESP_LOGI(TAG, "drink logged via button");
+    const AppMode mode = app_mode_get();
+
+    if (last_level == 1 && level == 0) {
+        press_started_us = now_us;
+        long_press_fired = false;
+    } else if (last_level == 0 && level == 0 && !long_press_fired &&
+               now_us - press_started_us > ACTION_BUTTON_LONG_PRESS_US) {
+        long_press_fired = true;
+        last_action_us = now_us;
+        if (mode == APP_MODE_POMODORO) {
+            pomodoro_reset();
+            ESP_LOGI(TAG, "pomodoro reset via long-press");
+        }
+    } else if (last_level == 0 && level == 1) {
+        if (!long_press_fired && now_us - last_action_us > ACTION_BUTTON_DEBOUNCE_US) {
+            if (mode == APP_MODE_WATER) {
+                water_log_drink();
+                ESP_LOGI(TAG, "drink logged via button");
+            } else if (mode == APP_MODE_POMODORO) {
+                pomodoro_toggle_start_pause();
+                ESP_LOGI(TAG, "pomodoro start/pause toggled via button");
+            }
+            last_action_us = now_us;
+        }
+        long_press_fired = false;
     }
     last_level = level;
 }
@@ -237,13 +270,19 @@ static void render_task(void *arg)
             last_metrics_us = now_us;
         }
         mode_button_poll();
-        log_drink_button_poll();
+        action_button_poll();
+        // Ticks unconditionally, unlike water_tick, so a countdown started on
+        // this screen keeps advancing (and can still alert) while another
+        // screen is displayed.
+        pomodoro_tick();
         u8g2_ClearBuffer(u8);
         if (mode == APP_MODE_WATER) {
             water_tick();
             water_render_current(u8);
         } else if (mode == APP_MODE_STATS) {
             stats_render_current(u8);
+        } else if (mode == APP_MODE_POMODORO) {
+            pomodoro_render_current(u8);
         } else {
             music_render_current(u8, true);
         }
@@ -268,10 +307,11 @@ extern "C" void app_main(void)
     music_screen_init();
     water_screen_init();
     stats_screen_init();
+    pomodoro_screen_init();
     display_start();
     ESP_ERROR_CHECK(board_peripherals_start());
     mode_button_init();
-    log_drink_button_init();
+    action_button_init();
     esp_err_t audio_err = audio_chime_init();
     if (audio_err != ESP_OK) {
         ESP_LOGW(TAG, "Audio chime unavailable at boot: %s", esp_err_to_name(audio_err));

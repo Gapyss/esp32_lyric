@@ -7,6 +7,7 @@ idf_component_register(
         "music_screen.cpp"
         "water_screen.cpp"
         "stats_screen.cpp"
+        "pomodoro_screen.cpp"
         "http_api.cpp"
         "board_client.cpp"
         "ui_error.cpp"
