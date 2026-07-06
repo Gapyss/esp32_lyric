@@ -1,10 +1,15 @@
 idf_component_register(
     SRCS
         "main.cpp"
+        "app_mode.cpp"
+        "audio_chime.cpp"
         "board_peripherals.cpp"
         "music_screen.cpp"
+        "water_screen.cpp"
+        "stats_screen.cpp"
         "http_api.cpp"
         "board_client.cpp"
+        "ui_error.cpp"
     INCLUDE_DIRS "."
     REQUIRES
         u8g2_st7305
@@ -15,5 +20,6 @@ idf_component_register(
         esp_netif
         esp_http_server
         driver
+        esp_adc
         mdns
 )

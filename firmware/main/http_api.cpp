@@ -8,8 +8,10 @@
 #include "esp_http_server.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "app_mode.h"
 #include "display_config.h"
 #include "music_screen.h"
+#include "water_screen.h"
 
 static const char *TAG = "http_api";
 static httpd_handle_t g_server;
@@ -73,6 +75,38 @@ static int query_int(const char *query, const char *key, int default_value)
         return default_value;
     }
     return atoi(value);
+}
+
+static bool parse_hhmm(const char *value, int *minutes)
+{
+    int hour = -1;
+    int minute = -1;
+    if (value == NULL || sscanf(value, "%d:%d", &hour, &minute) != 2) {
+        return false;
+    }
+    if (hour < 0 || hour > 23 || minute < 0 || minute > 59) {
+        return false;
+    }
+    *minutes = hour * 60 + minute;
+    return true;
+}
+
+static esp_err_t read_query(httpd_req_t *req, char **query_out)
+{
+    const size_t query_len = httpd_req_get_url_query_len(req);
+    char *query = (char *)calloc(query_len + 1, 1);
+    if (query == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    if (query_len > 0) {
+        const esp_err_t err = httpd_req_get_url_query_str(req, query, query_len + 1);
+        if (err != ESP_OK) {
+            free(query);
+            return err;
+        }
+    }
+    *query_out = query;
+    return ESP_OK;
 }
 
 static void frame_set_pixel(uint8_t *frame, int x, int y)
@@ -378,6 +412,140 @@ static esp_err_t usage_handler(httpd_req_t *req)
     return httpd_resp_sendstr(req, body);
 }
 
+static esp_err_t mode_handler(httpd_req_t *req)
+{
+    char *query = NULL;
+    esp_err_t err = read_query(req, &query);
+    if (err == ESP_ERR_NO_MEM) {
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "out of memory");
+    }
+    if (err != ESP_OK) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad query");
+    }
+
+    char mode[16] = {};
+    if (query_arg(query, "set", mode, sizeof(mode))) {
+        if (strcmp(mode, "water") == 0) {
+            app_mode_set(APP_MODE_WATER);
+        } else if (strcmp(mode, "music") == 0) {
+            app_mode_set(APP_MODE_MUSIC);
+        } else if (strcmp(mode, "stats") == 0) {
+            app_mode_set(APP_MODE_STATS);
+        } else {
+            free(query);
+            return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "mode must be water, music, or stats");
+        }
+    }
+    free(query);
+    httpd_resp_set_type(req, "text/plain");
+    return httpd_resp_sendstr(req, app_mode_name(app_mode_get()));
+}
+
+static esp_err_t hydrate_now_handler(httpd_req_t *req)
+{
+    app_mode_set(APP_MODE_WATER);
+    water_fire_now();
+    httpd_resp_set_type(req, "text/plain");
+    return httpd_resp_sendstr(req, "ok");
+}
+
+static esp_err_t hydrate_log_handler(httpd_req_t *req)
+{
+    app_mode_set(APP_MODE_WATER);
+    water_log_drink();
+    httpd_resp_set_type(req, "text/plain");
+    return httpd_resp_sendstr(req, "ok");
+}
+
+static esp_err_t hydrate_snooze_handler(httpd_req_t *req)
+{
+    char *query = NULL;
+    esp_err_t err = read_query(req, &query);
+    if (err == ESP_ERR_NO_MEM) {
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "out of memory");
+    }
+    if (err != ESP_OK) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad query");
+    }
+    const int minutes = query_int(query, "min", 10);
+    free(query);
+    if (minutes <= 0) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "min must be positive");
+    }
+    app_mode_set(APP_MODE_WATER);
+    water_snooze(minutes);
+    httpd_resp_set_type(req, "text/plain");
+    return httpd_resp_sendstr(req, "ok");
+}
+
+static esp_err_t hydrate_config_handler(httpd_req_t *req)
+{
+    char *query = NULL;
+    esp_err_t err = read_query(req, &query);
+    if (err == ESP_ERR_NO_MEM) {
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "out of memory");
+    }
+    if (err != ESP_OK) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad query");
+    }
+
+    WaterSnapshot current;
+    water_get_snapshot(&current);
+    int interval = query_int(query, "interval", current.interval_min);
+    int start = current.active_start_min;
+    int end = current.active_end_min;
+    char value[16] = {};
+    if (query_arg(query, "start", value, sizeof(value)) && !parse_hhmm(value, &start)) {
+        free(query);
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "start must be HH:MM");
+    }
+    if (query_arg(query, "end", value, sizeof(value)) && !parse_hhmm(value, &end)) {
+        free(query);
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "end must be HH:MM");
+    }
+    free(query);
+
+    err = water_configure(interval, start, end);
+    if (err != ESP_OK) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad hydration config");
+    }
+    app_mode_set(APP_MODE_WATER);
+    httpd_resp_set_type(req, "text/plain");
+    return httpd_resp_sendstr(req, "ok");
+}
+
+static esp_err_t hydrate_json_handler(httpd_req_t *req)
+{
+    WaterSnapshot snapshot;
+    water_get_snapshot(&snapshot);
+    char clock[8];
+    if (snapshot.clock_valid) {
+        snprintf(clock, sizeof(clock), "%02d:%02d", snapshot.hour, snapshot.minute);
+    } else {
+        snprintf(clock, sizeof(clock), "--:--");
+    }
+    char body[384];
+    snprintf(body,
+             sizeof(body),
+             "{\"mode\":\"water\",\"clock\":\"%s\",\"next_in_min\":%d,\"next_in_sec\":%d,"
+             "\"interval\":%d,\"start\":\"%02d:%02d\",\"end\":\"%02d:%02d\","
+             "\"alerting\":%s,\"audio_available\":%s,\"audio_playing\":%s,\"drinks_today\":%d}",
+             clock,
+             (snapshot.next_in_sec + 59) / 60,
+             snapshot.next_in_sec,
+             snapshot.interval_min,
+             snapshot.active_start_min / 60,
+             snapshot.active_start_min % 60,
+             snapshot.active_end_min / 60,
+             snapshot.active_end_min % 60,
+             snapshot.alerting ? "true" : "false",
+             snapshot.audio_available ? "true" : "false",
+             snapshot.audio_playing ? "true" : "false",
+             snapshot.drinks_today);
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_sendstr(req, body);
+}
+
 static esp_err_t diag_display_handler(httpd_req_t *req)
 {
     const size_t query_len = httpd_req_get_url_query_len(req);
@@ -416,6 +584,7 @@ esp_err_t http_api_start(void)
     }
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.max_uri_handlers = 16;
 
     esp_err_t err = httpd_start(&g_server, &config);
     if (err != ESP_OK) {
@@ -439,6 +608,58 @@ esp_err_t http_api_start(void)
         .user_ctx = NULL,
     };
 
+    httpd_uri_t mode_get = {
+        .uri = "/mode",
+        .method = HTTP_GET,
+        .handler = mode_handler,
+        .user_ctx = NULL,
+    };
+    httpd_uri_t mode_post = mode_get;
+    mode_post.method = HTTP_POST;
+
+    httpd_uri_t hydrate_now_get = {
+        .uri = "/hydrate/now",
+        .method = HTTP_GET,
+        .handler = hydrate_now_handler,
+        .user_ctx = NULL,
+    };
+    httpd_uri_t hydrate_now_post = hydrate_now_get;
+    hydrate_now_post.method = HTTP_POST;
+
+    httpd_uri_t hydrate_log_get = {
+        .uri = "/hydrate/log",
+        .method = HTTP_GET,
+        .handler = hydrate_log_handler,
+        .user_ctx = NULL,
+    };
+    httpd_uri_t hydrate_log_post = hydrate_log_get;
+    hydrate_log_post.method = HTTP_POST;
+
+    httpd_uri_t hydrate_snooze_get = {
+        .uri = "/hydrate/snooze",
+        .method = HTTP_GET,
+        .handler = hydrate_snooze_handler,
+        .user_ctx = NULL,
+    };
+    httpd_uri_t hydrate_snooze_post = hydrate_snooze_get;
+    hydrate_snooze_post.method = HTTP_POST;
+
+    httpd_uri_t hydrate_config_get = {
+        .uri = "/hydrate/config",
+        .method = HTTP_GET,
+        .handler = hydrate_config_handler,
+        .user_ctx = NULL,
+    };
+    httpd_uri_t hydrate_config_post = hydrate_config_get;
+    hydrate_config_post.method = HTTP_POST;
+
+    httpd_uri_t hydrate_json = {
+        .uri = "/hydrate.json",
+        .method = HTTP_GET,
+        .handler = hydrate_json_handler,
+        .user_ctx = NULL,
+    };
+
     httpd_uri_t diag_display = {
         .uri = "/diag/display",
         .method = HTTP_GET,
@@ -449,6 +670,17 @@ esp_err_t http_api_start(void)
     ESP_ERROR_CHECK(httpd_register_uri_handler(g_server, &nowplaying_get));
     ESP_ERROR_CHECK(httpd_register_uri_handler(g_server, &nowplaying_post));
     ESP_ERROR_CHECK(httpd_register_uri_handler(g_server, &usage));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(g_server, &mode_get));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(g_server, &mode_post));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(g_server, &hydrate_now_get));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(g_server, &hydrate_now_post));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(g_server, &hydrate_log_get));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(g_server, &hydrate_log_post));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(g_server, &hydrate_snooze_get));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(g_server, &hydrate_snooze_post));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(g_server, &hydrate_config_get));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(g_server, &hydrate_config_post));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(g_server, &hydrate_json));
     ESP_ERROR_CHECK(httpd_register_uri_handler(g_server, &diag_display));
 
     ESP_LOGI(TAG, "HTTP API listening on port %d", config.server_port);

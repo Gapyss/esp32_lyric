@@ -202,6 +202,31 @@ class LyricsStoreTests(unittest.TestCase):
         self.assertIsNotNone(cached)
         self.assertEqual(cached.plain, ["fetched"])
 
+    def test_read_timeout_during_resolution_surfaces_error_state(self) -> None:
+        async def run_resolution(store: LyricsStore, track: TrackInfo) -> LyricsDisplayDaemon:
+            daemon = LyricsDisplayDaemon(store, FallbackFrameRenderer())
+            daemon.state.track = track
+            daemon.state.resolving_key = track.key
+            await daemon.resolve_track(track)
+            return daemon
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = LyricsStore(Path(tmpdir) / "lyrics.sqlite3")
+            track = TrackInfo(video_id="video-1", title="Song", artist="Artist")
+            original_fetch = lyrics_display_daemon.fetch_lrclib
+
+            def raise_timeout(_track: TrackInfo) -> Lyrics:
+                raise TimeoutError("timed out")
+
+            lyrics_display_daemon.fetch_lrclib = raise_timeout
+            try:
+                daemon = asyncio.run(run_resolution(store, track))
+            finally:
+                lyrics_display_daemon.fetch_lrclib = original_fetch
+
+        self.assertEqual(daemon.state.lyrics.error, "Lyrics fetch timed out")
+        self.assertEqual(daemon.state.current_lines(), ("Lyrics fetch timed out", "", ""))
+
     def test_negative_cache_row_is_resolved_without_lines(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             store = LyricsStore(Path(tmpdir) / "lyrics.sqlite3")
@@ -329,7 +354,16 @@ class AppStateTests(unittest.TestCase):
             resolving_key="video-1",
         )
 
-        self.assertEqual(state.current_lines(), ("Resolving lyrics...", "", ""))
+        self.assertEqual(state.current_lines(), ("Loading lyrics...", "", ""))
+
+    def test_fetch_error_is_shown_over_loading_state(self) -> None:
+        state = AppState(
+            track=TrackInfo(video_id="video-1", title="Song", artist="Artist"),
+            lyrics=Lyrics(resolved=True, error="Lyrics fetch timed out"),
+            resolving_key="",
+        )
+
+        self.assertEqual(state.current_lines(), ("Lyrics fetch timed out", "", ""))
 
     def test_enhanced_lrc_syllables_drive_highlight_fraction(self) -> None:
         synced, syllables = parse_lrc_with_syllables("[00:10.00]<00:10.00>hel <00:10.50>lo\n[00:12.00]next")

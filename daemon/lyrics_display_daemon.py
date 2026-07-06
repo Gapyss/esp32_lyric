@@ -72,13 +72,16 @@ LYRIC_SINGLE_HIGHLIGHT_Y = 198
 LYRIC_HIGHLIGHT_GAP_Y = LYRIC_SINGLE_HIGHLIGHT_Y - LYRIC_SINGLE_BASELINE_Y
 
 # Brand type from the "Tend" design system (claude.ai/design project 019e2c0f-...):
-# Roboto Condensed for hero/display text, Roboto Medium for body, Roboto SemiBold
+# Roboto Condensed Bold for hero/display text (title + the active lyric line,
+# matching the design system's "Now Playing" card), Roboto Medium for the
+# artist line, Roboto Regular for lower-emphasis body copy, Roboto SemiBold
 # for tracked-uppercase labels. JetBrains Mono (the brand's numeral face) isn't
 # vendored here, so Menlo stands in for tabular time/caption text.
 BRAND_FONTS_DIR = Path(__file__).resolve().parent / "assets" / "fonts"
 BRAND_FONT_FILES = {
-    "display": "Roboto_Condensed-Regular.ttf",
+    "display": "Roboto_Condensed-Bold.ttf",
     "body": "Roboto-Regular.ttf",
+    "body_medium": "Roboto-Medium.ttf",
     "label": "Roboto-SemiBold.ttf",
 }
 MONO_FONT_NAME = "Menlo"
@@ -140,6 +143,7 @@ class Lyrics:
     plain: list[str] = field(default_factory=list)
     instrumental: bool = False
     resolved: bool = False
+    error: str = ""
 
 
 @dataclass
@@ -175,8 +179,10 @@ class AppState:
             return tuple((lines + ["", "", ""])[:3])  # type: ignore[return-value]
         if self.lyrics.plain:
             return (self.lyrics.plain[0], self.lyrics.plain[1] if len(self.lyrics.plain) > 1 else "", "")
+        if self.lyrics.error:
+            return (self.lyrics.error, "", "")
         if self.resolving_key == self.track.key and not self.lyrics.resolved:
-            return ("Resolving lyrics...", "", "")
+            return ("Loading lyrics...", "", "")
         return ("", "", "")
 
     def current_line_highlight_fraction(self) -> float:
@@ -711,6 +717,14 @@ def lyrics_from_lrclib_payload(payload: dict[str, Any] | None) -> Lyrics:
     return Lyrics(synced=synced, syllables=syllables, plain=plain, resolved=True)
 
 
+def _is_timeout_error(exc: BaseException) -> bool:
+    if isinstance(exc, (socket.timeout, TimeoutError)):
+        return True
+    if isinstance(exc, urllib.error.URLError):
+        return _is_timeout_error(exc.reason) if isinstance(exc.reason, BaseException) else False
+    return False
+
+
 def lrclib_request(path: str, params: dict[str, Any]) -> Any:
     url = "https://lrclib.net" + path + "?" + urllib.parse.urlencode(
         {k: v for k, v in params.items() if v not in ("", None, 0)}
@@ -819,13 +833,14 @@ class CoreTextFrameRenderer(FrameRenderer):
         label_font = self._role_font("label")
         display_font = self._role_font("display")
         body_font = self._role_font("body")
+        body_medium_font = self._role_font("body_medium")
 
         self._draw_text(
             ctx, "NOW PLAYING", 13, 14, 18, DISPLAY_WIDTH - 28, "left", font_name=label_font, tracking=TRACKING_MEGA
         )
         self._draw_rule(ctx, 12, 28, DISPLAY_WIDTH - 24)
         self._draw_text(ctx, state.track.title or "Not Playing", 28, 14, 60, DISPLAY_WIDTH - 28, "left", font_name=display_font)
-        self._draw_text(ctx, state.track.artist, 18, 14, 88, DISPLAY_WIDTH - 28, "left", font_name=body_font)
+        self._draw_text(ctx, state.track.artist, 18, 14, 88, DISPLAY_WIDTH - 28, "left", font_name=body_medium_font)
         self._draw_progress(ctx, state, MONO_FONT_NAME)
         self._draw_rule(ctx, 12, 130, DISPLAY_WIDTH - 24)
 
@@ -966,6 +981,25 @@ class CoreTextFrameRenderer(FrameRenderer):
         y = DISPLAY_HEIGHT - y_top_origin
         q.CGContextFillRect(ctx, q.CGRectMake(x, y, width, 1))
 
+    def _pill_path(self, x: float, y: float, w: float, h: float) -> Any:
+        q = self.Quartz
+        radius = min(h, w) / 2.0
+        return q.CGPathCreateWithRoundedRect(q.CGRectMake(x, y, w, h), radius, radius, None)
+
+    def _fill_pill(self, ctx: Any, x: float, y: float, w: float, h: float) -> None:
+        if w <= 0 or h <= 0:
+            return
+        q = self.Quartz
+        q.CGContextAddPath(ctx, self._pill_path(x, y, w, h))
+        q.CGContextFillPath(ctx)
+
+    def _stroke_pill(self, ctx: Any, x: float, y: float, w: float, h: float) -> None:
+        if w <= 0 or h <= 0:
+            return
+        q = self.Quartz
+        q.CGContextAddPath(ctx, self._pill_path(x, y, w, h))
+        q.CGContextStrokePath(ctx)
+
     def _draw_highlight(
         self,
         ctx: Any,
@@ -974,11 +1008,9 @@ class CoreTextFrameRenderer(FrameRenderer):
     ) -> None:
         if fraction <= 0:
             return
-        q = self.Quartz
-        x, width, height = 70, 260, 3
+        x, width, height = 70, 260, 4
         fill = int(clamp(fraction, 0.0, 1.0) * width)
-        if fill > 0:
-            q.CGContextFillRect(ctx, q.CGRectMake(x, DISPLAY_HEIGHT - y_top - height, fill, height))
+        self._fill_pill(ctx, x, DISPLAY_HEIGHT - y_top - height, fill, height)
 
     def _draw_progress(self, ctx: Any, state: AppState, font_name: str) -> None:
         q = self.Quartz
@@ -987,14 +1019,13 @@ class CoreTextFrameRenderer(FrameRenderer):
         self._draw_text(ctx, format_time(elapsed), 13, 14, 116, 54, "left", font_name=font_name)
         remaining = max(0.0, duration - elapsed) if duration else 0.0
         self._draw_text(ctx, "-" + format_time(remaining), 13, 328, 116, 58, "right", font_name=font_name)
-        bar_x, bar_y_top, bar_w, bar_h = 76, 105, 238, 10
+        bar_x, bar_y_top, bar_w, bar_h = 76, 105, 238, 8
         bar_y = DISPLAY_HEIGHT - bar_y_top - bar_h
         q.CGContextSetGrayStrokeColor(ctx, 1.0, 1.0)
-        q.CGContextStrokeRect(ctx, q.CGRectMake(bar_x, bar_y, bar_w, bar_h))
+        self._stroke_pill(ctx, bar_x, bar_y, bar_w, bar_h)
         if duration > 0:
             fill = int(clamp(elapsed / duration, 0.0, 1.0) * (bar_w - 2))
-            if fill > 0:
-                q.CGContextFillRect(ctx, q.CGRectMake(bar_x + 1, bar_y + 1, fill, bar_h - 2))
+            self._fill_pill(ctx, bar_x + 1, bar_y + 1, fill, bar_h - 2)
 
 
 class FallbackFrameRenderer(FrameRenderer):
@@ -1289,8 +1320,12 @@ class LyricsDisplayDaemon:
         try:
             lyrics = await asyncio.to_thread(self._resolve_track_sync, track)
         except Exception as exc:
-            print(f"lyrics resolve failed for {track.title!r}: {exc}")
-            lyrics = Lyrics(resolved=True)
+            if _is_timeout_error(exc):
+                print(f"lyrics resolve timed out for {track.title!r}: {exc}")
+                lyrics = Lyrics(resolved=True, error="Lyrics fetch timed out")
+            else:
+                print(f"lyrics resolve failed for {track.title!r}: {exc}")
+                lyrics = Lyrics(resolved=True)
         async with self.state_lock:
             if self.state.track.key != track.key:
                 return

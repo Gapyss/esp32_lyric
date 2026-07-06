@@ -965,9 +965,17 @@ def synced_lyric_payload(lines, pos):
 def lyric_payload(title, artist, pos, dur, paused, now, state):
     """Return (lyric, lyric2, lyric3, lt, lt2) for the current tick."""
     key = lyric_key(title, artist, dur)
-    if key != state.get("key"):
+    # Track continuity uses (title, artist) only, not the full lyric_key. `dur` can
+    # legitimately flip by a second between polls (browser_dur missing on a given
+    # read falls back to yt-dlp's duration, which need not match exactly — see
+    # read_now_playing). Resetting state on that flicker was fine for synced lyrics
+    # (recomputed fresh from `pos` every call) but silently froze plain/unsynced
+    # lyrics: plain_index and plain_last got wiped every tick, so elapsed time
+    # since plain_last never accumulated enough to advance past line 0.
+    track_key = (key[0], key[1]) if key is not None else None
+    if track_key != state.get("track_key"):
         state.clear()
-        state.update({"key": key, "plain_index": 0, "plain_last": now, "synced_index": None})
+        state.update({"track_key": track_key, "plain_index": 0, "plain_last": now, "synced_index": None})
 
     if key is None:
         return "", "", "", -1, -1

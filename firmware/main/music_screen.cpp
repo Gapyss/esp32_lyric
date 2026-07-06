@@ -617,6 +617,26 @@ static void format_elapsed_compact(int seconds, char *dst, size_t dst_len)
     }
 }
 
+// u8g2_DrawRBox has no internal radius clamp: a radius larger than half the
+// requested width/height underflows its unsigned coordinate math. The track
+// itself is a fixed size, but the elapsed-fill box shrinks to 0px at the
+// start of a track, so it must clamp its own radius (or skip rounding).
+static void draw_pill_box(u8g2_t *u8, int x, int y, int w, int h)
+{
+    if (w <= 0 || h <= 0) {
+        return;
+    }
+    int r = h / 2;
+    if (r > w / 2) {
+        r = w / 2;
+    }
+    if (r <= 0) {
+        u8g2_DrawBox(u8, x, y, w, h);
+        return;
+    }
+    u8g2_DrawRBox(u8, x, y, w, h, r);
+}
+
 static void draw_progress(u8g2_t *u8, int elapsed, int dur)
 {
     char elapsed_text[16];
@@ -632,14 +652,12 @@ static void draw_progress(u8g2_t *u8, int elapsed, int dur)
     const int bar_x = 76;
     const int bar_y = 105;
     const int bar_w = 238;
-    const int bar_h = 10;
-    u8g2_DrawFrame(u8, bar_x, bar_y, bar_w, bar_h);
+    const int bar_h = 8;
+    u8g2_DrawRFrame(u8, bar_x, bar_y, bar_w, bar_h, bar_h / 2);
     if (dur > 0) {
         int fill = (elapsed * (bar_w - 2)) / dur;
         fill = clamp_int(fill, 0, bar_w - 2);
-        if (fill > 0) {
-            u8g2_DrawBox(u8, bar_x + 1, bar_y + 1, fill, bar_h - 2);
-        }
+        draw_pill_box(u8, bar_x + 1, bar_y + 1, fill, bar_h - 2);
     }
 
     const int remaining_width = (int)u8g2_GetUTF8Width(u8, remaining);

@@ -96,9 +96,20 @@ Devices on this bus:
 - **ES8311** codec (speaker/DAC) + **ES7210** dual-mic array ADC
 - Codec control over the shared I2C bus (GPIO13/14)
 - I2S mode: **TDM**, 16 kHz / 16-bit in the reference firmware
-- *I2S GPIO pins (MCLK/BCLK/WS/DIN/DOUT) are configured inside Waveshare's
-  `codec_board` component and were not exposed in the public repo's
-  `board_cfg.txt`; confirm against the schematic if you drive audio directly.*
+- I2S pins from Waveshare `codec_board` `S3_RLCD_4_2` config:
+  - **MCLK GPIO16**
+  - **BCLK GPIO9**
+  - **WS/LRCK GPIO45**
+  - **DIN to codec GPIO10**
+  - **DOUT from codec GPIO8**
+  - **Speaker PA enable GPIO46**
+
+### Buttons
+
+| Button | GPIO | Active Level |
+|---|---:|---:|
+| BOOT / application button | **GPIO0** | Low |
+| Secondary demo button | **GPIO18** | Low |
 
 ---
 
