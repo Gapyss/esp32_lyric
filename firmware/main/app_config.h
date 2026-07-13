@@ -9,6 +9,7 @@ typedef enum {
     APP_MODE_WATER = 1,
     APP_MODE_STATS = 2,
     APP_MODE_POMODORO = 3,
+    APP_MODE_CLOCK = 4,
 } AppMode;
 
 #define APP_DEFAULT_MODE APP_MODE_WATER

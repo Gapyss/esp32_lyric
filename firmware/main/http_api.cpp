@@ -431,9 +431,11 @@ static esp_err_t mode_handler(httpd_req_t *req)
             app_mode_set(APP_MODE_MUSIC);
         } else if (strcmp(mode, "stats") == 0) {
             app_mode_set(APP_MODE_STATS);
+        } else if (strcmp(mode, "clock") == 0) {
+            app_mode_set(APP_MODE_CLOCK);
         } else {
             free(query);
-            return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "mode must be water, music, or stats");
+            return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "mode must be water, music, stats, or clock");
         }
     }
     free(query);

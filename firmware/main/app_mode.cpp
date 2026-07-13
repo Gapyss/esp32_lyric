@@ -28,7 +28,7 @@ AppMode app_mode_get(void)
 void app_mode_set(AppMode mode)
 {
     if (mode != APP_MODE_MUSIC && mode != APP_MODE_WATER && mode != APP_MODE_STATS &&
-        mode != APP_MODE_POMODORO) {
+        mode != APP_MODE_POMODORO && mode != APP_MODE_CLOCK) {
         return;
     }
     if (g_mode_mutex == NULL) {
@@ -55,6 +55,9 @@ AppMode app_mode_toggle(void)
         case APP_MODE_STATS:
             g_mode = APP_MODE_POMODORO;
             break;
+        case APP_MODE_POMODORO:
+            g_mode = APP_MODE_CLOCK;
+            break;
         default:
             g_mode = APP_MODE_MUSIC;
             break;
@@ -73,6 +76,8 @@ const char *app_mode_name(AppMode mode)
             return "stats";
         case APP_MODE_POMODORO:
             return "pomodoro";
+        case APP_MODE_CLOCK:
+            return "clock";
         default:
             return "music";
     }

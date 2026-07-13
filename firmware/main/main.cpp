@@ -24,6 +24,7 @@
 #include "nvs_flash.h"
 #include "pomodoro_screen.h"
 #include "stats_screen.h"
+#include "clock_screen.h"
 #include "u8g2_st7305.h"
 #include "ui_error.h"
 #include "water_screen.h"
@@ -283,6 +284,8 @@ static void render_task(void *arg)
             stats_render_current(u8);
         } else if (mode == APP_MODE_POMODORO) {
             pomodoro_render_current(u8);
+        } else if (mode == APP_MODE_CLOCK) {
+            clock_render_current(u8);
         } else {
             music_render_current(u8, true);
         }
@@ -307,6 +310,7 @@ extern "C" void app_main(void)
     music_screen_init();
     water_screen_init();
     stats_screen_init();
+    clock_screen_init();
     pomodoro_screen_init();
     display_start();
     ESP_ERROR_CHECK(board_peripherals_start());

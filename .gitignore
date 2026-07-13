@@ -7,6 +7,7 @@ firmware/main/wifi_secrets.h
 # ESP-IDF build output & regenerated files
 firmware/build/
 firmware/managed_components/
+firmware/.cache/
 firmware/sdkconfig
 firmware/sdkconfig.old
 firmware/dependencies.lock
