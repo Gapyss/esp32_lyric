@@ -433,9 +433,15 @@ static esp_err_t mode_handler(httpd_req_t *req)
             app_mode_set(APP_MODE_STATS);
         } else if (strcmp(mode, "clock") == 0) {
             app_mode_set(APP_MODE_CLOCK);
+        } else if (strcmp(mode, "pet") == 0) {
+            app_mode_set(APP_MODE_PET);
+        } else if (strcmp(mode, "pomodoro") == 0) {
+            app_mode_set(APP_MODE_POMODORO);
+        } else if (strcmp(mode, "sand") == 0) {
+            app_mode_set(APP_MODE_SAND);
         } else {
             free(query);
-            return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "mode must be water, music, stats, or clock");
+            return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "mode must be water, music, stats, pomodoro, clock, pet, or sand");
         }
     }
     free(query);

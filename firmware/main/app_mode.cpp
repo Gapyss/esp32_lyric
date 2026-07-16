@@ -28,7 +28,8 @@ AppMode app_mode_get(void)
 void app_mode_set(AppMode mode)
 {
     if (mode != APP_MODE_MUSIC && mode != APP_MODE_WATER && mode != APP_MODE_STATS &&
-        mode != APP_MODE_POMODORO && mode != APP_MODE_CLOCK) {
+        mode != APP_MODE_POMODORO && mode != APP_MODE_CLOCK && mode != APP_MODE_PET &&
+        mode != APP_MODE_SAND) {
         return;
     }
     if (g_mode_mutex == NULL) {
@@ -58,6 +59,12 @@ AppMode app_mode_toggle(void)
         case APP_MODE_POMODORO:
             g_mode = APP_MODE_CLOCK;
             break;
+        case APP_MODE_CLOCK:
+            g_mode = APP_MODE_PET;
+            break;
+        case APP_MODE_PET:
+            g_mode = APP_MODE_SAND;
+            break;
         default:
             g_mode = APP_MODE_MUSIC;
             break;
@@ -78,6 +85,10 @@ const char *app_mode_name(AppMode mode)
             return "pomodoro";
         case APP_MODE_CLOCK:
             return "clock";
+        case APP_MODE_PET:
+            return "pet";
+        case APP_MODE_SAND:
+            return "sand";
         default:
             return "music";
     }

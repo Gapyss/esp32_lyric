@@ -10,6 +10,8 @@ typedef enum {
     APP_MODE_STATS = 2,
     APP_MODE_POMODORO = 3,
     APP_MODE_CLOCK = 4,
+    APP_MODE_PET = 5,
+    APP_MODE_SAND = 6,
 } AppMode;
 
 #define APP_DEFAULT_MODE APP_MODE_WATER
@@ -21,6 +23,10 @@ typedef enum {
 
 #define POMODORO_DEFAULT_MINUTES 25
 #define POMODORO_ALERT_TIMEOUT_SEC 30
+
+#define PET_NVS_NAMESPACE "pet"
+#define PET_NVS_TOTAL_KEY "total"
+#define PET_NVS_ADOPT_KEY "adopt"
 
 #define HYDRATE_NVS_NAMESPACE "hydrate"
 #define HYDRATE_NVS_INTERVAL_KEY "interval"

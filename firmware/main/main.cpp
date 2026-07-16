@@ -22,7 +22,9 @@
 #include "mdns.h"
 #include "music_screen.h"
 #include "nvs_flash.h"
+#include "pet_screen.h"
 #include "pomodoro_screen.h"
+#include "sand_screen.h"
 #include "stats_screen.h"
 #include "clock_screen.h"
 #include "u8g2_st7305.h"
@@ -211,6 +213,9 @@ static void action_button_poll(void)
         if (mode == APP_MODE_POMODORO) {
             pomodoro_reset();
             ESP_LOGI(TAG, "pomodoro reset via long-press");
+        } else if (mode == APP_MODE_SAND) {
+            sand_clear();
+            ESP_LOGI(TAG, "sand field cleared via long-press");
         }
     } else if (last_level == 0 && level == 1) {
         if (!long_press_fired && now_us - last_action_us > ACTION_BUTTON_DEBOUNCE_US) {
@@ -220,6 +225,12 @@ static void action_button_poll(void)
             } else if (mode == APP_MODE_POMODORO) {
                 pomodoro_toggle_start_pause();
                 ESP_LOGI(TAG, "pomodoro start/pause toggled via button");
+            } else if (mode == APP_MODE_PET) {
+                pet_pet();
+                ESP_LOGI(TAG, "creature petted via button");
+            } else if (mode == APP_MODE_SAND) {
+                sand_pour();
+                ESP_LOGI(TAG, "sand poured via button");
             }
             last_action_us = now_us;
         }
@@ -286,6 +297,10 @@ static void render_task(void *arg)
             pomodoro_render_current(u8);
         } else if (mode == APP_MODE_CLOCK) {
             clock_render_current(u8);
+        } else if (mode == APP_MODE_PET) {
+            pet_render_current(u8);
+        } else if (mode == APP_MODE_SAND) {
+            sand_render_current(u8);
         } else {
             music_render_current(u8, true);
         }
@@ -312,6 +327,8 @@ extern "C" void app_main(void)
     stats_screen_init();
     clock_screen_init();
     pomodoro_screen_init();
+    pet_screen_init();
+    sand_screen_init();
     display_start();
     ESP_ERROR_CHECK(board_peripherals_start());
     mode_button_init();

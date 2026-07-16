@@ -9,6 +9,8 @@ idf_component_register(
         "stats_screen.cpp"
         "clock_screen.cpp"
         "pomodoro_screen.cpp"
+        "pet_screen.cpp"
+        "sand_screen.cpp"
         "http_api.cpp"
         "board_client.cpp"
         "ui_error.cpp"
