@@ -8,8 +8,10 @@
 
   <key>ProgramArguments</key>
   <array>
-    <string>/usr/bin/env</string>
-    <string>python3</string>
+    <!-- Must be an interpreter with pyobjc-framework-CoreText installed.
+         The daemon falls back to geometry-only frames without it, which means
+         the board receives rules/progress pixels but no rendered text. -->
+    <string>/Users/g4pys/esp-32/tools/.venv/bin/python3</string>
     <string>/Users/g4pys/esp-32/daemon/lyrics_display_daemon.py</string>
     <string>serve</string>
   </array>
