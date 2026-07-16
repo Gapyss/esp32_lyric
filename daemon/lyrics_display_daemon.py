@@ -48,7 +48,12 @@ EXTENSION_PORT = 8765
 BOARD_HOST = "0.0.0.0"
 BOARD_PORT = 8766
 NEGATIVE_CACHE_SECONDS = 14 * 24 * 60 * 60
-LRCLIB_TIMEOUT_SECONDS = 5.0
+# lrclib.net regularly takes 6-12s to first byte under load (DNS/TLS are fast,
+# the server is just slow), so the budget must be generous and timeouts are
+# worth one retry -- a timed-out resolve sticks as an error for the whole track.
+LRCLIB_TIMEOUT_SECONDS = 15.0
+LRCLIB_RETRY_ATTEMPTS = 2
+LRCLIB_RETRY_DELAY_SECONDS = 2.0
 LRCLIB_USER_AGENT = "g4pys-lyrics-display/0.1"
 MIN_SCHEDULE_SWAP_MS = 25
 MDNS_GROUP = "224.0.0.251"
@@ -87,6 +92,11 @@ BRAND_FONT_FILES = {
 MONO_FONT_NAME = "Menlo"
 TRACKING_MEGA = 0.12  # em; matches the design system's eyebrow/label letter-spacing
 TRACKING_WIDE = 0.04  # em; matches the design system's mono-caption letter-spacing
+# Karaoke hollow text: Core Text stroke width is a percentage of the font point
+# size. 3.5% ≈ 1px at the 30px base lyric size — thick enough to survive the
+# 1-bit threshold, thin enough to keep letter counters open. Smaller wrapped
+# sizes bump the percentage so the outline never falls below ~1px.
+KARAOKE_STROKE_PCT = 3.5
 
 LyricBreakFn = Callable[[str, float, int], list[str]]
 
@@ -717,6 +727,10 @@ def lyrics_from_lrclib_payload(payload: dict[str, Any] | None) -> Lyrics:
     return Lyrics(synced=synced, syllables=syllables, plain=plain, resolved=True)
 
 
+class ResolveCancelled(Exception):
+    """Raised when a track change abandons an in-flight lyrics fetch."""
+
+
 def _is_timeout_error(exc: BaseException) -> bool:
     if isinstance(exc, (socket.timeout, TimeoutError)):
         return True
@@ -725,16 +739,34 @@ def _is_timeout_error(exc: BaseException) -> bool:
     return False
 
 
-def lrclib_request(path: str, params: dict[str, Any]) -> Any:
+def lrclib_request(path: str, params: dict[str, Any], cancel: threading.Event | None = None) -> Any:
     url = "https://lrclib.net" + path + "?" + urllib.parse.urlencode(
         {k: v for k, v in params.items() if v not in ("", None, 0)}
     )
     req = urllib.request.Request(url, headers={"User-Agent": LRCLIB_USER_AGENT})
-    with urllib.request.urlopen(req, timeout=LRCLIB_TIMEOUT_SECONDS) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+    for attempt in range(LRCLIB_RETRY_ATTEMPTS):
+        # A blocking urlopen can't be interrupted, so cancellation takes effect
+        # at request/retry boundaries -- at worst one in-flight request finishes.
+        if cancel is not None and cancel.is_set():
+            raise ResolveCancelled()
+        try:
+            with urllib.request.urlopen(req, timeout=LRCLIB_TIMEOUT_SECONDS) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except Exception as exc:
+            if not _is_timeout_error(exc) or attempt + 1 >= LRCLIB_RETRY_ATTEMPTS:
+                raise
+            if cancel is not None and cancel.wait(LRCLIB_RETRY_DELAY_SECONDS):
+                raise ResolveCancelled()
+            if cancel is None:
+                time.sleep(LRCLIB_RETRY_DELAY_SECONDS)
 
 
-def fetch_lrclib(track: TrackInfo) -> Lyrics:
+def fetch_lrclib(track: TrackInfo, cancel: threading.Event | None = None) -> Lyrics:
+    """Resolve lyrics from lrclib, accepting only synced (or instrumental) results.
+
+    Plain-only lyrics are treated as not found: the display can't scroll them
+    in time, so two static lines would sit on screen for the whole song.
+    """
     params = {
         "track_name": track.title,
         "artist_name": track.artist,
@@ -742,34 +774,31 @@ def fetch_lrclib(track: TrackInfo) -> Lyrics:
         "duration": int(track.duration_sec or 0),
     }
     try:
-        exact = lrclib_request("/api/get", params)
+        exact = lrclib_request("/api/get", params, cancel)
         lyrics = lyrics_from_lrclib_payload(exact)
-        if lyrics.synced or lyrics.plain or lyrics.instrumental:
+        if lyrics.synced or lyrics.instrumental:
             return lyrics
     except urllib.error.HTTPError as exc:
-        if exc.code != 404:
+        # 404: no exact match. 400: /api/get demands track+artist+album+duration,
+        # so tracks with a missing field can only be found via /api/search.
+        if exc.code not in (400, 404):
             raise
 
-    results = lrclib_request("/api/search", params)
+    results = lrclib_request("/api/search", params, cancel)
     candidates = results if isinstance(results, list) else []
     duration = float(track.duration_sec or 0)
     best_synced: tuple[float, dict[str, Any]] | None = None
-    best_plain: tuple[float, dict[str, Any]] | None = None
     for item in candidates:
         lyrics = lyrics_from_lrclib_payload(item)
-        if not (lyrics.synced or lyrics.plain or lyrics.instrumental):
+        if not lyrics.synced:
             continue
         item_duration = float(item.get("duration") or 0)
         distance = abs(item_duration - duration) if duration > 0 and item_duration > 0 else 0
         if duration > 0 and distance > 3:
             continue
-        if lyrics.synced:
-            if best_synced is None or distance < best_synced[0]:
-                best_synced = (distance, item)
-        elif best_plain is None or distance < best_plain[0]:
-            best_plain = (distance, item)
-    best = best_synced or best_plain
-    return lyrics_from_lrclib_payload(best[1] if best else None)
+        if best_synced is None or distance < best_synced[0]:
+            best_synced = (distance, item)
+    return lyrics_from_lrclib_payload(best_synced[1] if best_synced else None)
 
 
 class FrameRenderer:
@@ -839,7 +868,23 @@ class CoreTextFrameRenderer(FrameRenderer):
             ctx, "NOW PLAYING", 13, 14, 18, DISPLAY_WIDTH - 28, "left", font_name=label_font, tracking=TRACKING_MEGA
         )
         self._draw_rule(ctx, 12, 28, DISPLAY_WIDTH - 24)
-        self._draw_text(ctx, state.track.title or "Not Playing", 28, 14, 60, DISPLAY_WIDTH - 28, "left", font_name=display_font)
+
+        if not state.track.title:
+            # Idle: quiet centered copy in the design system's lowercase voice.
+            self._draw_text(ctx, "nothing playing", 30, 14, 150, DISPLAY_WIDTH - 28, "center", font_name=display_font)
+            self._draw_text(
+                ctx, "waiting for youtube music", 15, 14, 182, DISPLAY_WIDTH - 28, "center", font_name=body_font
+            )
+            self._screen_rect(ctx, 14, 168, DISPLAY_WIDTH - 28, 20)
+            self._draw_text(
+                ctx, "g4pys.company", 13, 260, 292, 126, "right", font_name=MONO_FONT_NAME, tracking=TRACKING_WIDE
+            )
+            image = q.CGBitmapContextCreateImage(ctx)
+            pixels = bytes(q.CGDataProviderCopyData(q.CGImageGetDataProvider(image)))
+            stride = q.CGImageGetBytesPerRow(image)
+            return pack_1bpp(pixels, DISPLAY_WIDTH, DISPLAY_HEIGHT, stride)
+
+        self._draw_text(ctx, state.track.title, 28, 14, 60, DISPLAY_WIDTH - 28, "left", font_name=display_font)
         self._draw_text(ctx, state.track.artist, 18, 14, 88, DISPLAY_WIDTH - 28, "left", font_name=body_medium_font)
         self._draw_progress(ctx, state, MONO_FONT_NAME)
         self._draw_rule(ctx, 12, 130, DISPLAY_WIDTH - 24)
@@ -852,25 +897,37 @@ class CoreTextFrameRenderer(FrameRenderer):
             DEFAULT_LYRIC_LAYOUT_SIZES,
             self._break_text,
         )
+        # Karaoke fill only makes sense for timed lines; loading/error/plain and
+        # "Instrumental" copy would otherwise render fully hollow at fraction 0.
+        karaoke = bool(state.lyrics.synced) and not state.lyrics.instrumental
+        fraction = state.current_line_highlight_fraction() if karaoke else 1.0
+        total_chars = sum(len(row) for row in current_layout.rows) or 1
+        consumed_chars = 0
         for row, baseline_y in zip(current_layout.rows, current_layout.baselines):
-            self._draw_text(
-                ctx, row, current_layout.font_size, LYRIC_BOX_X, baseline_y, LYRIC_BOX_WIDTH, "center", font_name=display_font
+            row_fraction = clamp(
+                (fraction * total_chars - consumed_chars) / max(1, len(row)), 0.0, 1.0
             )
-        self._draw_highlight(ctx, state.current_line_highlight_fraction(), current_layout.highlight_y)
+            self._draw_karaoke_text(
+                ctx,
+                row,
+                current_layout.font_size,
+                LYRIC_BOX_X,
+                baseline_y,
+                LYRIC_BOX_WIDTH,
+                row_fraction if karaoke else 1.0,
+                display_font,
+            )
+            consumed_chars += len(row)
         self._draw_text(ctx, next_line, 21, 14, 224, DISPLAY_WIDTH - 28, "center", font_name=body_font)
-        if not current_layout.hide_third:
+        if not current_layout.hide_third and third:
             self._draw_text(ctx, third, 16, 14, 252, DISPLAY_WIDTH - 28, "center", font_name=body_font)
-        self._draw_text(
-            ctx,
-            "PAUSED" if state.clock.paused else "PLAYING",
-            13,
-            14,
-            292,
-            120,
-            "left",
-            font_name=label_font,
-            tracking=TRACKING_MEGA,
-        )
+            self._screen_rect(ctx, 14, 238, DISPLAY_WIDTH - 28, 22)
+        if state.clock.paused:
+            self._draw_state_chip(ctx, "PAUSED", 14, 292, font_name=label_font)
+        else:
+            self._draw_text(
+                ctx, "PLAYING", 13, 14, 292, 120, "left", font_name=label_font, tracking=TRACKING_MEGA
+            )
         self._draw_text(
             ctx, "g4pys.company", 13, 260, 292, 126, "right", font_name=MONO_FONT_NAME, tracking=TRACKING_WIDE
         )
@@ -920,6 +977,7 @@ class CoreTextFrameRenderer(FrameRenderer):
         align: str,
         font_name: str | None = None,
         tracking: float = 0.0,
+        gray: float = 1.0,
     ) -> None:
         if not text:
             return
@@ -971,6 +1029,7 @@ class CoreTextFrameRenderer(FrameRenderer):
             return
 
         q.CGContextSaveGState(ctx)
+        q.CGContextSetGrayFillColor(ctx, gray, 1.0)
         q.CGContextClipToRect(ctx, q.CGRectMake(x, clip_y, width, clip_top - clip_y))
         q.CGContextSetTextPosition(ctx, draw_x, baseline_y)
         ct.CTLineDraw(line, ctx)
@@ -1000,17 +1059,130 @@ class CoreTextFrameRenderer(FrameRenderer):
         q.CGContextAddPath(ctx, self._pill_path(x, y, w, h))
         q.CGContextStrokePath(ctx)
 
-    def _draw_highlight(
+    def _line_visual_metrics(self, line: Any) -> tuple[float, float, float]:
+        """Return (visual_left, visual_width, advance_width) for a CTLine.
+
+        visual_left/width mirror the union of advance width and image bounds
+        that _draw_text uses for alignment.
+        """
+        ct = self.CoreText
+        q = self.Quartz
+        measured = ct.CTLineGetTypographicBounds(line, None, None, None)
+        text_width = measured[0] if isinstance(measured, tuple) else measured
+        probe = q.CGBitmapContextCreate(None, 1, 1, 8, 1, self.color_space, q.kCGImageAlphaNone)
+        q.CGContextSetTextMatrix(probe, q.CGAffineTransformIdentity)
+        ink = ct.CTLineGetImageBounds(line, probe)
+        ink_x, ink_w = ink.origin.x, ink.size.width
+        if not (ink_w > 0):
+            ink_x, ink_w = 0.0, float(text_width)
+        visual_left = min(0.0, ink_x)
+        visual_right = max(float(text_width), ink_x + ink_w)
+        return visual_left, max(0.0, visual_right - visual_left), float(text_width)
+
+    def _draw_karaoke_text(
         self,
         ctx: Any,
+        text: str,
+        size: float,
+        x: int,
+        baseline_y_top_origin: int,
+        width: int,
         fraction: float,
-        y_top: int = LYRIC_SINGLE_HIGHLIGHT_Y,
+        font_name: str,
     ) -> None:
-        if fraction <= 0:
+        """Centered lyric row: sung portion solid, unsung portion hollow outline."""
+        if not text:
             return
-        x, width, height = 70, 260, 4
-        fill = int(clamp(fraction, 0.0, 1.0) * width)
-        self._fill_pill(ctx, x, DISPLAY_HEIGHT - y_top - height, fill, height)
+        ct = self.CoreText
+        q = self.Quartz
+        font = ct.CTFontCreateWithName(font_name, size, None)
+        solid_attrs = {
+            ct.kCTFontAttributeName: font,
+            ct.kCTForegroundColorFromContextAttributeName: True,
+        }
+        # Stroke-only text ignores the context fill color; without an explicit
+        # CGColor stroke attribute Core Text draws nothing here.
+        hollow_attrs = {
+            ct.kCTFontAttributeName: font,
+            ct.kCTStrokeWidthAttributeName: max(KARAOKE_STROKE_PCT, 100.0 / size),
+            ct.kCTStrokeColorAttributeName: q.CGColorCreateGenericGray(1.0, 1.0),
+        }
+        solid_line = ct.CTLineCreateWithAttributedString(
+            self.NSAttributedString.alloc().initWithString_attributes_(text, solid_attrs)
+        )
+        hollow_line = ct.CTLineCreateWithAttributedString(
+            self.NSAttributedString.alloc().initWithString_attributes_(text, hollow_attrs)
+        )
+        visual_left, visual_width, _advance = self._line_visual_metrics(solid_line)
+        visual_x = x + max(0, int((width - visual_width) / 2))
+        draw_x = visual_x - visual_left
+        baseline_y = DISPLAY_HEIGHT - baseline_y_top_origin
+        # The clip only bounds the horizontal wipe; keep it tall so Thai mark
+        # stacks and deep descenders never get shaved (only this row's glyphs
+        # are drawn in this pass, so a generous band cannot bleed).
+        band_h = size * 2.4
+        band_y = baseline_y - size * 0.8
+
+        fraction = clamp(fraction, 0.0, 1.0)
+        split_x = visual_x + visual_width * fraction
+
+        q.CGContextSaveGState(ctx)
+        q.CGContextSetGrayStrokeColor(ctx, 1.0, 1.0)
+        if fraction < 1.0:
+            q.CGContextSaveGState(ctx)
+            q.CGContextClipToRect(ctx, q.CGRectMake(split_x, band_y, x + width - split_x, band_h))
+            q.CGContextSetTextPosition(ctx, draw_x, baseline_y)
+            ct.CTLineDraw(hollow_line, ctx)
+            q.CGContextRestoreGState(ctx)
+        if fraction > 0.0:
+            q.CGContextSaveGState(ctx)
+            q.CGContextClipToRect(ctx, q.CGRectMake(x, band_y, split_x - x, band_h))
+            q.CGContextSetTextPosition(ctx, draw_x, baseline_y)
+            ct.CTLineDraw(solid_line, ctx)
+            q.CGContextRestoreGState(ctx)
+        q.CGContextRestoreGState(ctx)
+
+    def _screen_rect(self, ctx: Any, x: int, y_top_origin: int, w: int, h: int) -> None:
+        """Punch a 50% checkerboard of background over a band.
+
+        On the 1-bit panel this halftone-screens whatever was drawn there, so
+        the text underneath reads as gray -- the design system's ink-muted.
+        """
+        q = self.Quartz
+        y0 = DISPLAY_HEIGHT - y_top_origin - h
+        q.CGContextSaveGState(ctx)
+        q.CGContextSetShouldAntialias(ctx, False)
+        q.CGContextSetGrayStrokeColor(ctx, 0.0, 1.0)
+        q.CGContextSetLineWidth(ctx, 1.0)
+        for row in range(h):
+            q.CGContextSetLineDash(ctx, float((row + x) % 2), [1.0, 1.0], 2)
+            q.CGContextBeginPath(ctx)
+            q.CGContextMoveToPoint(ctx, float(x), y0 + row + 0.5)
+            q.CGContextAddLineToPoint(ctx, float(x + w), y0 + row + 0.5)
+            q.CGContextStrokePath(ctx)
+        q.CGContextRestoreGState(ctx)
+
+    def _draw_state_chip(self, ctx: Any, text: str, x: int, baseline_y_top_origin: int, font_name: str) -> None:
+        """Inverted pill chip -- the 1-bit stand-in for the ember accent."""
+        ct = self.CoreText
+        font = ct.CTFontCreateWithName(font_name, 13, None)
+        attrs = {
+            ct.kCTFontAttributeName: font,
+            ct.kCTForegroundColorFromContextAttributeName: True,
+            ct.kCTKernAttributeName: TRACKING_MEGA * 13,
+        }
+        line = ct.CTLineCreateWithAttributedString(
+            self.NSAttributedString.alloc().initWithString_attributes_(text, attrs)
+        )
+        _left, text_w, _advance = self._line_visual_metrics(line)
+        pad_x, chip_h = 9, 20
+        chip_w = int(text_w) + pad_x * 2
+        chip_y_top = baseline_y_top_origin - 14
+        self._fill_pill(ctx, x, DISPLAY_HEIGHT - chip_y_top - chip_h, chip_w, chip_h)
+        self._draw_text(
+            ctx, text, 13, x + pad_x, baseline_y_top_origin, chip_w, "left",
+            font_name=font_name, tracking=TRACKING_MEGA, gray=0.0,
+        )
 
     def _draw_progress(self, ctx: Any, state: AppState, font_name: str) -> None:
         q = self.Quartz
@@ -1019,13 +1191,28 @@ class CoreTextFrameRenderer(FrameRenderer):
         self._draw_text(ctx, format_time(elapsed), 13, 14, 116, 54, "left", font_name=font_name)
         remaining = max(0.0, duration - elapsed) if duration else 0.0
         self._draw_text(ctx, "-" + format_time(remaining), 13, 328, 116, 58, "right", font_name=font_name)
-        bar_x, bar_y_top, bar_w, bar_h = 76, 105, 238, 8
-        bar_y = DISPLAY_HEIGHT - bar_y_top - bar_h
+        bar_x, bar_w = 76, 238
+        center_y = DISPLAY_HEIGHT - 109  # track centerline, bottom-up coords
+        fraction = clamp(elapsed / duration, 0.0, 1.0) if duration > 0 else 0.0
+        played_w = bar_w * fraction
+        # remaining track: dotted hairline reads as ink-muted on the 1-bit panel
+        q.CGContextSaveGState(ctx)
+        q.CGContextSetShouldAntialias(ctx, False)
         q.CGContextSetGrayStrokeColor(ctx, 1.0, 1.0)
-        self._stroke_pill(ctx, bar_x, bar_y, bar_w, bar_h)
-        if duration > 0:
-            fill = int(clamp(elapsed / duration, 0.0, 1.0) * (bar_w - 2))
-            self._fill_pill(ctx, bar_x + 1, bar_y + 1, fill, bar_h - 2)
+        q.CGContextSetLineWidth(ctx, 1.0)
+        q.CGContextSetLineDash(ctx, 0.0, [1.0, 3.0], 2)
+        q.CGContextBeginPath(ctx)
+        q.CGContextMoveToPoint(ctx, bar_x + played_w, center_y - 0.5)
+        q.CGContextAddLineToPoint(ctx, bar_x + bar_w, center_y - 0.5)
+        q.CGContextStrokePath(ctx)
+        q.CGContextRestoreGState(ctx)
+        # played track: solid bar, then the playhead dot on top
+        if played_w > 0:
+            self._fill_pill(ctx, bar_x, center_y - 1.5, played_w, 3)
+        dot_r = 4.5
+        q.CGContextFillEllipseInRect(
+            ctx, q.CGRectMake(bar_x + played_w - dot_r, center_y - dot_r, dot_r * 2, dot_r * 2)
+        )
 
 
 class FallbackFrameRenderer(FrameRenderer):
@@ -1217,7 +1404,13 @@ class LyricsDisplayDaemon:
         self.schedule_generation = 0
         self.scheduled_task: asyncio.Task[None] | None = None
         self._background_tasks: set[asyncio.Task[None]] = set()
+        self._resolve_cancel: threading.Event | None = None
         self.media_timeline_offset_sec = 0.0
+
+    def _cancel_inflight_resolve(self) -> None:
+        if self._resolve_cancel is not None:
+            self._resolve_cancel.set()
+            self._resolve_cancel = None
 
     async def handle_extension(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         conn = WebSocketConnection(reader, writer)
@@ -1262,6 +1455,7 @@ class LyricsDisplayDaemon:
             await self.update_clock(payload, update_duration=event_type != "ended")
             if event_type == "ended":
                 async with self.state_lock:
+                    self._cancel_inflight_resolve()
                     if self.state.track.duration_sec > 0:
                         self.media_timeline_offset_sec += self.state.track.duration_sec
                     self.state.track = TrackInfo()
@@ -1280,13 +1474,16 @@ class LyricsDisplayDaemon:
         async with self.state_lock:
             if track.key == self.state.track.key and track.title == self.state.track.title:
                 return
+            self._cancel_inflight_resolve()
             self.state.track = track
             self.state.clock.update(0.0, self.state.clock.paused, self.state.clock.playback_rate)
             self.state.lyrics = cached or Lyrics()
             self.state.resolving_key = track.key if cached is None else ""
             self.state.dirty = True
         if track.title and cached is None:
-            task = asyncio.create_task(self.resolve_track(track))
+            cancel = threading.Event()
+            self._resolve_cancel = cancel
+            task = asyncio.create_task(self.resolve_track(track, cancel))
             self._background_tasks.add(task)
             task.add_done_callback(self._background_tasks.discard)
 
@@ -1316,9 +1513,12 @@ class LyricsDisplayDaemon:
             return max(0.0, position_sec - offset), max(0.0, duration_sec - offset)
         return position_sec, duration_sec
 
-    async def resolve_track(self, track: TrackInfo) -> None:
+    async def resolve_track(self, track: TrackInfo, cancel: threading.Event | None = None) -> None:
         try:
-            lyrics = await asyncio.to_thread(self._resolve_track_sync, track)
+            lyrics = await asyncio.to_thread(self._resolve_track_sync, track, cancel)
+        except ResolveCancelled:
+            print(f"lyrics resolve cancelled for {track.title!r} (track changed)")
+            return
         except Exception as exc:
             if _is_timeout_error(exc):
                 print(f"lyrics resolve timed out for {track.title!r}: {exc}")
@@ -1334,8 +1534,10 @@ class LyricsDisplayDaemon:
             self.state.dirty = True
         await self.render_and_broadcast()
 
-    def _resolve_track_sync(self, track: TrackInfo) -> Lyrics:
-        lyrics = fetch_lrclib(track)
+    def _resolve_track_sync(self, track: TrackInfo, cancel: threading.Event | None = None) -> Lyrics:
+        lyrics = fetch_lrclib(track, cancel)
+        # Even if the track changed mid-fetch, a completed result is worth
+        # caching -- the stale-key check above keeps it off the screen.
         self.store.save_lrclib(track, lyrics)
         return lyrics
 
@@ -1737,7 +1939,10 @@ def build_renderer(font_name: str) -> FrameRenderer:
     try:
         return CoreTextFrameRenderer(font_name)
     except ImportError as exc:
-        print(f"Core Text renderer unavailable ({exc}); using geometry-only fallback")
+        print(
+            f"Core Text renderer unavailable ({exc}); using geometry-only fallback "
+            "(rules/progress only, no text)"
+        )
         return FallbackFrameRenderer()
 
 

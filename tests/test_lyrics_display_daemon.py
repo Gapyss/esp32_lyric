@@ -190,7 +190,7 @@ class LyricsStoreTests(unittest.TestCase):
             store = LyricsStore(Path(tmpdir) / "lyrics.sqlite3")
             track = TrackInfo(video_id="video-1", title="Song", artist="Artist")
             original_fetch = lyrics_display_daemon.fetch_lrclib
-            lyrics_display_daemon.fetch_lrclib = lambda _track: Lyrics(plain=["fetched"], resolved=True)
+            lyrics_display_daemon.fetch_lrclib = lambda _track, _cancel=None: Lyrics(plain=["fetched"], resolved=True)
             try:
                 result = asyncio.run(run_resolution(store, track))
             finally:
@@ -215,7 +215,7 @@ class LyricsStoreTests(unittest.TestCase):
             track = TrackInfo(video_id="video-1", title="Song", artist="Artist")
             original_fetch = lyrics_display_daemon.fetch_lrclib
 
-            def raise_timeout(_track: TrackInfo) -> Lyrics:
+            def raise_timeout(_track: TrackInfo, _cancel: threading.Event | None = None) -> Lyrics:
                 raise TimeoutError("timed out")
 
             lyrics_display_daemon.fetch_lrclib = raise_timeout
@@ -226,6 +226,46 @@ class LyricsStoreTests(unittest.TestCase):
 
         self.assertEqual(daemon.state.lyrics.error, "Lyrics fetch timed out")
         self.assertEqual(daemon.state.current_lines(), ("Lyrics fetch timed out", "", ""))
+
+    def test_track_change_cancels_inflight_resolve(self) -> None:
+        old_started = threading.Event()
+        release_old = threading.Event()
+        old_cancels: list[threading.Event | None] = []
+
+        def fake_fetch(track: TrackInfo, cancel: threading.Event | None = None) -> Lyrics:
+            if track.title == "Old":
+                old_cancels.append(cancel)
+                old_started.set()
+                release_old.wait(timeout=5)
+                if cancel is not None and cancel.is_set():
+                    raise lyrics_display_daemon.ResolveCancelled()
+                return Lyrics(synced=[(0, "old line")], resolved=True)
+            return Lyrics(synced=[(0, "new line")], resolved=True)
+
+        async def run(store: LyricsStore) -> LyricsDisplayDaemon:
+            daemon = LyricsDisplayDaemon(store, FallbackFrameRenderer())
+            await daemon.set_track(TrackInfo(video_id="v-old", title="Old", artist="A", duration_sec=100))
+            await asyncio.to_thread(old_started.wait, 5)
+            await daemon.set_track(TrackInfo(video_id="v-new", title="New", artist="A", duration_sec=100))
+            release_old.set()
+            await asyncio.gather(*daemon._background_tasks, return_exceptions=True)
+            return daemon
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = LyricsStore(Path(tmpdir) / "lyrics.sqlite3")
+            original_fetch = lyrics_display_daemon.fetch_lrclib
+            lyrics_display_daemon.fetch_lrclib = fake_fetch
+            try:
+                daemon = asyncio.run(run(store))
+            finally:
+                lyrics_display_daemon.fetch_lrclib = original_fetch
+
+        self.assertEqual(len(old_cancels), 1)
+        assert old_cancels[0] is not None
+        self.assertTrue(old_cancels[0].is_set())
+        self.assertEqual(daemon.state.track.title, "New")
+        self.assertEqual(daemon.state.lyrics.synced, [(0, "new line")])
+        self.assertEqual(daemon.state.lyrics.error, "")
 
     def test_negative_cache_row_is_resolved_without_lines(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -278,10 +318,10 @@ class LyricsStoreTests(unittest.TestCase):
 
 
 class LrclibTests(unittest.TestCase):
-    def test_search_falls_back_to_plain_candidate_when_no_synced_match_exists(self) -> None:
+    def test_search_skips_plain_only_candidates(self) -> None:
         calls: list[str] = []
 
-        def fake_request(path: str, _params: dict[str, object]) -> object:
+        def fake_request(path: str, _params: dict[str, object], _cancel: object = None) -> object:
             calls.append(path)
             if path == "/api/get":
                 raise lyrics_display_daemon.urllib.error.HTTPError(
@@ -307,10 +347,11 @@ class LrclibTests(unittest.TestCase):
 
         self.assertEqual(calls, ["/api/get", "/api/search"])
         self.assertEqual(result.synced, [])
-        self.assertEqual(result.plain, ["plain one", "plain two"])
+        self.assertEqual(result.plain, [])
+        self.assertTrue(result.resolved)
 
     def test_search_prefers_synced_candidate_over_plain_candidate(self) -> None:
-        def fake_request(path: str, _params: dict[str, object]) -> object:
+        def fake_request(path: str, _params: dict[str, object], _cancel: object = None) -> object:
             if path == "/api/get":
                 raise lyrics_display_daemon.urllib.error.HTTPError(
                     url="https://lrclib.net/api/get",
