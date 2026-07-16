@@ -26,7 +26,9 @@
 #include "pomodoro_screen.h"
 #include "sand_screen.h"
 #include "stats_screen.h"
+#include "swarm_screen.h"
 #include "clock_screen.h"
+#include "comic_screen.h"
 #include "u8g2_st7305.h"
 #include "ui_error.h"
 #include "water_screen.h"
@@ -216,6 +218,9 @@ static void action_button_poll(void)
         } else if (mode == APP_MODE_SAND) {
             sand_clear();
             ESP_LOGI(TAG, "sand field cleared via long-press");
+        } else if (mode == APP_MODE_SWARM) {
+            swarm_toggle_roam();
+            ESP_LOGI(TAG, "swarm roam toggled via long-press");
         }
     } else if (last_level == 0 && level == 1) {
         if (!long_press_fired && now_us - last_action_us > ACTION_BUTTON_DEBOUNCE_US) {
@@ -231,6 +236,15 @@ static void action_button_poll(void)
             } else if (mode == APP_MODE_SAND) {
                 sand_pour();
                 ESP_LOGI(TAG, "sand poured via button");
+            } else if (mode == APP_MODE_SWARM) {
+                swarm_scatter();
+                ESP_LOGI(TAG, "swarm scattered via button");
+            } else if (mode == APP_MODE_COMIC) {
+                comic_refresh();
+                ESP_LOGI(TAG, "comic refresh requested via button");
+            } else if (mode == APP_MODE_APOD) {
+                apod_refresh();
+                ESP_LOGI(TAG, "APOD refresh requested via button");
             }
             last_action_us = now_us;
         }
@@ -301,6 +315,12 @@ static void render_task(void *arg)
             pet_render_current(u8);
         } else if (mode == APP_MODE_SAND) {
             sand_render_current(u8);
+        } else if (mode == APP_MODE_SWARM) {
+            swarm_render_current(u8);
+        } else if (mode == APP_MODE_COMIC) {
+            comic_render_current(u8);
+        } else if (mode == APP_MODE_APOD) {
+            apod_render_current(u8);
         } else {
             music_render_current(u8, true);
         }
@@ -329,6 +349,8 @@ extern "C" void app_main(void)
     pomodoro_screen_init();
     pet_screen_init();
     sand_screen_init();
+    swarm_screen_init();
+    comic_screen_init();
     display_start();
     ESP_ERROR_CHECK(board_peripherals_start());
     mode_button_init();
@@ -351,6 +373,7 @@ extern "C" void app_main(void)
 
     ESP_LOGI(TAG, "starting wifi");
     wifi_start();
+    comic_screen_start();
     ESP_LOGI(TAG, "wifi ready; starting SNTP");
     time_sync_start();
     ESP_LOGI(TAG, "starting mDNS and HTTP");

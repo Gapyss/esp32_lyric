@@ -11,6 +11,8 @@ idf_component_register(
         "pomodoro_screen.cpp"
         "pet_screen.cpp"
         "sand_screen.cpp"
+        "swarm_screen.cpp"
+        "comic_screen.cpp"
         "http_api.cpp"
         "board_client.cpp"
         "ui_error.cpp"
@@ -22,9 +24,13 @@ idf_component_register(
         esp_wifi
         esp_event
         esp_netif
+        esp_http_client
         esp_http_server
+        json
+        mbedtls
         driver
         esp_adc
         mdns
         esp_codec_dev
+        pngle
 )

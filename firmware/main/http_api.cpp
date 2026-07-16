@@ -439,9 +439,15 @@ static esp_err_t mode_handler(httpd_req_t *req)
             app_mode_set(APP_MODE_POMODORO);
         } else if (strcmp(mode, "sand") == 0) {
             app_mode_set(APP_MODE_SAND);
+        } else if (strcmp(mode, "swarm") == 0) {
+            app_mode_set(APP_MODE_SWARM);
+        } else if (strcmp(mode, "comic") == 0) {
+            app_mode_set(APP_MODE_COMIC);
+        } else if (strcmp(mode, "apod") == 0) {
+            app_mode_set(APP_MODE_APOD);
         } else {
             free(query);
-            return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "mode must be water, music, stats, pomodoro, clock, pet, or sand");
+            return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "mode must be water, music, stats, pomodoro, clock, pet, sand, swarm, comic, or apod");
         }
     }
     free(query);

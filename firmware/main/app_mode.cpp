@@ -29,7 +29,8 @@ void app_mode_set(AppMode mode)
 {
     if (mode != APP_MODE_MUSIC && mode != APP_MODE_WATER && mode != APP_MODE_STATS &&
         mode != APP_MODE_POMODORO && mode != APP_MODE_CLOCK && mode != APP_MODE_PET &&
-        mode != APP_MODE_SAND) {
+        mode != APP_MODE_SAND && mode != APP_MODE_SWARM && mode != APP_MODE_COMIC &&
+        mode != APP_MODE_APOD) {
         return;
     }
     if (g_mode_mutex == NULL) {
@@ -65,6 +66,15 @@ AppMode app_mode_toggle(void)
         case APP_MODE_PET:
             g_mode = APP_MODE_SAND;
             break;
+        case APP_MODE_SAND:
+            g_mode = APP_MODE_SWARM;
+            break;
+        case APP_MODE_SWARM:
+            g_mode = APP_MODE_COMIC;
+            break;
+        case APP_MODE_COMIC:
+            g_mode = APP_MODE_APOD;
+            break;
         default:
             g_mode = APP_MODE_MUSIC;
             break;
@@ -89,6 +99,12 @@ const char *app_mode_name(AppMode mode)
             return "pet";
         case APP_MODE_SAND:
             return "sand";
+        case APP_MODE_SWARM:
+            return "swarm";
+        case APP_MODE_COMIC:
+            return "comic";
+        case APP_MODE_APOD:
+            return "apod";
         default:
             return "music";
     }
