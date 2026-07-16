@@ -11,7 +11,7 @@ Status legend:
 
 ## Product Goal
 
-The project turns a Waveshare ESP32-S3-RLCD-4.2 board into a 400x300 monochrome synced-lyrics display for music playing on a Mac. Audio stays on the Mac; the ESP32 is a display client.
+The project turns a Waveshare ESP32-S3-RLCD-4.2 board into a multi-mode 400x300 monochrome ambient display. It provides synced lyrics for music playing on a Mac alongside hydration, productivity, clock, simulation, daily comic, and astronomy screens. Audio playback stays on the Mac; the board uses its speaker only for local notification chimes.
 
 Primary references:
 
@@ -159,6 +159,35 @@ Features:
 - Starts an HTTP server on port 80.
 - Starts a render task pinned to core 1.
 
+### Modes and Physical Controls
+
+Status: Implemented
+
+Files:
+
+- `firmware/main/app_mode.cpp`
+- `firmware/main/app_mode.h`
+- `firmware/main/app_config.h`
+- `firmware/main/main.cpp`
+
+The default screen is `water`. A short press of the BOOT button on GPIO0 cycles through:
+
+`music` -> `water` -> `stats` -> `pomodoro` -> `clock` -> `pet` -> `sand` -> `swarm` -> `comic` -> `apod` -> `music`
+
+The secondary button on GPIO18 performs an action based on the active screen:
+
+| Mode | Short press | Hold for 0.8 seconds |
+|---|---|---|
+| Water | Log a drink | No action |
+| Pomodoro | Start or pause | Reset timer |
+| Pet | Pet the creature | No action |
+| Sand | Pour sand | Clear the field |
+| Swarm | Scatter the fireflies | Toggle time/roam behavior |
+| Comic | Refresh XKCD | No action |
+| APOD | Refresh NASA APOD | No action |
+
+Modes can also be selected over HTTP with `GET /mode?set=<mode>`. Calling `GET /mode` without `set` returns the current mode name.
+
 ### ST7305 Display Driver Integration
 
 Status: Implemented
@@ -224,6 +253,54 @@ Features:
 - Validates SHTC3 CRC.
 - Supplies idle screen metrics to `music_screen`.
 
+### Firefly Clock Screen
+
+Status: Implemented
+
+Files:
+
+- `firmware/main/swarm_screen.cpp`
+- `firmware/main/swarm_screen.h`
+
+Features:
+
+- Simulates 300 independently moving fireflies using fixed-point positions and velocities.
+- Attracts the swarm into large seven-segment clock digits when RTC time is available.
+- Uses gentler movement between 22:00 and 07:00.
+- Short action-button presses scatter the swarm for 1.6 seconds.
+- Long action-button presses toggle between clock formation and free-roaming behavior.
+
+### Daily XKCD and NASA APOD Screens
+
+Status: Implemented
+
+Files:
+
+- `firmware/main/comic_screen.cpp`
+- `firmware/main/comic_screen.h`
+- `firmware/components/pngle/`
+- `firmware/main/idf_component.yml`
+
+Features:
+
+- Fetches the latest XKCD metadata and PNG from `https://xkcd.com/info.0.json`.
+- Fetches NASA Astronomy Picture of the Day metadata from the official APOD API.
+- Fetches both sources at startup and automatically refreshes them every six hours.
+- Allows an immediate refresh with the secondary button while the corresponding screen is active.
+- Keeps the previous image visible with an `UPDATING` indicator while a refresh is running.
+- Downloads and decodes images in a single background task so PNG and JPEG work do not compete for TLS and decode memory.
+- Places downloaded images and decode buffers in PSRAM.
+- Scales XKCD to the 238-pixel image area while retaining up to 720 pixels of width.
+- Slowly pans wide XKCD strips horizontally so text is larger and remains readable on the small screen.
+- Decodes APOD JPEG images with `espressif/esp_jpeg`, normalizes contrast, and applies ordered monochrome dithering.
+- Uses `thumbnail_url` when the APOD entry is a video.
+- Displays source title, XKCD number, or APOD publication date around the image.
+- Shows an on-screen error state when WiFi, HTTP, parsing, memory allocation, or decoding fails.
+
+The firmware uses NASA's `DEMO_KEY` by default. A different key can be supplied at compile time by defining the `NASA_API_KEY` string macro for the main component.
+
+The APOD screen changes after NASA publishes a new entry and the next refresh succeeds. It does not switch exactly at local midnight; with automatic refresh enabled, a newly published image may take up to six hours to appear. Restarting the board or pressing the secondary button requests it immediately.
+
 ### HTTP API on the ESP32
 
 Status: Implemented
@@ -240,6 +317,8 @@ Features:
 - `POST /nowplaying` accepts query numeric fields plus binary bitmap-slot body.
 - Percent-decodes UTF-8 query values.
 - `GET /usage.json` returns current display state for debugging.
+- `GET /mode` returns the active firmware mode.
+- `GET /mode?set=<mode>` selects `music`, `water`, `stats`, `pomodoro`, `clock`, `pet`, `sand`, `swarm`, `comic`, or `apod`.
 - `GET /diag/display` can show orientation, polarity, or timing diagnostic frames.
 - `GET /diag/display?pattern=clear` clears full-frame override mode.
 
@@ -414,4 +493,3 @@ Items documented but not active features in the current implementation:
 - microSD features.
 - Battery voltage ADC display.
 - Full production browser-store release workflow beyond packaging/signing helpers.
-
