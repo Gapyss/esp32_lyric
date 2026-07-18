@@ -8,7 +8,6 @@
 #include "esp_netif.h"
 #include "esp_netif_sntp.h"
 #include "esp_timer.h"
-#include "esp_wifi.h"
 #include "driver/gpio.h"
 #include "app_mode.h"
 #include "audio_chime.h"
@@ -16,14 +15,15 @@
 #include "board_client.h"
 #include "display_config.h"
 #include "freertos/FreeRTOS.h"
-#include "freertos/event_groups.h"
 #include "freertos/task.h"
 #include "http_api.h"
 #include "mdns.h"
 #include "music_screen.h"
+#include "network_manager.h"
 #include "nvs_flash.h"
 #include "pet_screen.h"
 #include "pomodoro_screen.h"
+#include "provisioning_display.h"
 #include "sand_screen.h"
 #include "stats_screen.h"
 #include "swarm_screen.h"
@@ -32,86 +32,22 @@
 #include "u8g2_st7305.h"
 #include "ui_error.h"
 #include "water_screen.h"
-#include "wifi_secrets.h"
 
 static const char *TAG = "g4pys.company";
-static const int WIFI_CONNECTED_BIT = BIT0;
-static EventGroupHandle_t g_wifi_events;
 static u8g2_st7305_t g_lcd;
 static const gpio_num_t MODE_BUTTON_GPIO = GPIO_NUM_0;
 static const gpio_num_t ACTION_BUTTON_GPIO = GPIO_NUM_18;
 static const int64_t ACTION_BUTTON_DEBOUNCE_US = 350000LL;
 static const int64_t ACTION_BUTTON_LONG_PRESS_US = 800000LL;
 
-static void wifi_event_handler(void *arg,
-                               esp_event_base_t event_base,
-                               int32_t event_id,
-                               void *event_data)
+static bool g_mdns_initialized;
+static bool g_mdns_http_advertised;
+static bool g_long_lived_services_started;
+static bool g_time_sync_started;
+
+static void time_sync_task(void *arg)
 {
     (void)arg;
-    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
-        music_set_network_status("acquiring");
-        esp_wifi_connect();
-    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        xEventGroupClearBits(g_wifi_events, WIFI_CONNECTED_BIT);
-        music_set_network_status("acquiring");
-        music_set_daemon_connected(false);
-        ESP_LOGW(TAG, "WiFi disconnected, reconnecting");
-        esp_wifi_connect();
-    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
-        const ip_event_got_ip_t *event = (const ip_event_got_ip_t *)event_data;
-        char ip[24];
-        snprintf(ip, sizeof(ip), IPSTR, IP2STR(&event->ip_info.ip));
-        music_set_network_status(ip);
-        ESP_LOGI(TAG, "WiFi connected, IP " IPSTR, IP2STR(&event->ip_info.ip));
-        xEventGroupSetBits(g_wifi_events, WIFI_CONNECTED_BIT);
-    }
-}
-
-static void wifi_start(void)
-{
-    g_wifi_events = xEventGroupCreate();
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_create_default_wifi_sta();
-
-    wifi_init_config_t init_config = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&init_config));
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
-                                                        ESP_EVENT_ANY_ID,
-                                                        wifi_event_handler,
-                                                        NULL,
-                                                        NULL));
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,
-                                                        IP_EVENT_STA_GOT_IP,
-                                                        wifi_event_handler,
-                                                        NULL,
-                                                        NULL));
-
-    wifi_config_t wifi_config = {};
-    snprintf((char *)wifi_config.sta.ssid, sizeof(wifi_config.sta.ssid), "%s", WIFI_SSID);
-    snprintf((char *)wifi_config.sta.password, sizeof(wifi_config.sta.password), "%s", WIFI_PASS);
-    wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
-
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
-    ESP_ERROR_CHECK(esp_wifi_start());
-
-    ESP_LOGI(TAG, "Connecting to WiFi SSID '%s'", WIFI_SSID);
-    xEventGroupWaitBits(g_wifi_events, WIFI_CONNECTED_BIT, pdFALSE, pdTRUE, portMAX_DELAY);
-}
-
-static void mdns_start(void)
-{
-    ESP_ERROR_CHECK(mdns_init());
-    ESP_ERROR_CHECK(mdns_hostname_set("g4pys-company"));
-    ESP_ERROR_CHECK(mdns_instance_name_set("g4pys.company Music Display"));
-    ESP_ERROR_CHECK(mdns_service_add("g4pys.company HTTP", "_http", "_tcp", 80, NULL, 0));
-    ESP_LOGI(TAG, "mDNS hostname set: g4pys-company.local");
-}
-
-static void time_sync_start(void)
-{
     setenv("TZ", "ICT-7", 1);
     tzset();
 
@@ -119,9 +55,14 @@ static void time_sync_start(void)
     esp_err_t err = esp_netif_sntp_init(&config);
     if (err == ESP_ERR_INVALID_STATE) {
         ESP_LOGW(TAG, "SNTP already initialized");
+        vTaskDelete(NULL);
         return;
     }
-    ESP_ERROR_CHECK(err);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "SNTP initialization failed: %s", esp_err_to_name(err));
+        vTaskDelete(NULL);
+        return;
+    }
 
     err = esp_netif_sntp_sync_wait(pdMS_TO_TICKS(10000));
     if (err == ESP_OK) {
@@ -147,6 +88,63 @@ static void time_sync_start(void)
     } else {
         ESP_LOGW(TAG, "SNTP sync not ready yet: %s", esp_err_to_name(err));
     }
+    vTaskDelete(NULL);
+}
+
+static void time_sync_start_async(void)
+{
+    if (g_time_sync_started) {
+        return;
+    }
+    g_time_sync_started = true;
+    const BaseType_t ok = xTaskCreate(time_sync_task, "sntp_sync", 4096, NULL, 3, NULL);
+    if (ok != pdPASS) {
+        g_time_sync_started = false;
+        ESP_LOGW(TAG, "Could not start SNTP task");
+    }
+}
+
+static void network_services_callback(NetworkServiceAction action,
+                                      const NetworkSnapshot *snapshot,
+                                      void *context)
+{
+    (void)context;
+    if (action == NETWORK_SERVICES_PAUSE) {
+        board_client_network_changed(false);
+        http_api_stop();
+        if (g_mdns_initialized && g_mdns_http_advertised) {
+            mdns_service_remove("_http", "_tcp");
+            g_mdns_http_advertised = false;
+        }
+        music_set_daemon_connected(false);
+        return;
+    }
+
+    music_set_network_status(snapshot->station_ip[0] == '\0' ? "acquiring" : snapshot->station_ip);
+    board_client_network_changed(true);
+    if (!g_mdns_initialized) {
+        if (mdns_init() != ESP_OK) {
+            ESP_LOGW(TAG, "mDNS initialization failed");
+        } else {
+            g_mdns_initialized = true;
+        }
+    }
+    if (g_mdns_initialized) {
+        ESP_ERROR_CHECK_WITHOUT_ABORT(mdns_hostname_set(snapshot->hostname));
+        ESP_ERROR_CHECK_WITHOUT_ABORT(mdns_instance_name_set("g4pys.company Music Display"));
+    }
+    if (g_mdns_initialized && !g_mdns_http_advertised &&
+        mdns_service_add("g4pys.company HTTP", "_http", "_tcp", 80, NULL, 0) == ESP_OK) {
+        g_mdns_http_advertised = true;
+    }
+    ESP_ERROR_CHECK_WITHOUT_ABORT(http_api_start());
+    if (!g_long_lived_services_started) {
+        g_long_lived_services_started = true;
+        comic_screen_start();
+        ESP_ERROR_CHECK_WITHOUT_ABORT(board_client_start());
+    }
+    time_sync_start_async();
+    ESP_LOGI(TAG, "normal services available at %s.local", snapshot->hostname);
 }
 
 static void mode_button_init(void)
@@ -160,23 +158,6 @@ static void mode_button_init(void)
     ESP_ERROR_CHECK_WITHOUT_ABORT(gpio_config(&cfg));
 }
 
-static void mode_button_poll(void)
-{
-    static int last_level = 1;
-    static int64_t last_toggle_us = 0;
-    const int level = gpio_get_level(MODE_BUTTON_GPIO);
-    const int64_t now_us = esp_timer_get_time();
-    if (last_level == 1 && level == 0 && now_us - last_toggle_us > 350000LL) {
-        const AppMode mode = app_mode_toggle();
-        last_toggle_us = now_us;
-        ESP_LOGI(TAG, "BOOT button toggled mode to %s", app_mode_name(mode));
-        if (mode != APP_MODE_WATER && mode != APP_MODE_POMODORO) {
-            audio_chime_stop();
-        }
-    }
-    last_level = level;
-}
-
 static void action_button_init(void)
 {
     gpio_config_t cfg = {};
@@ -188,69 +169,135 @@ static void action_button_init(void)
     ESP_ERROR_CHECK_WITHOUT_ABORT(gpio_config(&cfg));
 }
 
-// Meaning depends on the active screen: on Water, a short press logs a
-// drink (no long-press action there). On Pomodoro, short press toggles
-// start/pause and long press resets. Long-press must fire on release for a
-// held-and-released press (short action), but fires immediately once the
-// hold crosses the threshold for a long press -- otherwise a long-press
-// would always trigger the short-press action first.
-static void action_button_poll(void)
+static void action_button_short_press(AppMode mode)
 {
-    static int last_level = 1;
-    static int64_t press_started_us = 0;
-    static bool long_press_fired = false;
-    static int64_t last_action_us = 0;
+    if (mode == APP_MODE_WATER) {
+        water_log_drink();
+        ESP_LOGI(TAG, "drink logged via button");
+    } else if (mode == APP_MODE_POMODORO) {
+        pomodoro_toggle_start_pause();
+        ESP_LOGI(TAG, "pomodoro start/pause toggled via button");
+    } else if (mode == APP_MODE_PET) {
+        pet_pet();
+        ESP_LOGI(TAG, "creature petted via button");
+    } else if (mode == APP_MODE_SAND) {
+        sand_pour();
+        ESP_LOGI(TAG, "sand poured via button");
+    } else if (mode == APP_MODE_SWARM) {
+        swarm_scatter();
+        ESP_LOGI(TAG, "swarm scattered via button");
+    } else if (mode == APP_MODE_COMIC) {
+        comic_refresh();
+        ESP_LOGI(TAG, "comic refresh requested via button");
+    } else if (mode == APP_MODE_APOD) {
+        apod_refresh();
+        ESP_LOGI(TAG, "APOD refresh requested via button");
+    }
+}
 
-    const int level = gpio_get_level(ACTION_BUTTON_GPIO);
+static void action_button_long_press(AppMode mode)
+{
+    if (mode == APP_MODE_POMODORO) {
+        pomodoro_reset();
+        ESP_LOGI(TAG, "pomodoro reset via long-press");
+    } else if (mode == APP_MODE_SAND) {
+        sand_clear();
+        ESP_LOGI(TAG, "sand field cleared via long-press");
+    } else if (mode == APP_MODE_SWARM) {
+        swarm_toggle_roam();
+        ESP_LOGI(TAG, "swarm roam toggled via long-press");
+    }
+}
+
+static void buttons_poll(void)
+{
+    static int last_mode_level = 1;
+    static int last_action_level = 1;
+    static int64_t action_started_us;
+    static int64_t last_mode_action_us;
+    static int64_t last_action_us;
+    static int64_t chord_started_us;
+    static bool action_long_fired;
+    static bool chord_suppressed;
+    static bool setup_opened;
+    static bool reset_fired;
+
+    const int mode_level = gpio_get_level(MODE_BUTTON_GPIO);
+    const int action_level = gpio_get_level(ACTION_BUTTON_GPIO);
     const int64_t now_us = esp_timer_get_time();
-    const AppMode mode = app_mode_get();
+    const bool both_down = mode_level == 0 && action_level == 0;
 
-    if (last_level == 1 && level == 0) {
-        press_started_us = now_us;
-        long_press_fired = false;
-    } else if (last_level == 0 && level == 0 && !long_press_fired &&
-               now_us - press_started_us > ACTION_BUTTON_LONG_PRESS_US) {
-        long_press_fired = true;
-        last_action_us = now_us;
-        if (mode == APP_MODE_POMODORO) {
-            pomodoro_reset();
-            ESP_LOGI(TAG, "pomodoro reset via long-press");
-        } else if (mode == APP_MODE_SAND) {
-            sand_clear();
-            ESP_LOGI(TAG, "sand field cleared via long-press");
-        } else if (mode == APP_MODE_SWARM) {
-            swarm_toggle_roam();
-            ESP_LOGI(TAG, "swarm roam toggled via long-press");
+    if (both_down) {
+        if (!chord_suppressed) {
+            chord_suppressed = true;
+            chord_started_us = now_us;
+            setup_opened = false;
+            reset_fired = false;
+            action_long_fired = true;
         }
-    } else if (last_level == 0 && level == 1) {
-        if (!long_press_fired && now_us - last_action_us > ACTION_BUTTON_DEBOUNCE_US) {
-            if (mode == APP_MODE_WATER) {
-                water_log_drink();
-                ESP_LOGI(TAG, "drink logged via button");
-            } else if (mode == APP_MODE_POMODORO) {
-                pomodoro_toggle_start_pause();
-                ESP_LOGI(TAG, "pomodoro start/pause toggled via button");
-            } else if (mode == APP_MODE_PET) {
-                pet_pet();
-                ESP_LOGI(TAG, "creature petted via button");
-            } else if (mode == APP_MODE_SAND) {
-                sand_pour();
-                ESP_LOGI(TAG, "sand poured via button");
-            } else if (mode == APP_MODE_SWARM) {
-                swarm_scatter();
-                ESP_LOGI(TAG, "swarm scattered via button");
-            } else if (mode == APP_MODE_COMIC) {
-                comic_refresh();
-                ESP_LOGI(TAG, "comic refresh requested via button");
-            } else if (mode == APP_MODE_APOD) {
-                apod_refresh();
-                ESP_LOGI(TAG, "APOD refresh requested via button");
-            }
+        const int64_t held_us = now_us - chord_started_us;
+        if (held_us >= 5000000LL && !setup_opened) {
+            setup_opened = true;
+            ESP_ERROR_CHECK_WITHOUT_ABORT(network_manager_open_manual_setup());
+        }
+        if (held_us >= 5000000LL && held_us < 15000000LL) {
+            const int remaining = (int)((15000000LL - held_us + 999999LL) / 1000000LL);
+            network_manager_set_reset_countdown(remaining);
+        }
+        if (held_us >= 15000000LL && !reset_fired) {
+            reset_fired = true;
+            network_manager_set_reset_countdown(0);
+            ESP_ERROR_CHECK_WITHOUT_ABORT(network_manager_reset_provisioning());
+        }
+        last_mode_level = mode_level;
+        last_action_level = action_level;
+        return;
+    }
+
+    if (chord_suppressed) {
+        network_manager_set_reset_countdown(0);
+        if (mode_level == 1 && action_level == 1) {
+            chord_suppressed = false;
+        }
+        last_mode_level = mode_level;
+        last_action_level = action_level;
+        return;
+    }
+
+    if (network_manager_provisioning_display_active()) {
+        last_mode_level = mode_level;
+        last_action_level = action_level;
+        return;
+    }
+
+    const AppMode mode = app_mode_get();
+    if (last_mode_level == 0 && mode_level == 1 && now_us - last_mode_action_us > 350000LL) {
+        const AppMode next = app_mode_toggle();
+        last_mode_action_us = now_us;
+        ESP_LOGI(TAG, "BOOT button toggled mode to %s", app_mode_name(next));
+        if (next != APP_MODE_WATER && next != APP_MODE_POMODORO) {
+            audio_chime_stop();
+        }
+    }
+
+    if (last_action_level == 1 && action_level == 0) {
+        action_started_us = now_us;
+        action_long_fired = false;
+    } else if (last_action_level == 0 && action_level == 0 && !action_long_fired &&
+               now_us - action_started_us > ACTION_BUTTON_LONG_PRESS_US) {
+        action_long_fired = true;
+        last_action_us = now_us;
+        action_button_long_press(mode);
+    } else if (last_action_level == 0 && action_level == 1) {
+        if (!action_long_fired && now_us - last_action_us > ACTION_BUTTON_DEBOUNCE_US) {
+            action_button_short_press(mode);
             last_action_us = now_us;
         }
-        long_press_fired = false;
+        action_long_fired = false;
     }
-    last_level = level;
+
+    last_mode_level = mode_level;
+    last_action_level = action_level;
 }
 
 static void display_start(void)
@@ -295,14 +342,15 @@ static void render_task(void *arg)
                                    metrics.env_valid);
             last_metrics_us = now_us;
         }
-        mode_button_poll();
-        action_button_poll();
+        buttons_poll();
         // Ticks unconditionally, unlike water_tick, so a countdown started on
         // this screen keeps advancing (and can still alert) while another
         // screen is displayed.
         pomodoro_tick();
         u8g2_ClearBuffer(u8);
-        if (mode == APP_MODE_WATER) {
+        if (network_manager_provisioning_display_active()) {
+            provisioning_display_render(u8);
+        } else if (mode == APP_MODE_WATER) {
             water_tick();
             water_render_current(u8);
         } else if (mode == APP_MODE_STATS) {
@@ -371,14 +419,7 @@ extern "C" void app_main(void)
                                                 1);
     ESP_ERROR_CHECK(task_ok == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
 
-    ESP_LOGI(TAG, "starting wifi");
-    wifi_start();
-    comic_screen_start();
-    ESP_LOGI(TAG, "wifi ready; starting SNTP");
-    time_sync_start();
-    ESP_LOGI(TAG, "starting mDNS and HTTP");
-    mdns_start();
-    ESP_ERROR_CHECK(http_api_start());
-    ESP_LOGI(TAG, "starting board client");
-    ESP_ERROR_CHECK(board_client_start());
+    music_set_network_status("acquiring");
+    ESP_LOGI(TAG, "starting non-blocking network manager");
+    ESP_ERROR_CHECK(network_manager_start(network_services_callback, NULL));
 }

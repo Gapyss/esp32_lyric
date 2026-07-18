@@ -29,6 +29,7 @@ import socket
 import sqlite3
 import struct
 import subprocess
+import secrets
 import threading
 import time
 import urllib.error
@@ -38,6 +39,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
+import uuid
 
 
 DISPLAY_WIDTH = 400
@@ -52,8 +54,12 @@ NEGATIVE_CACHE_SECONDS = 14 * 24 * 60 * 60
 # the server is just slow), so the budget must be generous and timeouts are
 # worth one retry -- a timed-out resolve sticks as an error for the whole track.
 LRCLIB_TIMEOUT_SECONDS = 15.0
-LRCLIB_RETRY_ATTEMPTS = 2
+# lrclib sits behind Cloudflare, which sheds bursts of requests with 503 (and
+# occasionally 429/502/504). These are transient, so retry them like timeouts.
+LRCLIB_RETRY_ATTEMPTS = 3
 LRCLIB_RETRY_DELAY_SECONDS = 2.0
+LRCLIB_RETRYABLE_STATUS = (429, 502, 503, 504)
+LRCLIB_MAX_RETRY_AFTER_SECONDS = 10.0
 LRCLIB_USER_AGENT = "g4pys-lyrics-display/0.1"
 MIN_SCHEDULE_SWAP_MS = 25
 MDNS_GROUP = "224.0.0.251"
@@ -65,6 +71,16 @@ FRAME_KIND_FULL_SCHEDULED = 2
 FRAME_KIND_RECT_NOW = 3
 FRAME_KIND_RECT_SCHEDULED = 4
 FRAME_ENVELOPE_STRUCT = struct.Struct("!4sBBHHHHHHHII")
+SEC2_MAGIC = b"SEC2"
+SEC2_VERSION = 1
+SEC2_TEXT = 1
+SEC2_BINARY = 2
+SEC2_HEADER_STRUCT = struct.Struct("!4sBBHQI")
+SEC2_TAG_BYTES = 32
+AUTH_TIMEOUT_SECONDS = 5.0
+HEARTBEAT_INTERVAL_SECONDS = 20.0
+HEARTBEAT_TIMEOUT_SECONDS = 10.0
+BOARD_QUEUE_DEPTH = 8
 LYRIC_BASE_SIZE = 30
 LYRIC_WRAP_SIZE = 26
 LYRIC_MIN_SIZE = 14
@@ -99,6 +115,62 @@ TRACKING_WIDE = 0.04  # em; matches the design system's mono-caption letter-spac
 KARAOKE_STROKE_PCT = 3.5
 
 LyricBreakFn = Callable[[str, float, int], list[str]]
+
+
+@dataclass(frozen=True)
+class DaemonIdentity:
+    daemon_uuid: str
+    token: str
+
+
+def default_identity_path() -> Path:
+    return Path.home() / ".g4pys" / "lyrics-identity.json"
+
+
+def load_or_create_identity(path: Path | None = None) -> DaemonIdentity:
+    """Load the long-lived daemon UUID and pairing secret, creating them safely."""
+    path = path or default_identity_path()
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        os.chmod(path.parent, 0o700)
+    except OSError:
+        pass
+    if path.exists():
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        daemon_uuid = str(uuid.UUID(str(raw["daemon_uuid"])))
+        token = str(raw["token"])
+        if not re.fullmatch(r"[0-9a-f]{64}", token):
+            raise ValueError(f"invalid token in {path}")
+        os.chmod(path, 0o600)
+        return DaemonIdentity(daemon_uuid, token)
+
+    identity = DaemonIdentity(str(uuid.uuid4()), secrets.token_hex(32))
+    payload = (json.dumps({"version": 1, "daemon_uuid": identity.daemon_uuid, "token": identity.token}, indent=2) + "\n").encode()
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        os.write(fd, payload)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    return identity
+
+
+def _auth_transcript(role: str, daemon_uuid: str, server_nonce: bytes, client_nonce: bytes) -> bytes:
+    return b"lyrics-v2/" + role.encode("ascii") + b"\0" + daemon_uuid.encode("ascii") + b"\0" + server_nonce + client_nonce
+
+
+def derive_session_keys(token: str, server_nonce: bytes, client_nonce: bytes) -> tuple[bytes, bytes]:
+    """RFC 5869 HKDF-SHA256; returns (client->server, server->client)."""
+    salt = server_nonce + client_nonce
+    prk = hmac.new(salt, token.encode("ascii"), hashlib.sha256).digest()
+    output = b""
+    previous = b""
+    counter = 1
+    while len(output) < 64:
+        previous = hmac.new(prk, previous + b"lyrics-v2/session" + bytes([counter]), hashlib.sha256).digest()
+        output += previous
+        counter += 1
+    return output[:32], output[32:64]
 
 
 def monotonic_ms() -> int:
@@ -240,7 +312,7 @@ class AppState:
 
 @dataclass
 class ScheduledFrame:
-    frame: bytes
+    frames: dict[str, bytes]  # profile name -> rendered frame
     swap_in_ms: int
     due_monotonic_ms: int
 
@@ -281,6 +353,105 @@ class LyricLayout:
 
 
 DEFAULT_LYRIC_LAYOUT_SIZES = LyricLayoutSizes()
+
+# Compact 240x240 lyric band (ESP8266 GeekMagic SmallTV boards). Same fitting
+# algorithm as the 400x300 band, just smaller sizes and a tighter box.
+SQUARE_LYRIC_LAYOUT_SIZES = LyricLayoutSizes(
+    base_size=22,
+    wrap_size=18,
+    min_size=12,
+    band_top_y=104,
+    single_baseline_y=146,
+    single_highlight_y=162,
+    highlight_gap_y=16,
+)
+
+
+@dataclass(frozen=True)
+class RenderProfile:
+    """One board display geometry the daemon can render frames for.
+
+    Boards opt into a profile with /board?w=&h= at handshake time; the default
+    (no query) stays the original 400x300 e-ink layout so existing ESP32
+    firmware needs no change.
+    """
+
+    name: str
+    width: int
+    height: int
+    lyric_sizes: LyricLayoutSizes
+    lyric_box_x: int
+    lyric_box_width: int
+    lyric_band_bottom_y: int
+
+    @property
+    def row_bytes(self) -> int:
+        return self.width // 8
+
+    @property
+    def frame_bytes(self) -> int:
+        return self.width * self.height // 8
+
+
+WIDE_PROFILE = RenderProfile(
+    name="400x300",
+    width=DISPLAY_WIDTH,
+    height=DISPLAY_HEIGHT,
+    lyric_sizes=DEFAULT_LYRIC_LAYOUT_SIZES,
+    lyric_box_x=LYRIC_BOX_X,
+    lyric_box_width=LYRIC_BOX_WIDTH,
+    lyric_band_bottom_y=LYRIC_BAND_BOTTOM_Y,
+)
+SQUARE_PROFILE = RenderProfile(
+    name="240x240",
+    width=240,
+    height=240,
+    lyric_sizes=SQUARE_LYRIC_LAYOUT_SIZES,
+    lyric_box_x=12,
+    lyric_box_width=240 - 24,
+    lyric_band_bottom_y=184,
+)
+DEFAULT_PROFILE = WIDE_PROFILE
+PROFILES_BY_SIZE = {
+    (WIDE_PROFILE.width, WIDE_PROFILE.height): WIDE_PROFILE,
+    (SQUARE_PROFILE.width, SQUARE_PROFILE.height): SQUARE_PROFILE,
+}
+
+
+@dataclass(frozen=True)
+class ProgressGeom:
+    """Coordinates for the elapsed/bar/remaining progress row (top-origin y)."""
+
+    time_size: int
+    left_x: int
+    left_w: int
+    right_x: int
+    right_w: int
+    baseline_y: int
+    bar_x: int
+    bar_w: int
+    center_y: int  # track centerline, top-origin
+    dot_r: float
+
+
+WIDE_PROGRESS_GEOM = ProgressGeom(
+    time_size=13, left_x=14, left_w=54, right_x=328, right_w=58,
+    baseline_y=116, bar_x=76, bar_w=238, center_y=109, dot_r=4.5,
+)
+SQUARE_PROGRESS_GEOM = ProgressGeom(
+    time_size=11, left_x=12, left_w=48, right_x=180, right_w=48,
+    baseline_y=95, bar_x=66, bar_w=108, center_y=91, dot_r=3.5,
+)
+
+
+def profile_from_board_path(path: str) -> RenderProfile:
+    query = parse_qs(urlparse(path).query)
+    try:
+        width = int((query.get("w") or ["0"])[0])
+        height = int((query.get("h") or ["0"])[0])
+    except ValueError:
+        return DEFAULT_PROFILE
+    return PROFILES_BY_SIZE.get((width, height), DEFAULT_PROFILE)
 
 
 def fit_lyric_layout(
@@ -364,15 +535,20 @@ def _lyric_baselines(row_count: int, size: float, box_h: int, sizes: LyricLayout
     return [int(round(block_top + baseline_offset + idx * line_height)) for idx in range(row_count)]
 
 
-def dirty_rect(previous: bytes | None, current: bytes) -> DirtyRect | None:
+def dirty_rect(
+    previous: bytes | None,
+    current: bytes,
+    width: int = DISPLAY_WIDTH,
+    height: int = DISPLAY_HEIGHT,
+) -> DirtyRect | None:
     if previous is None or len(previous) != len(current) or previous == current:
         return None
-    display_row_bytes = DISPLAY_WIDTH // 8
-    min_row = DISPLAY_HEIGHT
+    display_row_bytes = width // 8
+    min_row = height
     max_row = -1
     min_byte = display_row_bytes
     max_byte = -1
-    for y in range(DISPLAY_HEIGHT):
+    for y in range(height):
         row_off = y * display_row_bytes
         for bx in range(display_row_bytes):
             idx = row_off + bx
@@ -393,7 +569,7 @@ def dirty_rect(previous: bytes | None, current: bytes) -> DirtyRect | None:
     return DirtyRect(
         x=min_byte * 8,
         y=min_row,
-        width=min(row_bytes * 8, DISPLAY_WIDTH - min_byte * 8),
+        width=min(row_bytes * 8, width - min_byte * 8),
         height=max_row - min_row + 1,
         row_bytes=row_bytes,
         payload=bytes(payload),
@@ -410,13 +586,15 @@ def make_frame_envelope(
     rect_height: int,
     row_bytes: int,
     swap_in_ms: int,
+    display_width: int = DISPLAY_WIDTH,
+    display_height: int = DISPLAY_HEIGHT,
 ) -> bytes:
     header = FRAME_ENVELOPE_STRUCT.pack(
         FRAME_ENVELOPE_MAGIC,
         FRAME_ENVELOPE_VERSION,
         kind,
-        DISPLAY_WIDTH,
-        DISPLAY_HEIGHT,
+        display_width,
+        display_height,
         x,
         y,
         rect_width,
@@ -739,6 +917,28 @@ def _is_timeout_error(exc: BaseException) -> bool:
     return False
 
 
+def _is_retryable_error(exc: BaseException) -> bool:
+    if _is_timeout_error(exc):
+        return True
+    if isinstance(exc, urllib.error.HTTPError) and exc.code in LRCLIB_RETRYABLE_STATUS:
+        return True
+    return False
+
+
+def _retry_delay_seconds(exc: BaseException) -> float:
+    """Delay before the next attempt, honoring a Retry-After header if lrclib
+    sends one (Cloudflare 503/429 sometimes does), capped so a track change
+    doesn't wait absurdly long."""
+    if isinstance(exc, urllib.error.HTTPError):
+        header = exc.headers.get("Retry-After") if exc.headers else None
+        if header:
+            try:
+                return max(0.0, min(float(header), LRCLIB_MAX_RETRY_AFTER_SECONDS))
+            except ValueError:
+                pass
+    return LRCLIB_RETRY_DELAY_SECONDS
+
+
 def lrclib_request(path: str, params: dict[str, Any], cancel: threading.Event | None = None) -> Any:
     url = "https://lrclib.net" + path + "?" + urllib.parse.urlencode(
         {k: v for k, v in params.items() if v not in ("", None, 0)}
@@ -753,12 +953,13 @@ def lrclib_request(path: str, params: dict[str, Any], cancel: threading.Event | 
             with urllib.request.urlopen(req, timeout=LRCLIB_TIMEOUT_SECONDS) as resp:
                 return json.loads(resp.read().decode("utf-8"))
         except Exception as exc:
-            if not _is_timeout_error(exc) or attempt + 1 >= LRCLIB_RETRY_ATTEMPTS:
+            if not _is_retryable_error(exc) or attempt + 1 >= LRCLIB_RETRY_ATTEMPTS:
                 raise
-            if cancel is not None and cancel.wait(LRCLIB_RETRY_DELAY_SECONDS):
+            delay = _retry_delay_seconds(exc)
+            if cancel is not None and cancel.wait(delay):
                 raise ResolveCancelled()
             if cancel is None:
-                time.sleep(LRCLIB_RETRY_DELAY_SECONDS)
+                time.sleep(delay)
 
 
 def fetch_lrclib(track: TrackInfo, cancel: threading.Event | None = None) -> Lyrics:
@@ -802,7 +1003,7 @@ def fetch_lrclib(track: TrackInfo, cancel: threading.Event | None = None) -> Lyr
 
 
 class FrameRenderer:
-    def render(self, state: AppState) -> bytes:
+    def render(self, state: AppState, profile: RenderProfile = DEFAULT_PROFILE) -> bytes:
         raise NotImplementedError
 
 
@@ -819,6 +1020,10 @@ class CoreTextFrameRenderer(FrameRenderer):
         self.font_name = font_name
         self.color_space = Quartz.CGColorSpaceCreateDeviceGray()
         self.brand_fonts = self._load_brand_fonts(NSURL)
+        # Height of the frame currently being rendered; the Core Text primitives
+        # need it to flip top-origin layout coords into Quartz's bottom-origin
+        # space. render() sets it per call (rendering is single-threaded).
+        self._h = DISPLAY_HEIGHT
 
     def _load_brand_fonts(self, NSURL: Any) -> dict[str, str]:
         """Register vendored brand TTFs and resolve their real PostScript names.
@@ -848,17 +1053,61 @@ class CoreTextFrameRenderer(FrameRenderer):
     def _role_font(self, role: str) -> str:
         return self.brand_fonts.get(role, self.font_name)
 
-    def render(self, state: AppState) -> bytes:
+    def render(self, state: AppState, profile: RenderProfile = DEFAULT_PROFILE) -> bytes:
         q = self.Quartz
+        self._h = profile.height
         ctx = q.CGBitmapContextCreate(
-            None, DISPLAY_WIDTH, DISPLAY_HEIGHT, 8, 0, self.color_space, q.kCGImageAlphaNone
+            None, profile.width, profile.height, 8, 0, self.color_space, q.kCGImageAlphaNone
         )
         q.CGContextSetGrayFillColor(ctx, 0.0, 1.0)
-        q.CGContextFillRect(ctx, q.CGRectMake(0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT))
+        q.CGContextFillRect(ctx, q.CGRectMake(0, 0, profile.width, profile.height))
         q.CGContextSetGrayFillColor(ctx, 1.0, 1.0)
         q.CGContextSetShouldAntialias(ctx, True)
         q.CGContextSetTextMatrix(ctx, q.CGAffineTransformIdentity)
 
+        if profile.name == SQUARE_PROFILE.name:
+            self._draw_square(ctx, state, profile)
+        else:
+            self._draw_wide(ctx, state, profile)
+
+        image = q.CGBitmapContextCreateImage(ctx)
+        pixels = bytes(q.CGDataProviderCopyData(q.CGImageGetDataProvider(image)))
+        stride = q.CGImageGetBytesPerRow(image)
+        return pack_1bpp(pixels, profile.width, profile.height, stride)
+
+    def _draw_lyric_band(self, ctx: Any, state: AppState, profile: RenderProfile, display_font: str) -> LyricLayout:
+        current, _next_line, _third = state.current_lines()
+        current_layout = fit_lyric_layout(
+            current,
+            profile.lyric_box_width,
+            profile.lyric_band_bottom_y - profile.lyric_sizes.band_top_y,
+            profile.lyric_sizes,
+            self._break_text,
+        )
+        # Karaoke fill only makes sense for timed lines; loading/error/plain and
+        # "Instrumental" copy would otherwise render fully hollow at fraction 0.
+        karaoke = bool(state.lyrics.synced) and not state.lyrics.instrumental
+        fraction = state.current_line_highlight_fraction() if karaoke else 1.0
+        total_chars = sum(len(row) for row in current_layout.rows) or 1
+        consumed_chars = 0
+        for row, baseline_y in zip(current_layout.rows, current_layout.baselines):
+            row_fraction = clamp(
+                (fraction * total_chars - consumed_chars) / max(1, len(row)), 0.0, 1.0
+            )
+            self._draw_karaoke_text(
+                ctx,
+                row,
+                current_layout.font_size,
+                profile.lyric_box_x,
+                baseline_y,
+                profile.lyric_box_width,
+                row_fraction if karaoke else 1.0,
+                display_font,
+            )
+            consumed_chars += len(row)
+        return current_layout
+
+    def _draw_wide(self, ctx: Any, state: AppState, profile: RenderProfile) -> None:
         label_font = self._role_font("label")
         display_font = self._role_font("display")
         body_font = self._role_font("body")
@@ -879,45 +1128,15 @@ class CoreTextFrameRenderer(FrameRenderer):
             self._draw_text(
                 ctx, "g4pys.company", 13, 260, 292, 126, "right", font_name=MONO_FONT_NAME, tracking=TRACKING_WIDE
             )
-            image = q.CGBitmapContextCreateImage(ctx)
-            pixels = bytes(q.CGDataProviderCopyData(q.CGImageGetDataProvider(image)))
-            stride = q.CGImageGetBytesPerRow(image)
-            return pack_1bpp(pixels, DISPLAY_WIDTH, DISPLAY_HEIGHT, stride)
+            return
 
         self._draw_text(ctx, state.track.title, 28, 14, 60, DISPLAY_WIDTH - 28, "left", font_name=display_font)
         self._draw_text(ctx, state.track.artist, 18, 14, 88, DISPLAY_WIDTH - 28, "left", font_name=body_medium_font)
-        self._draw_progress(ctx, state, MONO_FONT_NAME)
+        self._draw_progress(ctx, state, MONO_FONT_NAME, WIDE_PROGRESS_GEOM)
         self._draw_rule(ctx, 12, 130, DISPLAY_WIDTH - 24)
 
-        current, next_line, third = state.current_lines()
-        current_layout = fit_lyric_layout(
-            current,
-            LYRIC_BOX_WIDTH,
-            LYRIC_BAND_BOTTOM_Y - LYRIC_BAND_TOP_Y,
-            DEFAULT_LYRIC_LAYOUT_SIZES,
-            self._break_text,
-        )
-        # Karaoke fill only makes sense for timed lines; loading/error/plain and
-        # "Instrumental" copy would otherwise render fully hollow at fraction 0.
-        karaoke = bool(state.lyrics.synced) and not state.lyrics.instrumental
-        fraction = state.current_line_highlight_fraction() if karaoke else 1.0
-        total_chars = sum(len(row) for row in current_layout.rows) or 1
-        consumed_chars = 0
-        for row, baseline_y in zip(current_layout.rows, current_layout.baselines):
-            row_fraction = clamp(
-                (fraction * total_chars - consumed_chars) / max(1, len(row)), 0.0, 1.0
-            )
-            self._draw_karaoke_text(
-                ctx,
-                row,
-                current_layout.font_size,
-                LYRIC_BOX_X,
-                baseline_y,
-                LYRIC_BOX_WIDTH,
-                row_fraction if karaoke else 1.0,
-                display_font,
-            )
-            consumed_chars += len(row)
+        _current, next_line, third = state.current_lines()
+        current_layout = self._draw_lyric_band(ctx, state, profile, display_font)
         self._draw_text(ctx, next_line, 21, 14, 224, DISPLAY_WIDTH - 28, "center", font_name=body_font)
         if not current_layout.hide_third and third:
             self._draw_text(ctx, third, 16, 14, 252, DISPLAY_WIDTH - 28, "center", font_name=body_font)
@@ -932,10 +1151,56 @@ class CoreTextFrameRenderer(FrameRenderer):
             ctx, "g4pys.company", 13, 260, 292, 126, "right", font_name=MONO_FONT_NAME, tracking=TRACKING_WIDE
         )
 
-        image = q.CGBitmapContextCreateImage(ctx)
-        pixels = bytes(q.CGDataProviderCopyData(q.CGImageGetDataProvider(image)))
-        stride = q.CGImageGetBytesPerRow(image)
-        return pack_1bpp(pixels, DISPLAY_WIDTH, DISPLAY_HEIGHT, stride)
+    def _draw_square(self, ctx: Any, state: AppState, profile: RenderProfile) -> None:
+        """Compact 240x240 layout for the ESP8266 SmallTV boards.
+
+        Same structure as the wide layout -- eyebrow, title/artist, progress,
+        karaoke lyric band, next line, footer -- just tighter type scale.
+        """
+        width = profile.width
+        label_font = self._role_font("label")
+        display_font = self._role_font("display")
+        body_font = self._role_font("body")
+        body_medium_font = self._role_font("body_medium")
+
+        self._draw_text(
+            ctx, "NOW PLAYING", 11, 12, 14, width - 24, "left", font_name=label_font, tracking=TRACKING_MEGA
+        )
+        self._draw_rule(ctx, 10, 24, width - 20)
+
+        if not state.track.title:
+            self._draw_text(ctx, "nothing playing", 22, 12, 112, width - 24, "center", font_name=display_font)
+            self._draw_text(
+                ctx, "waiting for youtube music", 13, 12, 140, width - 24, "center", font_name=body_font
+            )
+            self._screen_rect(ctx, 12, 126, width - 24, 18)
+            self._draw_text(
+                ctx, "g4pys.company", 11, 116, 228, width - 128, "right", font_name=MONO_FONT_NAME, tracking=TRACKING_WIDE
+            )
+            return
+
+        self._draw_text(ctx, state.track.title, 20, 12, 52, width - 24, "left", font_name=display_font)
+        self._draw_text(ctx, state.track.artist, 14, 12, 74, width - 24, "left", font_name=body_medium_font)
+        self._draw_progress(ctx, state, MONO_FONT_NAME, SQUARE_PROGRESS_GEOM)
+        self._draw_rule(ctx, 10, 104, width - 20)
+
+        _current, next_line, third = state.current_lines()
+        current_layout = self._draw_lyric_band(ctx, state, profile, display_font)
+        self._draw_text(ctx, next_line, 14, 12, 202, width - 24, "center", font_name=body_font)
+        if not current_layout.hide_third and third:
+            self._draw_text(ctx, third, 12, 12, 222, width - 24, "center", font_name=body_font)
+            self._screen_rect(ctx, 12, 210, width - 24, 16)
+        if state.clock.paused:
+            self._draw_state_chip(
+                ctx, "PAUSED", 12, 234, font_name=label_font, size=11, pad_x=7, chip_h=16, rise=11
+            )
+        else:
+            self._draw_text(
+                ctx, "PLAYING", 11, 12, 234, 110, "left", font_name=label_font, tracking=TRACKING_MEGA
+            )
+        self._draw_text(
+            ctx, "g4pys.company", 11, 116, 234, width - 128, "right", font_name=MONO_FONT_NAME, tracking=TRACKING_WIDE
+        )
 
     def _break_text(self, text: str, size: float, width: int) -> list[str]:
         if not text:
@@ -1021,10 +1286,10 @@ class CoreTextFrameRenderer(FrameRenderer):
             visual_x = x
         draw_x = visual_x - visual_left
 
-        baseline_y = DISPLAY_HEIGHT - baseline_y_top_origin
+        baseline_y = self._h - baseline_y_top_origin
         pad = 3
         clip_y = max(0, math.floor(baseline_y + ink_y - pad))
-        clip_top = min(DISPLAY_HEIGHT, math.ceil(baseline_y + ink_y + ink_h + pad))
+        clip_top = min(self._h, math.ceil(baseline_y + ink_y + ink_h + pad))
         if clip_top <= clip_y:
             return
 
@@ -1037,7 +1302,7 @@ class CoreTextFrameRenderer(FrameRenderer):
 
     def _draw_rule(self, ctx: Any, x: int, y_top_origin: int, width: int) -> None:
         q = self.Quartz
-        y = DISPLAY_HEIGHT - y_top_origin
+        y = self._h - y_top_origin
         q.CGContextFillRect(ctx, q.CGRectMake(x, y, width, 1))
 
     def _pill_path(self, x: float, y: float, w: float, h: float) -> Any:
@@ -1116,7 +1381,7 @@ class CoreTextFrameRenderer(FrameRenderer):
         visual_left, visual_width, _advance = self._line_visual_metrics(solid_line)
         visual_x = x + max(0, int((width - visual_width) / 2))
         draw_x = visual_x - visual_left
-        baseline_y = DISPLAY_HEIGHT - baseline_y_top_origin
+        baseline_y = self._h - baseline_y_top_origin
         # The clip only bounds the horizontal wipe; keep it tall so Thai mark
         # stacks and deep descenders never get shaved (only this row's glyphs
         # are drawn in this pass, so a generous band cannot bleed).
@@ -1149,7 +1414,7 @@ class CoreTextFrameRenderer(FrameRenderer):
         the text underneath reads as gray -- the design system's ink-muted.
         """
         q = self.Quartz
-        y0 = DISPLAY_HEIGHT - y_top_origin - h
+        y0 = self._h - y_top_origin - h
         q.CGContextSaveGState(ctx)
         q.CGContextSetShouldAntialias(ctx, False)
         q.CGContextSetGrayStrokeColor(ctx, 0.0, 1.0)
@@ -1162,37 +1427,53 @@ class CoreTextFrameRenderer(FrameRenderer):
             q.CGContextStrokePath(ctx)
         q.CGContextRestoreGState(ctx)
 
-    def _draw_state_chip(self, ctx: Any, text: str, x: int, baseline_y_top_origin: int, font_name: str) -> None:
+    def _draw_state_chip(
+        self,
+        ctx: Any,
+        text: str,
+        x: int,
+        baseline_y_top_origin: int,
+        font_name: str,
+        size: int = 13,
+        pad_x: int = 9,
+        chip_h: int = 20,
+        rise: int = 14,
+    ) -> None:
         """Inverted pill chip -- the 1-bit stand-in for the ember accent."""
         ct = self.CoreText
-        font = ct.CTFontCreateWithName(font_name, 13, None)
+        font = ct.CTFontCreateWithName(font_name, size, None)
         attrs = {
             ct.kCTFontAttributeName: font,
             ct.kCTForegroundColorFromContextAttributeName: True,
-            ct.kCTKernAttributeName: TRACKING_MEGA * 13,
+            ct.kCTKernAttributeName: TRACKING_MEGA * size,
         }
         line = ct.CTLineCreateWithAttributedString(
             self.NSAttributedString.alloc().initWithString_attributes_(text, attrs)
         )
         _left, text_w, _advance = self._line_visual_metrics(line)
-        pad_x, chip_h = 9, 20
         chip_w = int(text_w) + pad_x * 2
-        chip_y_top = baseline_y_top_origin - 14
-        self._fill_pill(ctx, x, DISPLAY_HEIGHT - chip_y_top - chip_h, chip_w, chip_h)
+        chip_y_top = baseline_y_top_origin - rise
+        self._fill_pill(ctx, x, self._h - chip_y_top - chip_h, chip_w, chip_h)
         self._draw_text(
-            ctx, text, 13, x + pad_x, baseline_y_top_origin, chip_w, "left",
+            ctx, text, size, x + pad_x, baseline_y_top_origin, chip_w, "left",
             font_name=font_name, tracking=TRACKING_MEGA, gray=0.0,
         )
 
-    def _draw_progress(self, ctx: Any, state: AppState, font_name: str) -> None:
+    def _draw_progress(self, ctx: Any, state: AppState, font_name: str, geom: ProgressGeom) -> None:
         q = self.Quartz
         elapsed = state.clock.interpolated_position()
         duration = max(0.0, state.track.duration_sec)
-        self._draw_text(ctx, format_time(elapsed), 13, 14, 116, 54, "left", font_name=font_name)
+        self._draw_text(
+            ctx, format_time(elapsed), geom.time_size, geom.left_x, geom.baseline_y, geom.left_w,
+            "left", font_name=font_name,
+        )
         remaining = max(0.0, duration - elapsed) if duration else 0.0
-        self._draw_text(ctx, "-" + format_time(remaining), 13, 328, 116, 58, "right", font_name=font_name)
-        bar_x, bar_w = 76, 238
-        center_y = DISPLAY_HEIGHT - 109  # track centerline, bottom-up coords
+        self._draw_text(
+            ctx, "-" + format_time(remaining), geom.time_size, geom.right_x, geom.baseline_y, geom.right_w,
+            "right", font_name=font_name,
+        )
+        bar_x, bar_w = geom.bar_x, geom.bar_w
+        center_y = self._h - geom.center_y  # track centerline, bottom-up coords
         fraction = clamp(elapsed / duration, 0.0, 1.0) if duration > 0 else 0.0
         played_w = bar_w * fraction
         # remaining track: dotted hairline reads as ink-muted on the 1-bit panel
@@ -1209,23 +1490,25 @@ class CoreTextFrameRenderer(FrameRenderer):
         # played track: solid bar, then the playhead dot on top
         if played_w > 0:
             self._fill_pill(ctx, bar_x, center_y - 1.5, played_w, 3)
-        dot_r = 4.5
+        dot_r = geom.dot_r
         q.CGContextFillEllipseInRect(
             ctx, q.CGRectMake(bar_x + played_w - dot_r, center_y - dot_r, dot_r * 2, dot_r * 2)
         )
 
 
 class FallbackFrameRenderer(FrameRenderer):
-    def render(self, state: AppState) -> bytes:
-        frame = bytearray(FRAME_BYTES)
+    def render(self, state: AppState, profile: RenderProfile = DEFAULT_PROFILE) -> bytes:
+        width, height = profile.width, profile.height
+        frame = bytearray(profile.frame_bytes)
         elapsed = state.clock.interpolated_position()
         duration = max(1.0, state.track.duration_sec or 1.0)
-        fill = int(clamp(elapsed / duration, 0.0, 1.0) * 238)
-        draw_rect(frame, 76, 105, 238, 10)
+        geom = SQUARE_PROGRESS_GEOM if profile.name == SQUARE_PROFILE.name else WIDE_PROGRESS_GEOM
+        fill = int(clamp(elapsed / duration, 0.0, 1.0) * geom.bar_w)
+        draw_rect(frame, geom.bar_x, geom.center_y - 5, geom.bar_w, 10, width, height)
         if fill:
-            fill_rect(frame, 77, 106, fill, 8)
-        fill_rect(frame, 12, 27, DISPLAY_WIDTH - 24, 1)
-        fill_rect(frame, 12, 130, DISPLAY_WIDTH - 24, 1)
+            fill_rect(frame, geom.bar_x + 1, geom.center_y - 4, fill, 8, width, height)
+        fill_rect(frame, 12, 27 * height // DISPLAY_HEIGHT, width - 24, 1, width, height)
+        fill_rect(frame, 12, 130 * height // DISPLAY_HEIGHT, width - 24, 1, width, height)
         return bytes(frame)
 
 
@@ -1250,23 +1533,27 @@ def pack_1bpp(pixels: bytes, width: int, height: int, stride: int) -> bytes:
     return bytes(out)
 
 
-def set_pixel(frame: bytearray, x: int, y: int) -> None:
-    if 0 <= x < DISPLAY_WIDTH and 0 <= y < DISPLAY_HEIGHT:
-        row_bytes = DISPLAY_WIDTH // 8
+def set_pixel(frame: bytearray, x: int, y: int, width: int = DISPLAY_WIDTH, height: int = DISPLAY_HEIGHT) -> None:
+    if 0 <= x < width and 0 <= y < height:
+        row_bytes = width // 8
         frame[y * row_bytes + x // 8] |= 1 << (x & 7)
 
 
-def fill_rect(frame: bytearray, x: int, y: int, w: int, h: int) -> None:
+def fill_rect(
+    frame: bytearray, x: int, y: int, w: int, h: int, width: int = DISPLAY_WIDTH, height: int = DISPLAY_HEIGHT
+) -> None:
     for py in range(y, y + h):
         for px in range(x, x + w):
-            set_pixel(frame, px, py)
+            set_pixel(frame, px, py, width, height)
 
 
-def draw_rect(frame: bytearray, x: int, y: int, w: int, h: int) -> None:
-    fill_rect(frame, x, y, w, 1)
-    fill_rect(frame, x, y + h - 1, w, 1)
-    fill_rect(frame, x, y, 1, h)
-    fill_rect(frame, x + w - 1, y, 1, h)
+def draw_rect(
+    frame: bytearray, x: int, y: int, w: int, h: int, width: int = DISPLAY_WIDTH, height: int = DISPLAY_HEIGHT
+) -> None:
+    fill_rect(frame, x, y, w, 1, width, height)
+    fill_rect(frame, x, y + h - 1, w, 1, width, height)
+    fill_rect(frame, x, y, 1, h, width, height)
+    fill_rect(frame, x + w - 1, y, 1, h, width, height)
 
 
 class WebSocketConnection:
@@ -1275,6 +1562,16 @@ class WebSocketConnection:
         self.writer = writer
         self.write_lock = asyncio.Lock()
         self.board_frame_base: bytes | None = None
+        self.profile: RenderProfile = DEFAULT_PROFILE
+        self.tx_key: bytes | None = None
+        self.rx_key: bytes | None = None
+        self.tx_sequence = 0
+        self.rx_sequence = 0
+        self.outbound: asyncio.Queue[tuple[bytes, int]] | None = None
+        self.sender_task: asyncio.Task[None] | None = None
+        self.backpressure_events = 0
+        self.pong_event = asyncio.Event()
+        self.closed = False
 
     async def handshake(self, accept: Callable[[str, dict[str, str]], bool] | None = None) -> str:
         raw = await self.reader.readuntil(b"\r\n\r\n")
@@ -1323,6 +1620,7 @@ class WebSocketConnection:
                 await self.send(payload, opcode=10)
                 continue
             if opcode == 10:
+                self.pong_event.set()
                 continue
             if opcode in (1, 2):
                 if fragment_opcode is not None:
@@ -1366,12 +1664,95 @@ class WebSocketConnection:
         return fin, opcode, bytes(payload)
 
     async def send_text(self, payload: dict[str, Any]) -> None:
-        await self.send(json.dumps(payload, separators=(",", ":")).encode("utf-8"), opcode=1)
+        raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        if self.tx_key is not None:
+            await self.send(self._protect(raw, SEC2_TEXT), opcode=2)
+        else:
+            await self.send(raw, opcode=1)
 
     async def send_binary(self, payload: bytes) -> None:
-        await self.send(payload, opcode=2)
+        await self.send(self._protect(payload, SEC2_BINARY) if self.tx_key is not None else payload, opcode=2)
+
+    def enable_security(self, tx_key: bytes, rx_key: bytes) -> None:
+        self.tx_key = tx_key
+        self.rx_key = rx_key
+        self.tx_sequence = 0
+        self.rx_sequence = 0
+
+    def _protect(self, payload: bytes, content_type: int) -> bytes:
+        if self.tx_key is None:
+            raise ValueError("secure session is not initialized")
+        self.tx_sequence += 1
+        header = SEC2_HEADER_STRUCT.pack(SEC2_MAGIC, SEC2_VERSION, content_type, 0, self.tx_sequence, len(payload))
+        return header + payload + hmac.new(self.tx_key, header + payload, hashlib.sha256).digest()
+
+    def _unprotect(self, record: bytes) -> tuple[int, bytes]:
+        if self.rx_key is None or len(record) < SEC2_HEADER_STRUCT.size + SEC2_TAG_BYTES:
+            raise ValueError("invalid SEC2 record")
+        header = record[: SEC2_HEADER_STRUCT.size]
+        magic, version, content_type, reserved, sequence, payload_len = SEC2_HEADER_STRUCT.unpack(header)
+        expected_len = SEC2_HEADER_STRUCT.size + payload_len + SEC2_TAG_BYTES
+        if magic != SEC2_MAGIC or version != SEC2_VERSION or reserved != 0 or expected_len != len(record):
+            raise ValueError("invalid SEC2 header")
+        if sequence != self.rx_sequence + 1:
+            raise ValueError("SEC2 replay or sequence gap")
+        payload = record[SEC2_HEADER_STRUCT.size : -SEC2_TAG_BYTES]
+        tag = record[-SEC2_TAG_BYTES:]
+        expected = hmac.new(self.rx_key, header + payload, hashlib.sha256).digest()
+        if not hmac.compare_digest(tag, expected):
+            raise ValueError("SEC2 authentication failed")
+        if content_type not in (SEC2_TEXT, SEC2_BINARY):
+            raise ValueError("invalid SEC2 content type")
+        self.rx_sequence = sequence
+        return content_type, payload
+
+    async def recv_application(self) -> tuple[int, bytes] | None:
+        message = await self.recv()
+        if message is None:
+            return None
+        opcode, payload = message
+        if self.rx_key is None:
+            return message
+        if opcode != 2:
+            raise ValueError("secure application data must use binary WebSocket frames")
+        content_type, clear = self._unprotect(payload)
+        return (1 if content_type == SEC2_TEXT else 2), clear
+
+    def start_sender(self) -> None:
+        if self.outbound is not None:
+            return
+        self.outbound = asyncio.Queue(maxsize=BOARD_QUEUE_DEPTH)
+        self.sender_task = asyncio.create_task(self._sender_loop())
+
+    async def _sender_loop(self) -> None:
+        assert self.outbound is not None
+        try:
+            while True:
+                payload, opcode = await self.outbound.get()
+                async with self.write_lock:
+                    self._write_frame(payload, opcode)
+                    await self.writer.drain()
+                self.backpressure_events = 0
+        except (asyncio.CancelledError, OSError, ConnectionError):
+            pass
+        finally:
+            self.closed = True
+            self.writer.close()
 
     async def send(self, payload: bytes, opcode: int) -> None:
+        if self.closed:
+            raise ConnectionError("board connection is closed")
+        if self.outbound is not None:
+            try:
+                self.outbound.put_nowait((payload, opcode))
+                return
+            except asyncio.QueueFull:
+                self.backpressure_events += 1
+                # A full bounded queue means this board has already remained
+                # behind for several complete messages. SEC2 sequences cannot
+                # safely skip a dropped record, so isolate it immediately.
+                self.close()
+                raise ConnectionError("board outbound queue is full")
         async with self.write_lock:
             self._write_frame(payload, opcode)
             await self.writer.drain()
@@ -1388,19 +1769,38 @@ class WebSocketConnection:
         self.writer.write(bytes(header) + payload)
 
     def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        if self.sender_task is not None:
+            self.sender_task.cancel()
         self.writer.close()
+
+    async def heartbeat(self) -> None:
+        while not self.closed:
+            await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
+            self.pong_event.clear()
+            await self.send(str(monotonic_ms()).encode("ascii"), opcode=9)
+            try:
+                await asyncio.wait_for(self.pong_event.wait(), HEARTBEAT_TIMEOUT_SECONDS)
+            except asyncio.TimeoutError:
+                self.close()
+                raise ConnectionError("board heartbeat timed out")
 
 
 class LyricsDisplayDaemon:
-    def __init__(self, store: LyricsStore, renderer: FrameRenderer, board_token: str = "") -> None:
+    def __init__(self, store: LyricsStore, renderer: FrameRenderer, board_token: str = "",
+                 identity: DaemonIdentity | None = None, allow_legacy_proto1: bool = False) -> None:
         self.store = store
         self.renderer = renderer
         self.board_token = board_token
+        self.identity = identity
+        self.allow_legacy_proto1 = allow_legacy_proto1
         self.state = AppState()
         self.theme = "light"
         self.state_lock = asyncio.Lock()
         self.boards: set[WebSocketConnection] = set()
-        self.last_frame: bytes | None = None
+        self.last_frames: dict[str, bytes] = {}  # profile name -> latest now-frame
         self.schedule_generation = 0
         self.scheduled_task: asyncio.Task[None] | None = None
         self._background_tasks: set[asyncio.Task[None]] = set()
@@ -1541,9 +1941,27 @@ class LyricsDisplayDaemon:
         self.store.save_lrclib(track, lyrics)
         return lyrics
 
-    def _render(self, state: AppState) -> bytes:
-        frame = self.renderer.render(state)
+    @property
+    def last_frame(self) -> bytes | None:
+        """Latest default-profile now-frame (kept for tests/back-compat)."""
+        return self.last_frames.get(DEFAULT_PROFILE.name)
+
+    @last_frame.setter
+    def last_frame(self, frame: bytes | None) -> None:
+        if frame is None:
+            self.last_frames.pop(DEFAULT_PROFILE.name, None)
+        else:
+            self.last_frames[DEFAULT_PROFILE.name] = frame
+
+    def _render(self, state: AppState, profile: RenderProfile) -> bytes:
+        frame = self.renderer.render(state, profile)
         return invert_frame(frame) if self.theme == "light" else frame
+
+    def _active_profiles(self) -> list[RenderProfile]:
+        profiles: dict[str, RenderProfile] = {conn.profile.name: conn.profile for conn in self.boards}
+        if not profiles:
+            profiles[DEFAULT_PROFILE.name] = DEFAULT_PROFILE
+        return list(profiles.values())
 
     def _has_current_track_locked(self) -> bool:
         return bool(self.state.track.title)
@@ -1556,33 +1974,102 @@ class LyricsDisplayDaemon:
 
     async def handle_board(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         conn = WebSocketConnection(reader, writer)
-        await conn.handshake(self.board_handshake_allowed)
-        self.boards.add(conn)
-        print("board connected")
         try:
-            await conn.send_text({"type": "hello", "width": DISPLAY_WIDTH, "height": DISPLAY_HEIGHT})
+            path = await conn.handshake(self.board_handshake_allowed)
+            parsed = urlparse(path)
+            query = parse_qs(parsed.query)
+            requested_proto = (query.get("proto") or [""])[0]
+            legacy = requested_proto == "1" or (
+                self.allow_legacy_proto1 and "token" in query and requested_proto != "2"
+            )
+            if self.identity is not None and not legacy:
+                await self.authenticate_board(conn)
+            elif self.identity is not None and not self.allow_legacy_proto1:
+                raise ValueError("legacy protocol is disabled")
+            conn.profile = profile_from_board_path(path)
+            await conn.send_text({"type": "hello", "proto": 2 if conn.tx_key else 1,
+                                  "daemonUuid": self.identity.daemon_uuid if self.identity else "",
+                                  "width": conn.profile.width, "height": conn.profile.height})
+            ready = await asyncio.wait_for(conn.recv_application(), AUTH_TIMEOUT_SECONDS)
+            if ready is None or ready[0] != 1:
+                raise ValueError("missing protected ready")
+            ready_payload = ready[1].decode("utf-8", "replace")
+            if conn.tx_key is not None:
+                if json.loads(ready_payload).get("type") != "ready":
+                    raise ValueError("invalid protected ready")
+            elif ready_payload != "ready":
+                raise ValueError("invalid legacy ready")
+            conn.start_sender()
+            self.boards.add(conn)
+            print(f"board connected ({conn.profile.name}, proto={'2' if conn.tx_key else '1'})")
             await self.send_current_frame(conn, now=True)
+            heartbeat = asyncio.create_task(conn.heartbeat())
             while True:
-                message = await conn.recv()
+                message = await conn.recv_application()
                 if message is None:
                     break
                 opcode, payload = message
-                if opcode == 1 and payload.decode("utf-8", "replace") == "ready":
+                if opcode == 1 and conn.tx_key is None and payload.decode("utf-8", "replace") == "ready":
                     await self.send_current_frame(conn, now=True)
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError, ConnectionError, asyncio.TimeoutError, json.JSONDecodeError) as exc:
             print(f"board websocket closed: {exc}")
         finally:
+            if 'heartbeat' in locals():
+                heartbeat.cancel()
+                try:
+                    await heartbeat
+                except (asyncio.CancelledError, ConnectionError):
+                    pass
             self.boards.discard(conn)
             conn.close()
             print("board disconnected")
+
+    async def authenticate_board(self, conn: WebSocketConnection) -> str:
+        assert self.identity is not None
+        server_nonce = secrets.token_bytes(32)
+        await conn.send_text({"type": "auth-challenge", "proto": 2,
+                              "daemonUuid": self.identity.daemon_uuid,
+                              "serverNonce": server_nonce.hex()})
+        message = await asyncio.wait_for(conn.recv(), AUTH_TIMEOUT_SECONDS)
+        if message is None or message[0] != 1:
+            raise ValueError("missing authentication response")
+        response = json.loads(message[1].decode("utf-8"))
+        if response.get("type") != "auth-response" or response.get("proto") != 2:
+            raise ValueError("invalid authentication response")
+        client_nonce = bytes.fromhex(str(response.get("clientNonce", "")))
+        proof = bytes.fromhex(str(response.get("proof", "")))
+        board_id = str(response.get("boardId", ""))
+        if len(client_nonce) != 32 or not re.fullmatch(r"[0-9A-Fa-f:-]{12,32}", board_id):
+            raise ValueError("invalid board identity or nonce")
+        expected = hmac.new(self.identity.token.encode("ascii"),
+                            _auth_transcript("client", self.identity.daemon_uuid, server_nonce, client_nonce),
+                            hashlib.sha256).digest()
+        if not hmac.compare_digest(proof, expected):
+            raise ValueError("board authentication failed")
+        server_proof = hmac.new(self.identity.token.encode("ascii"),
+                                _auth_transcript("server", self.identity.daemon_uuid, server_nonce, client_nonce),
+                                hashlib.sha256).hexdigest()
+        await conn.send_text({"type": "auth-ok", "proto": 2, "proof": server_proof})
+        client_to_server, server_to_client = derive_session_keys(self.identity.token, server_nonce, client_nonce)
+        conn.enable_security(server_to_client, client_to_server)
+        return board_id
 
     def board_handshake_allowed(self, path: str, headers: dict[str, str]) -> bool:
         parsed = urlparse(path)
         if parsed.path != "/board":
             return False
-        if not self.board_token:
+        query = parse_qs(parsed.query)
+        requested_proto = (query.get("proto") or [""])[0]
+        legacy = requested_proto == "1" or (
+            self.allow_legacy_proto1 and "token" in query and requested_proto != "2"
+        )
+        if self.identity is not None and not legacy:
             return True
-        query_token = (parse_qs(parsed.query).get("token") or [""])[0]
+        if self.identity is not None and not self.allow_legacy_proto1:
+            return False
+        if not self.board_token:
+            return self.identity is None
+        query_token = (query.get("token") or [""])[0]
         auth = headers.get("authorization", "")
         bearer = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
         return hmac.compare_digest(query_token, self.board_token) or hmac.compare_digest(bearer, self.board_token)
@@ -1597,17 +2084,18 @@ class LyricsDisplayDaemon:
             if not self._has_current_track_locked():
                 self.state.dirty = False
                 plan = None
-                frame = None
+                frames = None
             else:
-                frame = self._render(self.state)
+                profiles = self._active_profiles()
+                frames = {profile.name: self._render(self.state, profile) for profile in profiles}
                 self.state.dirty = False
-                plan = self._next_scheduled_frame_locked()
-        if frame is None:
-            self.last_frame = None
+                plan = self._next_scheduled_frame_locked(profiles)
+        if frames is None:
+            self.last_frames.clear()
             await self.broadcast_clear()
             return
-        self.last_frame = frame
-        await self.broadcast_frame(frame, now=True, swap_in_ms=0)
+        self.last_frames.update(frames)
+        await self.broadcast_frames(frames, now=True, swap_in_ms=0)
         await self.arm_scheduled_frame(plan, generation)
 
     async def broadcast_clear(self) -> None:
@@ -1619,32 +2107,40 @@ class LyricsDisplayDaemon:
                 dead.append(board)
         for board in dead:
             self.boards.discard(board)
+            board.close()
 
     async def send_clear(self, conn: WebSocketConnection) -> None:
         await conn.send_text({"type": "clear"})
         conn.board_frame_base = None
 
     async def send_current_frame(self, conn: WebSocketConnection, now: bool) -> None:
+        profile = conn.profile
         async with self.state_lock:
             has_track = self._has_current_track_locked()
             if not has_track:
-                self.last_frame = None
+                self.last_frames.clear()
+                frame = None
                 plan = None
-            elif self.last_frame is None:
-                self.last_frame = self._render(self.state)
-                plan = self._next_scheduled_frame_locked()
             else:
-                plan = self._next_scheduled_frame_locked()
-            frame = self.last_frame
+                frame = self.last_frames.get(profile.name)
+                if frame is None:
+                    frame = self._render(self.state, profile)
+                    self.last_frames[profile.name] = frame
+                plan = self._next_scheduled_frame_locked([profile])
         if not has_track or frame is None:
             await self.send_clear(conn)
             return
         await self.send_frame(conn, frame, now=now, swap_in_ms=0)
         if plan is not None:
-            await self.send_frame(conn, plan.frame, now=False, swap_in_ms=plan.swap_in_ms)
+            await self.send_frame(conn, plan.frames[profile.name], now=False, swap_in_ms=plan.swap_in_ms)
 
     async def send_frame(self, conn: WebSocketConnection, frame: bytes, now: bool, swap_in_ms: int) -> None:
-        rect = dirty_rect(conn.board_frame_base, frame) if now and swap_in_ms <= 0 else None
+        profile = conn.profile
+        rect = (
+            dirty_rect(conn.board_frame_base, frame, profile.width, profile.height)
+            if now and swap_in_ms <= 0
+            else None
+        )
         if rect is not None and rect.bytes < len(frame):
             envelope = make_frame_envelope(
                 FRAME_KIND_RECT_NOW,
@@ -1655,6 +2151,8 @@ class LyricsDisplayDaemon:
                 rect_height=rect.height,
                 row_bytes=rect.row_bytes,
                 swap_in_ms=0,
+                display_width=profile.width,
+                display_height=profile.height,
             )
             await conn.send_binary(envelope)
             conn.board_frame_base = frame
@@ -1666,16 +2164,18 @@ class LyricsDisplayDaemon:
             frame,
             x=0,
             y=0,
-            rect_width=DISPLAY_WIDTH,
-            rect_height=DISPLAY_HEIGHT,
-            row_bytes=DISPLAY_WIDTH // 8,
+            rect_width=profile.width,
+            rect_height=profile.height,
+            row_bytes=profile.row_bytes,
             swap_in_ms=max(0, int(swap_in_ms)),
+            display_width=profile.width,
+            display_height=profile.height,
         )
         await conn.send_binary(envelope)
         if now and swap_in_ms <= 0:
             conn.board_frame_base = frame
 
-    def _next_scheduled_frame_locked(self) -> ScheduledFrame | None:
+    def _next_scheduled_frame_locked(self, profiles: list[RenderProfile]) -> ScheduledFrame | None:
         next_ms = self.state.next_line_time_ms()
         if next_ms is None:
             return None
@@ -1684,24 +2184,30 @@ class LyricsDisplayDaemon:
         if remaining_ms <= MIN_SCHEDULE_SWAP_MS:
             return None
         future_state = self.state.at_position(next_ms / 1000.0)
-        frame = self._render(future_state)
+        frames = {profile.name: self._render(future_state, profile) for profile in profiles}
         return ScheduledFrame(
-            frame=frame,
+            frames=frames,
             swap_in_ms=remaining_ms,
             due_monotonic_ms=monotonic_ms() + remaining_ms,
         )
 
-    async def broadcast_frame(self, frame: bytes, now: bool, swap_in_ms: int) -> None:
+    async def broadcast_frames(self, frames: dict[str, bytes], now: bool, swap_in_ms: int) -> None:
         dead: list[WebSocketConnection] = []
         # Snapshot: send_frame awaits, during which a board may connect/disconnect
         # and mutate self.boards, which would raise "Set changed size during iteration".
         for board in list(self.boards):
+            frame = frames.get(board.profile.name)
+            if frame is None:
+                # Board connected between render and broadcast; its connect-time
+                # send_current_frame sync covers it.
+                continue
             try:
                 await self.send_frame(board, frame, now=now, swap_in_ms=swap_in_ms)
             except OSError:
                 dead.append(board)
         for board in dead:
             self.boards.discard(board)
+            board.close()
 
     async def arm_scheduled_frame(self, plan: ScheduledFrame | None, generation: int) -> None:
         if plan is None:
@@ -1709,7 +2215,7 @@ class LyricsDisplayDaemon:
         async with self.state_lock:
             if generation != self.schedule_generation:
                 return
-        await self.broadcast_frame(plan.frame, now=False, swap_in_ms=plan.swap_in_ms)
+        await self.broadcast_frames(plan.frames, now=False, swap_in_ms=plan.swap_in_ms)
         async with self.state_lock:
             if generation != self.schedule_generation:
                 return
@@ -1733,8 +2239,9 @@ class LyricsDisplayDaemon:
                 # pixels (e.g. long -> short line ghosting, or a clipped highlight).
                 for board in list(self.boards):
                     board.board_frame_base = None
-                self.last_frame = self._render(self.state)
-                plan = self._next_scheduled_frame_locked()
+                profiles = self._active_profiles()
+                self.last_frames = {profile.name: self._render(self.state, profile) for profile in profiles}
+                plan = self._next_scheduled_frame_locked(profiles)
             await self.arm_scheduled_frame(plan, generation)
         except asyncio.CancelledError:
             return
@@ -1826,6 +2333,12 @@ class DnsSdAdvertiser:
         self.thread: threading.Thread | None = None
 
     def start(self) -> None:
+        # On macOS, Bonjour owns interface scoping and publishes the correct A
+        # records per interface (including when VPNs come and go). Prefer it to
+        # synthesizing one host address ourselves.
+        if shutil.which("dns-sd") is not None:
+            self._start_dns_sd()
+            return
         try:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
             self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -1854,7 +2367,8 @@ class DnsSdAdvertiser:
             return
         try:
             self.proc = subprocess.Popen(
-                [dns_sd, "-R", self.instance, self.service, self.proto, "local", str(self.port)],
+                [dns_sd, "-R", self.instance, f"{self.service}.{self.proto}", "local", str(self.port),
+                 *[f"{key}={value}" for key, value in self.txt.items()]],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
@@ -1997,31 +2511,43 @@ def cache_command(args: argparse.Namespace) -> int:
 
 async def run(args: argparse.Namespace) -> None:
     store = LyricsStore(Path(args.db))
-    daemon = LyricsDisplayDaemon(store, build_renderer(args.font), board_token=args.board_token)
+    identity = load_or_create_identity(Path(args.identity))
+    if args.board_token:
+        if not re.fullmatch(r"[0-9a-fA-F]{64}", args.board_token):
+            raise ValueError("--board-token must be exactly 64 hexadecimal characters")
+        identity = DaemonIdentity(identity.daemon_uuid, args.board_token)
+    daemon = LyricsDisplayDaemon(store, build_renderer(args.font), board_token=identity.token,
+                                 identity=identity, allow_legacy_proto1=args.allow_legacy_proto1)
     advertiser = DnsSdAdvertiser(
         args.mdns_instance,
         "_lyrics",
         "_tcp",
         args.board_port,
-        txt={"path": "/board", "auth": "token" if args.board_token else "none"},
+        txt={"path": "/board", "proto": "2", "auth": "hmac-sha256", "uuid": identity.daemon_uuid},
     )
+    legacy_advertiser = DnsSdAdvertiser(
+        args.mdns_instance + " Legacy", "_lyrics", "_tcp", args.board_port,
+        txt={"path": "/board?proto=1", "proto": "1", "auth": "token", "uuid": identity.daemon_uuid},
+    ) if args.allow_legacy_proto1 else None
     extension_server = await asyncio.start_server(
         daemon.handle_extension, args.extension_host, args.extension_port
     )
     board_server = await asyncio.start_server(daemon.handle_board, args.board_host, args.board_port)
     print(f"extension WebSocket: ws://{args.extension_host}:{args.extension_port}/extension")
     print(f"board WebSocket: ws://{args.board_host}:{args.board_port}/board")
-    if args.board_token:
-        print("board WebSocket auth: token required")
-    else:
-        print("board WebSocket auth: disabled; set G4PYS_LYRICS_BOARD_TOKEN to require a token")
+    print(f"secure board identity: {identity.daemon_uuid}")
+    print("board WebSocket auth: mutual nonce/HMAC (proto=2)")
     if not args.no_mdns:
         advertiser.start()
+        if legacy_advertiser is not None:
+            legacy_advertiser.start()
     try:
         async with extension_server, board_server:
             await asyncio.gather(extension_server.serve_forever(), board_server.serve_forever())
     finally:
         advertiser.stop()
+        if legacy_advertiser is not None:
+            legacy_advertiser.stop()
 
 
 def main() -> int:
@@ -2038,6 +2564,9 @@ def main() -> int:
         target.add_argument("--font", default=os.environ.get("G4PYS_LYRICS_FONT", "Tahoma"))
         target.add_argument("--mdns-instance", default=os.environ.get("G4PYS_LYRICS_MDNS_INSTANCE", "g4pys Lyrics Display"))
         target.add_argument("--board-token", default=os.environ.get("G4PYS_LYRICS_BOARD_TOKEN", ""))
+        target.add_argument("--identity", default=os.environ.get("G4PYS_LYRICS_IDENTITY", str(default_identity_path())))
+        target.add_argument("--allow-legacy-proto1", action="store_true",
+                            default=os.environ.get("G4PYS_LYRICS_ALLOW_LEGACY_PROTO1") == "1")
         target.add_argument("--no-mdns", action="store_true", default=os.environ.get("G4PYS_LYRICS_NO_MDNS") == "1")
 
     import_parser = subparsers.add_parser("import-lrc", help="import one or more .lrc files as manual lyrics")
@@ -2057,11 +2586,19 @@ def main() -> int:
     clear_parser.add_argument("--video-id", default="")
     cache_subparsers.add_parser("stats", help="show cache row counts")
 
+    pairing_parser = subparsers.add_parser("pairing-token", help="print the token to enter on a board")
+    pairing_parser.add_argument("--identity", default=os.environ.get("G4PYS_LYRICS_IDENTITY", str(default_identity_path())))
+
     args = parser.parse_args()
     if args.command == "import-lrc":
         return import_lrc_command(args)
     if args.command == "cache":
         return cache_command(args)
+    if args.command == "pairing-token":
+        identity = load_or_create_identity(Path(args.identity))
+        print(f"daemon UUID: {identity.daemon_uuid}")
+        print(f"pairing token: {identity.token}")
+        return 0
     if args.command == "serve":
         asyncio.run(run(args))
         return 0

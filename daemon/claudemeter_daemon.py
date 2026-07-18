@@ -54,6 +54,18 @@ YTDLP_CACHE_SECONDS = int(os.environ.get("CLAWDMETER_YTDLP_CACHE_SECONDS", "900"
 # to the token budgets you want the ESP progress bars to represent.
 SESSION_TOKEN_LIMIT = int(os.environ.get("CLAWDMETER_SESSION_TOKEN_LIMIT", "30000000"))
 WEEKLY_TOKEN_LIMIT = int(os.environ.get("CLAWDMETER_WEEKLY_TOKEN_LIMIT", "100000000"))
+
+# Daily-image metadata (xkcd + NASA APOD) for the ESP8266 COMIC/APOD screens.
+# The ESP8266 cannot afford BearSSL's ~22 KB TLS heap to call these HTTPS APIs
+# itself, so this daemon resolves them and pushes image URL + title to /daily.
+# "auto" = only when usage pushing is on (i.e. the target is the ESP8266; the
+# ESP32 render wrapper has no /daily endpoint).
+_RAW_DAILY = os.environ.get("CLAWDMETER_DAILY_IMAGES", "auto").lower()
+NASA_API_KEY = os.environ.get("CLAWDMETER_NASA_API_KEY", "DEMO_KEY")
+DAILY_INTERVAL = int(os.environ.get("CLAWDMETER_DAILY_INTERVAL", str(6 * 3600)))
+DAILY_RETRY = 10 * 60                    # retry sooner after a fetch/push failure
+DAILY_ENABLED = (USAGE_ENABLED if _RAW_DAILY == "auto"
+                 else _RAW_DAILY not in ("off", "none", "disabled", "0", "false"))
 # ------------------------
 
 KEYCHAIN_SERVICE = "Claude Code-credentials"
@@ -1208,6 +1220,46 @@ def push_mac_only(reason):
         print(f"device push failed: {push_error}", file=sys.stderr)
 
 
+def daily_fetch_json(url):
+    req = urllib.request.Request(url, headers={"User-Agent": "clawdmeter-daemon"})
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        return json.load(resp)
+
+
+def push_daily_images():
+    """Resolve today's xkcd + NASA APOD metadata and push it to the device's
+    /daily endpoint (see esp8266 daily_screen.cpp — the chip fetches the image
+    itself over plain HTTP via the wsrv.nl proxy; it only needs URL + title).
+    Returns seconds to wait before the next attempt."""
+    args = {}
+    try:
+        c = daily_fetch_json("https://xkcd.com/info.0.json")
+        args.update(comicimg=c["img"], comictitle=c.get("title", ""),
+                    comicnum=f"#{c.get('num', '')}")
+    except Exception as e:
+        print(f"xkcd fetch failed: {e}", file=sys.stderr)
+    try:
+        a = daily_fetch_json(
+            f"https://api.nasa.gov/planetary/apod?api_key={NASA_API_KEY}&thumbs=true")
+        img = a.get("thumbnail_url") if a.get("media_type") == "video" else a.get("url")
+        if img:
+            args.update(apodimg=img, apodtitle=a.get("title", ""),
+                        apoddate=a.get("date", ""))
+    except Exception as e:
+        print(f"apod fetch failed: {e}", file=sys.stderr)
+    if not args:
+        return DAILY_RETRY
+    try:
+        device_post(f"{DEVICE_URL}/daily?{urllib.parse.urlencode(args)}")
+    except Exception as e:
+        print(f"daily push failed: {e}", file=sys.stderr)
+        return DAILY_RETRY
+    print(f"daily: comic={args.get('comicnum', 'skipped')}  "
+          f"apod={args.get('apoddate', 'skipped')}")
+    # Partial success (one API down) retries sooner so the missing half fills in.
+    return DAILY_INTERVAL if ("comicimg" in args and "apodimg" in args) else DAILY_RETRY
+
+
 def poll_and_push_usage():
     """Poll Claude usage once and push it (with Mac metrics). Returns the number
     of seconds to wait before the next usage poll (normally POLL_INTERVAL, or a
@@ -1265,11 +1317,13 @@ def poll_and_push_usage():
 
 def main():
     usage_text = f"usage source={USAGE_SOURCE} every {POLL_INTERVAL}s" if USAGE_ENABLED else "usage off"
-    print(f"Clawdmeter daemon -> {DEVICE_URL}, {usage_text}, "
+    daily_text = f"daily images every {DAILY_INTERVAL // 3600}h" if DAILY_ENABLED else "daily images off"
+    print(f"Clawdmeter daemon -> {DEVICE_URL}, {usage_text}, {daily_text}, "
           f"now-playing every {NOWPLAYING_TICK}s")
     # The song changes every few minutes, so we read it on a fast ~8s tick while
     # keeping the (costlier) Claude usage poll on its 60s cadence via a deadline.
     next_usage = 0.0 if USAGE_ENABLED else float("inf")
+    next_daily = 0.0 if DAILY_ENABLED else float("inf")
     # monotonic time of the next due usage poll (0 = now; inf = disabled)
     # Seed with the "nothing playing" state so a daemon (re)start with no song
     # open sends no /nowplaying push (now-playing is web-only, but there's still
@@ -1283,6 +1337,8 @@ def main():
         now = time.monotonic()
         if now >= next_usage:
             next_usage = now + poll_and_push_usage()
+        if now >= next_daily:
+            next_daily = now + push_daily_images()
 
         last_title, last_artist, _last_pos, last_dur, last_paused = last_song
         song = normalize_nowplaying_timing(read_now_playing(), last_song)
@@ -1315,7 +1371,8 @@ def main():
         # Read fast (4s) while a song tab is open, slow when idle. Cap the sleep to the
         # next usage deadline so a long idle tick never delays the 60s usage poll.
         tick = NOWPLAYING_TICK if title else NOWPLAYING_IDLE_TICK
-        time.sleep(max(0.0, min(tick, next_usage - time.monotonic())))
+        time.sleep(max(0.0, min(tick, next_usage - time.monotonic(),
+                                next_daily - time.monotonic())))
 
 
 if __name__ == "__main__":

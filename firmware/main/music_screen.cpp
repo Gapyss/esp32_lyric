@@ -42,6 +42,7 @@ typedef struct {
     bool idle_time_valid;
     bool idle_env_valid;
     char board_ip[24];
+    char daemon_status[32];
     bool daemon_connected;
     int64_t daemon_wait_start_us;
 } NowPlaying;
@@ -182,6 +183,7 @@ void music_screen_init(void)
     g_now.lyric_at = -1;
     g_now.lyric2_at = -1;
     copy_text(g_now.board_ip, sizeof(g_now.board_ip), "acquiring");
+    copy_text(g_now.daemon_status, sizeof(g_now.daemon_status), "DISCOVERING");
     g_now.daemon_connected = false;
     g_now.daemon_wait_start_us = esp_timer_get_time();
     if (g_now_mutex == NULL) {
@@ -416,6 +418,16 @@ void music_set_daemon_connected(bool connected)
             g_now.daemon_wait_start_us = esp_timer_get_time();
         }
     }
+    xSemaphoreGive(g_now_mutex);
+}
+
+void music_set_daemon_status(const char *status)
+{
+    if (g_now_mutex == NULL) {
+        music_screen_init();
+    }
+    xSemaphoreTake(g_now_mutex, portMAX_DELAY);
+    copy_text(g_now.daemon_status, sizeof(g_now.daemon_status), status);
     xSemaphoreGive(g_now_mutex);
 }
 
@@ -718,6 +730,8 @@ static void render_state_locked(u8g2_t *u8, NowPlaying *state, bool allow_promot
         format_elapsed_compact(wait_seconds, wait_text, sizeof(wait_text));
         if (state->daemon_connected) {
             snprintf(connect_text, sizeof(connect_text), "Connected to daemon");
+        } else if (state->daemon_status[0] != '\0') {
+            snprintf(connect_text, sizeof(connect_text), "%s", state->daemon_status);
         } else {
             snprintf(connect_text, sizeof(connect_text), "Waiting to connect  %s", wait_text);
         }

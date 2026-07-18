@@ -24,7 +24,12 @@ you're already logged into. All code is yours.
 
 **YouTube Music plays in your browser → your extension reads song + position → a tiny local
 daemon resolves + renders lyrics to a 1-bit bitmap → pushes binary frame envelopes over
-WebSocket → the ESP32 blits them to the LCD.**
+WebSocket → the board blits them to its LCD.**
+
+Two boards speak this protocol today: the ESP32-S3 (400×300, the original target) and the
+ESP8266 GeekMagic SmallTV (240×240 color TFT, `esp8266/clawdmeter_esp8266/lyrics_stream.cpp`),
+which draws the 1-bit frames as Tend ink-on-paper and keeps its on-device text renderer as
+the fallback whenever no stream flows.
 
 ```
 ┌───────────────────────────── macOS ─────────────────────────────┐      WiFi / LAN
@@ -103,10 +108,35 @@ Two links, both mediated by the daemon:
 | `tick` | `{ positionSec, paused, playbackRate }` (periodic; throttled to ~1 s when tab hidden) |
 | `event` | `{ type: 'play'|'pause'|'seek'|'ended' }` |
 
-**Daemon → board** (board is client; daemon discovered via mDNS `_lyrics._tcp`):
+**Daemon → board** (board is client; the ESP32 discovers the daemon via mDNS
+`_lyrics._tcp`, the ESP8266 dials back to the Mac whose IP it learned from the
+claudemeter daemon's `/usage`/`/nowplaying` HTTP pushes):
+
+A board picks its **render profile** at handshake time with query parameters on the
+WebSocket path — `/board` (or unknown sizes) means the default 400×300 e-ink layout;
+`/board?w=240&h=240` selects the compact 240×240 layout. On connect the daemon sends a
+nonce challenge. The board proves possession of its NVS token, the daemon proves the
+same token, and HKDF-SHA256 derives independent client→server and server→client keys.
+Only then does the daemon send a protected `hello`; the board answers with protected
+`ready`. The daemon persists its UUID/token in `~/.g4pys/lyrics-identity.json` (0600),
+while a board persists only the token and last authenticated UUID—never the daemon IP.
+
+Bonjour TXT must contain `proto=2`, `auth=hmac-sha256`, and `uuid=<daemon UUID>`.
+The board rejects other advertisements, prefers its remembered UUID and same-subnet
+IPv4, and always uses the SRV port plus an address returned on that Bonjour interface.
+Legacy proto=1 requires an explicit firmware/daemon migration flag and is never chosen
+as a fallback from a failed proto=2 authentication.
+
+Application messages are carried in an authenticated SEC2 record inside one binary
+WebSocket message. The fixed header is `SEC2`, version/type/reserved, a monotonically
+increasing 64-bit sequence, and a 32-bit payload length; HMAC-SHA256 over header+payload
+is appended. Sequence checks reject replay/gaps. `hello`, `ready`, and `clear` use the
+text content type; LYR1 framebuffer envelopes use the binary content type. The daemon
+renders and caches frames per profile, so mixed fleets stream simultaneously.
 
 Each display update is one binary WebSocket message containing a fixed big-endian header
-followed by either a full 400×300 1-bpp framebuffer or a byte-aligned dirty rectangle.
+followed by either a full 1-bpp framebuffer or a byte-aligned dirty rectangle at the
+profile's size.
 
 ```text
 magic[4] = "LYR1"
@@ -119,13 +149,18 @@ payloadBytes u32
 payload bytes
 ```
 
-Full frames are `15000` bytes (`400 * 300 / 8`) in `1bpp-lsb-rowmajor` order. Rect
-payloads contain `rowBytes * rectHeight` bytes and are byte-aligned on `x`. Scheduled
-frames/rects are staged and flipped after `swapInMs`; `*-now` kinds are applied
-immediately. The board still accepts the older JSON-header plus binary-payload format as
-a compatibility fallback, but the daemon sends only the single-message envelope.
+`width`/`height` carry the profile size, so a board can reject frames that don't match
+what it negotiated. Full frames are `width * height / 8` bytes (`15000` at 400×300,
+`7200` at 240×240) in `1bpp-lsb-rowmajor` order. Rect payloads contain
+`rowBytes * rectHeight` bytes and are byte-aligned on `x`. Scheduled frames/rects are
+staged and flipped after `swapInMs`; `*-now` kinds are applied immediately. The ESP32
+still accepts the older JSON-header plus binary-payload format as a compatibility
+fallback, but the daemon sends only the single-message envelope.
 
-Board→daemon: text `ready` on connect/reconnect, which triggers a current-frame resend.
+Every board owns a bounded outbound queue and writer task. Persistent backpressure
+disconnects that board only. Both peers ping every 20 seconds and require a pong within
+10 seconds. Wi-Fi/IP changes, daemon restarts, and reconnects discard the endpoint and
+begin fresh Bonjour discovery with jittered exponential backoff capped at 30 seconds.
 
 ## SQLite schema (draft, Mac-side, in the daemon)
 
@@ -161,8 +196,10 @@ files writes `manual` rows.
 - WebSocket server for the extension (localhost) **and** for the board (LAN); advertise
   `_lyrics._tcp` via mDNS/Bonjour.
 - SQLite resolve (`manual` ▸ `lrclib` cache ▸ network) + lrclib `get`→`search`.
-- Core Text render → 1-bit 400×300 karaoke frames (system fonts = any language), with
-  a geometry-only fallback when PyObjC is unavailable.
+- Core Text render → 1-bit karaoke frames (system fonts = any language), with a
+  geometry-only fallback when PyObjC is unavailable. Two layouts: the 400×300 e-ink
+  original and a compact 240×240 profile for the ESP8266 boards; frame caches,
+  dirty-rects, and scheduled swaps are all kept per profile.
 - Precise scheduler with position interpolation; pre-send + `swapInMs`; pause/seek handling.
 - Ships as a per-user **LaunchAgent** (`RunAtLoad` + `KeepAlive`) — starts at login, restarts
   on crash, never launched by hand. Tolerates "extension not connected yet"; the board
@@ -176,6 +213,27 @@ files writes `manual` rows.
 - **Idle mode** (no daemon connection): read PCF85063 RTC + SHTC3, draw a clock +
   temp/humidity with a tiny built-in digits/Latin font (no Unicode needed).
 - Auto-reconnect; send `ready` on (re)connect to trigger a resync.
+
+## ESP8266 client (`esp8266/clawdmeter_esp8266/lyrics_stream.cpp`)
+
+The GeekMagic SmallTV port shares the protocol but not the constraints — it is an
+Arduino sketch on a much smaller chip, so the client is shaped differently:
+
+- Hand-rolled non-blocking WebSocket client over `WiFiClient`, pumped from `loop()`
+  (byte-wise state machine; a 7.2 KB frame arriving across TCP segments never blocks
+  the web server or the other screens). No extra library, no task, no timer ISR.
+- **No mDNS query and no configuration**: the Mac already POSTs `/usage` and
+  `/nowplaying` to the device, so the sketch remembers the source IP of those pushes
+  and dials back to `:8766/board?w=240&h=240`. Connects only while the MUSIC screen is
+  visible; a stale host (no push in 10 min) is never dialed.
+- Frames blit as Tend ink-on-paper RGB565 rows (set bit = paper, clear = ink — the
+  daemon's light theme). Two 7.2 KB buffers (current + scheduled) are malloc'd only
+  while streaming, and the on-device marquee canvases (~17 KB) are freed while the
+  stream owns the panel, so the two render paths never hold heap at once.
+- The on-device Thai/Latin text renderer remains the fallback: stream drops, daemon
+  `clear`, or the Mac going away all hand the panel back within seconds.
+- Sends no board token — leave `G4PYS_LYRICS_BOARD_TOKEN` unset when ESP8266 boards
+  should connect.
 
 ## Deferred / open (intentionally, not blockers)
 

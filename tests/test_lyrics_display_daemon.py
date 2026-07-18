@@ -2,6 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import hmac
+import hashlib
+import stat
+from unittest import mock
 import tempfile
 import threading
 import unittest
@@ -17,6 +21,9 @@ from daemon.lyrics_display_daemon import (
     LyricsStore,
     TrackInfo,
     WebSocketConnection,
+    DaemonIdentity,
+    derive_session_keys,
+    load_or_create_identity,
     dirty_rect,
     fit_lyric_layout,
     invert_frame,
@@ -615,6 +622,113 @@ class DirtyRectTests(unittest.TestCase):
 
 
 class WebSocketConnectionTests(unittest.TestCase):
+    def test_full_board_queue_disconnects_only_that_board(self) -> None:
+        async def run() -> tuple[bool, list[tuple[int, bytes]]]:
+            slow = WebSocketConnection(asyncio.StreamReader(), FakeWriter())  # type: ignore[arg-type]
+            slow.outbound = asyncio.Queue(maxsize=1)
+            slow.outbound.put_nowait((b"already queued", 1))
+            with self.assertRaises(ConnectionError):
+                await slow.send_text({"type": "clear"})
+
+            fast_writer = FakeWriter()
+            fast = WebSocketConnection(asyncio.StreamReader(), fast_writer)  # type: ignore[arg-type]
+            await fast.send_text({"type": "clear"})
+            return slow.closed, server_frame_payloads(b"".join(fast_writer.writes))
+
+        slow_closed, fast_frames = asyncio.run(run())
+        self.assertTrue(slow_closed)
+        self.assertEqual(json.loads(fast_frames[0][1]), {"type": "clear"})
+
+    def test_dns_sd_registration_uses_combined_service_type(self) -> None:
+        advertiser = lyrics_display_daemon.DnsSdAdvertiser(
+            "Lyrics Test", "_lyrics", "_tcp", 8766,
+            {"proto": "2", "auth": "hmac-sha256"},
+        )
+        process = mock.Mock()
+        with mock.patch.object(lyrics_display_daemon.shutil, "which", return_value="/usr/bin/dns-sd"), \
+             mock.patch.object(lyrics_display_daemon.subprocess, "Popen", return_value=process) as popen:
+            advertiser._start_dns_sd()
+
+        command = popen.call_args.args[0]
+        self.assertEqual(command[:7], [
+            "/usr/bin/dns-sd", "-R", "Lyrics Test", "_lyrics._tcp", "local", "8766", "proto=2",
+        ])
+
+    def test_identity_is_stable_and_private(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / ".g4pys" / "lyrics-identity.json"
+            first = load_or_create_identity(path)
+            second = load_or_create_identity(path)
+            mode = stat.S_IMODE(path.stat().st_mode)
+
+        self.assertEqual(first, second)
+        self.assertEqual(mode, 0o600)
+        self.assertEqual(len(first.token), 64)
+
+    def test_sec2_directional_record_rejects_tamper_and_replay(self) -> None:
+        async def run() -> tuple[bytes, WebSocketConnection]:
+            writer = FakeWriter()
+            sender = WebSocketConnection(asyncio.StreamReader(), writer)  # type: ignore[arg-type]
+            receiver = WebSocketConnection(asyncio.StreamReader(), FakeWriter())  # type: ignore[arg-type]
+            client_to_server, server_to_client = derive_session_keys("ab" * 32, bytes(32), bytes(range(32)))
+            sender.enable_security(server_to_client, client_to_server)
+            receiver.enable_security(client_to_server, server_to_client)
+            await sender.send_text({"type": "hello"})
+            record = server_frame_payloads(b"".join(writer.writes))[0][1]
+            return record, receiver
+
+        record, receiver = asyncio.run(run())
+        content_type, clear = receiver._unprotect(record)
+        self.assertEqual(content_type, lyrics_display_daemon.SEC2_TEXT)
+        self.assertEqual(json.loads(clear), {"type": "hello"})
+        with self.assertRaises(ValueError):
+            receiver._unprotect(record)
+
+        _, fresh_receiver = asyncio.run(run())
+        tampered = bytearray(record)
+        tampered[-1] ^= 1
+        with self.assertRaises(ValueError):
+            fresh_receiver._unprotect(bytes(tampered))
+
+    def test_mutual_authentication_derives_secure_session(self) -> None:
+        async def run() -> tuple[WebSocketConnection, list[tuple[int, bytes]]]:
+            identity = DaemonIdentity("12345678-1234-4234-8234-123456789abc", "42" * 32)
+            server_nonce = bytes(range(32))
+            client_nonce = bytes(range(32, 64))
+            transcript = lyrics_display_daemon._auth_transcript(
+                "client", identity.daemon_uuid, server_nonce, client_nonce
+            )
+            proof = hmac.new(identity.token.encode("ascii"), transcript, hashlib.sha256).hexdigest()
+            response = json.dumps({
+                "type": "auth-response", "proto": 2, "clientNonce": client_nonce.hex(),
+                "boardId": "AA:BB:CC:DD:EE:FF", "proof": proof,
+            }, separators=(",", ":")).encode()
+            reader = asyncio.StreamReader()
+            reader.feed_data(masked_client_frame(1, response))
+            writer = FakeWriter()
+            conn = WebSocketConnection(reader, writer)  # type: ignore[arg-type]
+            with tempfile.TemporaryDirectory() as tmpdir:
+                daemon = LyricsDisplayDaemon(
+                    LyricsStore(Path(tmpdir) / "lyrics.sqlite3"), FallbackFrameRenderer(), identity=identity
+                )
+                original = lyrics_display_daemon.secrets.token_bytes
+                lyrics_display_daemon.secrets.token_bytes = lambda count: server_nonce
+                try:
+                    await daemon.authenticate_board(conn)
+                finally:
+                    lyrics_display_daemon.secrets.token_bytes = original
+            return conn, server_frame_payloads(b"".join(writer.writes))
+
+        conn, frames = asyncio.run(run())
+        self.assertIsNotNone(conn.tx_key)
+        self.assertIsNotNone(conn.rx_key)
+        self.assertEqual(json.loads(frames[0][1]), {
+            "type": "auth-challenge", "proto": 2,
+            "daemonUuid": "12345678-1234-4234-8234-123456789abc",
+            "serverNonce": bytes(range(32)).hex(),
+        })
+        self.assertEqual(json.loads(frames[1][1])["type"], "auth-ok")
+
     def test_recv_handles_many_pings_without_recursion(self) -> None:
         async def run() -> tuple[tuple[int, bytes] | None, bytes]:
             reader = asyncio.StreamReader()

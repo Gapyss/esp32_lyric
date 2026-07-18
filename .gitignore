@@ -1,8 +1,11 @@
 # macOS
 .DS_Store
 
-# Secrets (use wifi_secrets.example.h as the template)
+# Legacy local header; provisioning firmware does not include it.
 firmware/main/wifi_secrets.h
+
+# Local API credentials (copy api_credentials.example.h).
+firmware/main/api_credentials.h
 
 # ESP-IDF build output & regenerated files
 firmware/build/
@@ -22,3 +25,4 @@ tools/.venv/
 
 # Build artifacts
 dist/
+esp8266/bin/

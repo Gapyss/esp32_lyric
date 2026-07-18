@@ -17,6 +17,10 @@
 #include "jpeg_decoder.h"
 #include "pngle.h"
 
+#if __has_include("api_credentials.h")
+#include "api_credentials.h"
+#endif
+
 static const char *TAG = "comic_screen";
 static const char *XKCD_API_URL = "https://xkcd.com/info.0.json";
 #ifndef NASA_API_KEY
@@ -515,6 +519,28 @@ static esp_err_t fetch_jpeg(const char *url, DecodeContext *ctx)
     return err;
 }
 
+static esp_err_t normalize_apod_url(char *url, size_t capacity)
+{
+    static const char *HTTP_APOD_PREFIX = "http://apod.nasa.gov/";
+    if (strncmp(url, HTTP_APOD_PREFIX, strlen(HTTP_APOD_PREFIX)) == 0) {
+        const size_t url_length = strlen(url);
+        if (url_length + 1 >= capacity) {
+            return ESP_ERR_INVALID_SIZE;
+        }
+        memmove(url + 5, url + 4, url_length - 3);
+        url[4] = 's';
+    }
+    return strncmp(url, "https://", strlen("https://")) == 0 ? ESP_OK : ESP_ERR_INVALID_RESPONSE;
+}
+
+static esp_err_t fetch_apod_image(const char *url, DecodeContext *decoded)
+{
+    if (strstr(url, ".png") != NULL) {
+        return fetch_png(url, decoded);
+    }
+    return fetch_jpeg(url, decoded);
+}
+
 static esp_err_t refresh_comic(void)
 {
     char *json = (char *)alloc_external(MAX_API_BYTES + 1);
@@ -595,7 +621,9 @@ static esp_err_t refresh_apod(void)
     const cJSON *title = cJSON_GetObjectItemCaseSensitive(root, "title");
     const cJSON *date = cJSON_GetObjectItemCaseSensitive(root, "date");
     const cJSON *url = cJSON_GetObjectItemCaseSensitive(root, "url");
-    if (cJSON_IsString(media_type) && strcmp(media_type->valuestring, "video") == 0) {
+    const bool is_video = cJSON_IsString(media_type) && strcmp(media_type->valuestring, "video") == 0;
+    const cJSON *hdurl = is_video ? NULL : cJSON_GetObjectItemCaseSensitive(root, "hdurl");
+    if (is_video) {
         url = cJSON_GetObjectItemCaseSensitive(root, "thumbnail_url");
     }
     if (!cJSON_IsString(title) || !cJSON_IsString(date) || !cJSON_IsString(url) ||
@@ -607,29 +635,35 @@ static esp_err_t refresh_apod(void)
     char apod_title[sizeof(g_apod.title)];
     char apod_date[sizeof(g_apod.date)];
     char image_url[512];
+    char fallback_url[512] = {};
     snprintf(apod_title, sizeof(apod_title), "%s", title->valuestring);
     snprintf(apod_date, sizeof(apod_date), "%s", date->valuestring);
     snprintf(image_url, sizeof(image_url), "%s", url->valuestring);
-    cJSON_Delete(root);
-    if (strncmp(image_url, "http://apod.nasa.gov/", strlen("http://apod.nasa.gov/")) == 0) {
-        const size_t url_length = strlen(image_url);
-        if (url_length + 1 >= sizeof(image_url)) {
-            return ESP_ERR_INVALID_SIZE;
-        }
-        memmove(image_url + 5, image_url + 4, url_length - 3);
-        image_url[4] = 's';
+    if (cJSON_IsString(hdurl) && hdurl->valuestring != NULL) {
+        snprintf(fallback_url, sizeof(fallback_url), "%s", hdurl->valuestring);
     }
-    if (strncmp(image_url, "https://", strlen("https://")) != 0) {
-        return ESP_ERR_INVALID_RESPONSE;
+    cJSON_Delete(root);
+    err = normalize_apod_url(image_url, sizeof(image_url));
+    if (err != ESP_OK) {
+        return err;
+    }
+    if (fallback_url[0] != '\0' &&
+        (normalize_apod_url(fallback_url, sizeof(fallback_url)) != ESP_OK ||
+         strcmp(fallback_url, image_url) == 0)) {
+        fallback_url[0] = '\0';
     }
 
     DecodeContext decoded = {};
     decoded.max_width = VIEWPORT_W;
     decoded.max_height = VIEWPORT_H;
-    if (strstr(image_url, ".png") != NULL) {
-        err = fetch_png(image_url, &decoded);
-    } else {
-        err = fetch_jpeg(image_url, &decoded);
+    err = fetch_apod_image(image_url, &decoded);
+    if (err != ESP_OK && fallback_url[0] != '\0') {
+        ESP_LOGW(TAG, "APOD primary image failed (%s); trying hdurl", esp_err_to_name(err));
+        free(decoded.bitmap);
+        decoded = {};
+        decoded.max_width = VIEWPORT_W;
+        decoded.max_height = VIEWPORT_H;
+        err = fetch_apod_image(fallback_url, &decoded);
     }
     if (err != ESP_OK) {
         free(decoded.bitmap);

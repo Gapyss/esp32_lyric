@@ -75,6 +75,7 @@ void music_set_idle_metrics(int hour,
                             bool env_valid);
 void music_set_network_status(const char *ip_address);
 void music_set_daemon_connected(bool connected);
+void music_set_daemon_status(const char *status);
 void music_get_snapshot(NowPlayingSnapshot *snapshot, bool allow_promote);
 void music_render_current(u8g2_t *u8, bool allow_promote);
 

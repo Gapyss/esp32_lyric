@@ -15,6 +15,9 @@ idf_component_register(
         "comic_screen.cpp"
         "http_api.cpp"
         "board_client.cpp"
+        "network_manager.cpp"
+        "provisioning_portal.cpp"
+        "provisioning_display.cpp"
         "ui_error.cpp"
     INCLUDE_DIRS "."
     REQUIRES
@@ -26,6 +29,7 @@ idf_component_register(
         esp_netif
         esp_http_client
         esp_http_server
+        qrcode
         json
         mbedtls
         driver
@@ -33,4 +37,5 @@ idf_component_register(
         mdns
         esp_codec_dev
         pngle
+        lwip
 )

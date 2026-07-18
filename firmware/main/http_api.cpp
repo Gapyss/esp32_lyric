@@ -9,6 +9,7 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "app_mode.h"
+#include "board_client.h"
 #include "display_config.h"
 #include "music_screen.h"
 #include "water_screen.h"
@@ -591,6 +592,41 @@ static esp_err_t diag_display_handler(httpd_req_t *req)
     return httpd_resp_sendstr(req, "ok");
 }
 
+static esp_err_t pairing_handler(httpd_req_t *req)
+{
+    if (req->method == HTTP_GET) {
+        char json[128];
+        snprintf(json, sizeof(json), "{\"paired\":%s,\"state\":\"%s\"}",
+                 board_client_has_pairing_token() ? "true" : "false",
+                 board_client_state_name(board_client_get_state()));
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+        return httpd_resp_sendstr(req, json);
+    }
+    if (req->content_len == 0 || req->content_len > 96) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "send token=<64 hex characters>");
+    }
+    char body[97] = {}, token[65] = {};
+    size_t offset = 0;
+    while (offset < req->content_len) {
+        const int received = httpd_req_recv(req, body + offset, req->content_len - offset);
+        if (received <= 0) return ESP_FAIL;
+        offset += (size_t)received;
+    }
+    body[offset] = '\0';
+    if (strncmp(body, "token=", 6) == 0) {
+        url_decode(token, sizeof(token), body + 6);
+    } else if (strlen(body) == 64) {
+        memcpy(token, body, 64);
+        token[64] = '\0';
+    }
+    memset(body, 0, sizeof(body));
+    const esp_err_t err = board_client_set_pairing_token(token);
+    memset(token, 0, sizeof(token));
+    if (err != ESP_OK) return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "token must be 64 hexadecimal characters");
+    return httpd_resp_sendstr(req, "paired; discovery restarted");
+}
+
 esp_err_t http_api_start(void)
 {
     if (g_server != NULL) {
@@ -598,7 +634,7 @@ esp_err_t http_api_start(void)
     }
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 16;
+    config.max_uri_handlers = 18;
 
     esp_err_t err = httpd_start(&g_server, &config);
     if (err != ESP_OK) {
@@ -680,6 +716,14 @@ esp_err_t http_api_start(void)
         .handler = diag_display_handler,
         .user_ctx = NULL,
     };
+    httpd_uri_t pairing_get = {
+        .uri = "/pairing",
+        .method = HTTP_GET,
+        .handler = pairing_handler,
+        .user_ctx = NULL,
+    };
+    httpd_uri_t pairing_post = pairing_get;
+    pairing_post.method = HTTP_POST;
 
     ESP_ERROR_CHECK(httpd_register_uri_handler(g_server, &nowplaying_get));
     ESP_ERROR_CHECK(httpd_register_uri_handler(g_server, &nowplaying_post));
@@ -696,7 +740,25 @@ esp_err_t http_api_start(void)
     ESP_ERROR_CHECK(httpd_register_uri_handler(g_server, &hydrate_config_post));
     ESP_ERROR_CHECK(httpd_register_uri_handler(g_server, &hydrate_json));
     ESP_ERROR_CHECK(httpd_register_uri_handler(g_server, &diag_display));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(g_server, &pairing_get));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(g_server, &pairing_post));
 
     ESP_LOGI(TAG, "HTTP API listening on port %d", config.server_port);
     return ESP_OK;
+}
+
+esp_err_t http_api_stop(void)
+{
+    if (g_server == NULL) {
+        return ESP_OK;
+    }
+    httpd_handle_t server = g_server;
+    const esp_err_t err = httpd_stop(server);
+    if (err == ESP_OK) {
+        g_server = NULL;
+        ESP_LOGI(TAG, "HTTP API stopped");
+    } else {
+        ESP_LOGW(TAG, "HTTP API stop failed: %s", esp_err_to_name(err));
+    }
+    return err;
 }

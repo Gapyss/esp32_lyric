@@ -1,13 +1,12 @@
 #pragma once
 
-#include "esp_err.h"
+#include "u8g2.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-esp_err_t http_api_start(void);
-esp_err_t http_api_stop(void);
+void provisioning_display_render(u8g2_t *u8);
 
 #ifdef __cplusplus
 }

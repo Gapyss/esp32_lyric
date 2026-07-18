@@ -74,13 +74,18 @@ Features:
 - Provides cache `stats` and `clear` CLI commands.
 - Parses standard LRC timestamps and inline enhanced-LRC syllable markers.
 - Renders 400x300 1-bit frames on the Mac.
+- Also renders a compact 240x240 profile for ESP8266 boards (`/board?w=240&h=240`).
+- Keeps per-profile frame caches; scheduled swaps render every active profile.
 - Uses Core Text rendering when PyObjC is available.
 - Uses a geometry-only fallback renderer when Core Text is unavailable.
 - Generates `LYR1` binary frame envelopes for the ESP32 board.
 - Sends full-frame updates and dirty-rectangle updates.
 - Schedules future lyric-line frames with relative `swapInMs`.
 - Re-sends the current frame when a board sends `ready`.
-- Advertises `_lyrics._tcp` over native mDNS, with `dns-sd` fallback.
+- Advertises `_lyrics._tcp` with strict `proto=2`, HMAC auth, and daemon UUID TXT metadata.
+- Persists the Mac daemon identity in a mode-0600 JSON file and provides a `pairing-token` CLI.
+- Uses nonce/HMAC mutual authentication, directional SEC2 keys, replay-protected records, and heartbeat timeouts.
+- Gives every board an independent bounded outbound queue so a slow board is disconnected in isolation.
 - launchd job starts the daemon at login and keeps it alive.
 
 Default SQLite location:
@@ -119,19 +124,22 @@ Files:
 - `firmware/main/board_client.h`
 - `firmware/main/music_screen.cpp`
 - `firmware/main/display_config.h`
-- `firmware/main/wifi_secrets.example.h`
+- `firmware/main/network_manager.cpp`
+- `firmware/main/provisioning_portal.cpp`
 
 Features:
 
-- Discovers the lyrics daemon through mDNS `_lyrics._tcp`.
-- Can fall back to a configured `LYRICS_DAEMON_HOST` and `LYRICS_DAEMON_PORT`.
-- Connects to `/board` over raw WebSocket.
-- Sends `ready` after connecting to request a current-frame sync.
+- Loads the pairing token and preferred daemon UUID from NVS, never a daemon IP.
+- Discovers `_lyrics._tcp` on every connection attempt and strictly filters proto=2/auth/UUID TXT.
+- Prefers the remembered UUID and same-subnet, interface-correct Bonjour IPv4 addresses.
+- Performs nonce/HMAC mutual authentication and exchanges SEC2-protected hello/ready records.
 - Receives `LYR1` full-frame and rect-frame envelopes.
 - Applies immediate frames immediately.
 - Stages scheduled frames and swaps them after `swapInMs`.
-- Supports board token query string configuration.
-- Auto-reconnects when the daemon is unavailable.
+- Exposes `PAIRING_REQUIRED` without preventing Wi-Fi and accepts pairing through setup or `/pairing`.
+- Auto-reconnects with jittered exponential discovery retry capped at 30 seconds.
+- Enforces a 20-second ping / 10-second pong heartbeat and re-discovers after every reconnect.
+- Keeps proto=1 behind the explicit `LYRICS_ALLOW_LEGACY_PROTO1` migration flag without downgrade.
 - Clears daemon-supplied full frames after disconnect so idle UI can return.
 
 ## Firmware Runtime
@@ -297,7 +305,9 @@ Features:
 - Displays source title, XKCD number, or APOD publication date around the image.
 - Shows an on-screen error state when WiFi, HTTP, parsing, memory allocation, or decoding fails.
 
-The firmware uses NASA's `DEMO_KEY` by default. A different key can be supplied at compile time by defining the `NASA_API_KEY` string macro for the main component.
+The firmware uses NASA's `DEMO_KEY` by default. For a private key, copy
+`firmware/main/api_credentials.example.h` to `api_credentials.h` and set the
+`NASA_API_KEY` string macro. The local credentials file is ignored by Git.
 
 The APOD screen changes after NASA publishes a new entry and the next refresh succeeds. It does not switch exactly at local midnight; with automatic refresh enabled, a newly published image may take up to six hours to appear. Restarting the board or pressing the secondary button requests it immediately.
 
