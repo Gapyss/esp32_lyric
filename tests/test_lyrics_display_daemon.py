@@ -621,6 +621,78 @@ class DirtyRectTests(unittest.TestCase):
         self.assertEqual(rect.payload, b"\x80")
 
 
+class PausedHeroArtTests(unittest.TestCase):
+    """Full-screen album art shown while paused (fit + PAUSED chip)."""
+
+    WIDE = lyrics_display_daemon.WIDE_PROFILE
+    SQUARE = lyrics_display_daemon.SQUARE_PROFILE
+
+    @staticmethod
+    def _get(frame: bytes, x: int, y: int, profile) -> int:
+        return (frame[y * (profile.width // 8) + (x >> 3)] >> (x & 7)) & 1
+
+    def test_hero_cover_size_picks_largest_square(self) -> None:
+        self.assertEqual(lyrics_display_daemon.hero_cover_size([self.WIDE]), 300)
+        self.assertEqual(lyrics_display_daemon.hero_cover_size([self.SQUARE]), 240)
+        self.assertEqual(lyrics_display_daemon.hero_cover_size([self.WIDE, self.SQUARE]), 300)
+        self.assertEqual(lyrics_display_daemon.hero_cover_size([]), 0)
+
+    def test_blit_cover_centered_fits_with_side_bars(self) -> None:
+        # 300px all-lit cover centered on 400x300 -> 50px black bars, no crop.
+        cover = lyrics_display_daemon.CoverArt(size=300, bits=bytes([1]) * (300 * 300))
+        frame = lyrics_display_daemon.blit_cover_centered(
+            bytes(self.WIDE.frame_bytes), cover, self.WIDE
+        )
+        self.assertEqual(self._get(frame, 49, 150, self.WIDE), 0)   # left bar
+        self.assertEqual(self._get(frame, 50, 150, self.WIDE), 1)   # art edge
+        self.assertEqual(self._get(frame, 349, 150, self.WIDE), 1)  # art edge
+        self.assertEqual(self._get(frame, 350, 150, self.WIDE), 0)  # right bar
+
+    def test_blit_cover_centered_crops_when_larger_than_frame(self) -> None:
+        # A 300px cover on a 240x240 frame is centered and clipped (full-bleed).
+        cover = lyrics_display_daemon.CoverArt(size=300, bits=bytes([1]) * (300 * 300))
+        frame = lyrics_display_daemon.blit_cover_centered(
+            bytes(self.SQUARE.frame_bytes), cover, self.SQUARE
+        )
+        for x, y in ((0, 0), (239, 0), (0, 239), (239, 239), (120, 120)):
+            self.assertEqual(self._get(frame, x, y, self.SQUARE), 1)
+
+    def test_blit_zero_bits_leaves_background(self) -> None:
+        # A 0-bit cover clears its pixels (dark art must not OR-leak stale lit px).
+        base = bytes([0xFF]) * self.WIDE.frame_bytes
+        cover = lyrics_display_daemon.CoverArt(size=300, bits=bytes(300 * 300))
+        frame = lyrics_display_daemon.blit_cover_centered(base, cover, self.WIDE)
+        self.assertEqual(self._get(frame, 200, 150, self.WIDE), 0)  # inside art: cleared
+        self.assertEqual(self._get(frame, 0, 150, self.WIDE), 1)    # side bar untouched
+
+    def test_composite_chip_only_writes_masked_pixels(self) -> None:
+        # 8x1 chip, mask lit only in the left half; art underneath stays elsewhere.
+        art = bytes([0xFF]) * self.WIDE.frame_bytes
+        value = bytes([0x00])          # all text/black where written
+        chip_mask = bytes([0x0F])      # cols 0-3 inside pill, 4-7 outside
+        frame = lyrics_display_daemon.composite_chip(
+            art, value, chip_mask, x=16, y=5, chip_w=8, chip_h=1, profile=self.WIDE
+        )
+        self.assertEqual(self._get(frame, 16, 5, self.WIDE), 0)  # masked -> value 0
+        self.assertEqual(self._get(frame, 19, 5, self.WIDE), 0)  # masked -> value 0
+        self.assertEqual(self._get(frame, 20, 5, self.WIDE), 1)  # unmasked -> art kept
+        self.assertEqual(self._get(frame, 23, 5, self.WIDE), 1)  # unmasked -> art kept
+
+    def test_paused_without_hero_cover_uses_normal_layout(self) -> None:
+        # No art (instrumental/fetch-fail/headless): paused must fall back, not blank.
+        # _render only touches self.renderer/self.theme, so bind it to a stub and
+        # skip the daemon's event-loop-dependent constructor.
+        class _Stub:
+            theme = "light"
+            renderer = FallbackFrameRenderer()
+
+        state = AppState(track=TrackInfo(title="Song", duration_sec=100), hero_cover=None)
+        state.clock.update(position_sec=10, paused=True, playback_rate=1)
+        frame = LyricsDisplayDaemon._render(_Stub(), state, self.WIDE)
+        self.assertEqual(len(frame), self.WIDE.frame_bytes)
+        self.assertNotEqual(frame, bytes(self.WIDE.frame_bytes))  # not an empty screen
+
+
 class WebSocketConnectionTests(unittest.TestCase):
     def test_full_board_queue_disconnects_only_that_board(self) -> None:
         async def run() -> tuple[bool, list[tuple[int, bytes]]]:
@@ -902,6 +974,28 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(envelopes[0]["kind"], lyrics_display_daemon.FRAME_KIND_FULL_NOW)
         self.assertEqual(envelopes[1]["kind"], lyrics_display_daemon.FRAME_KIND_RECT_NOW)
         self.assertEqual(envelopes[1]["payload_len"], 1)
+
+    def test_identical_immediate_frame_is_not_resent(self) -> None:
+        # A paused re-render produces byte-identical frames; the daemon must not
+        # re-push (and re-flash) a frame the board already shows. A scheduled
+        # frame of the same bytes is still sent (it swaps in later).
+        async def run() -> tuple[int, int]:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                daemon = LyricsDisplayDaemon(LyricsStore(Path(tmpdir) / "lyrics.sqlite3"), FallbackFrameRenderer())
+                conn = WebSocketConnection(asyncio.StreamReader(), FakeWriter())  # type: ignore[arg-type]
+                frame = bytearray(lyrics_display_daemon.FRAME_BYTES)
+                frame[0] = 1
+                frame = bytes(frame)
+                await daemon.send_frame(conn, frame, now=True, swap_in_ms=0)
+                await daemon.send_frame(conn, frame, now=True, swap_in_ms=0)  # identical -> skipped
+                immediate = len(server_frame_payloads(b"".join(conn.writer.writes)))
+                await daemon.send_frame(conn, frame, now=False, swap_in_ms=500)  # scheduled -> sent
+                total = len(server_frame_payloads(b"".join(conn.writer.writes)))
+                return immediate, total
+
+        immediate, total = asyncio.run(run())
+        self.assertEqual(immediate, 1)  # second identical immediate frame suppressed
+        self.assertEqual(total, 2)      # scheduled frame still delivered
 
     def test_scheduled_swap_invalidates_board_dirty_rect_base(self) -> None:
         # Once a scheduled swap becomes due the board may hold any of several

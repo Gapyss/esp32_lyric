@@ -98,12 +98,23 @@ LYRIC_HIGHLIGHT_GAP_Y = LYRIC_SINGLE_HIGHLIGHT_Y - LYRIC_SINGLE_BASELINE_Y
 # artist line, Roboto Regular for lower-emphasis body copy, Roboto SemiBold
 # for tracked-uppercase labels. JetBrains Mono (the brand's numeral face) isn't
 # vendored here, so Menlo stands in for tabular time/caption text.
-BRAND_FONTS_DIR = Path(__file__).resolve().parent / "assets" / "fonts"
-BRAND_FONT_FILES = {
-    "display": "Roboto_Condensed-Bold.ttf",
-    "body": "Roboto-Regular.ttf",
-    "body_medium": "Roboto-Medium.ttf",
-    "label": "Roboto-SemiBold.ttf",
+# Tend's type roles rendered in Sukhumvit Set, a macOS system family that
+# covers Thai and Latin in one face. Roboto has no Thai glyphs, so mixed
+# lyrics used to hit a CoreText cascade seam (Latin=Roboto, Thai=system
+# fallback); a single Thai+Latin face removes it. Weights mirror the previous
+# Roboto hierarchy (display heaviest → body lightest); the lenient >32
+# threshold in pack_1bpp keeps even the Text weight legible on the 1-bit panel.
+# Note: Sukhumvit Set has no condensed variant, so the display role loses the
+# tighter line budget Roboto Condensed had — long lines marquee-scroll sooner.
+BRAND_FONT_NAMES = {
+    "display": "Sukhumvit Set Bold",
+    # The main lyric is the content, not a heading: one step lighter than the
+    # Bold title so the title still reads as the hero, while Semi Bold keeps the
+    # lyric crisp under the 1-bit threshold.
+    "lyric": "Sukhumvit Set Semi Bold",
+    "body": "Sukhumvit Set Text",
+    "body_medium": "Sukhumvit Set Medium",
+    "label": "Sukhumvit Set Semi Bold",
 }
 MONO_FONT_NAME = "Menlo"
 TRACKING_MEGA = 0.12  # em; matches the design system's eyebrow/label letter-spacing
@@ -188,12 +199,26 @@ class TrackInfo:
     artist: str = ""
     album: str = ""
     duration_sec: float = 0.0
+    art_url: str = ""
 
     @property
     def key(self) -> str:
         return self.video_id or "\x00".join(
             (self.title.lower(), self.artist.lower(), str(round(self.duration_sec or 0)))
         )
+
+
+@dataclass(frozen=True)
+class CoverArt:
+    """A track's album art, already dithered to 1-bit for the mono panel.
+
+    ``bits`` holds one byte per pixel (0 or 1, row-major, top-origin), lit=1.
+    The renderer blits it into a reserved square rect after the theme decision,
+    so a photo keeps its natural tonality in both light and dark themes.
+    """
+
+    size: int
+    bits: bytes
 
 
 @dataclass
@@ -235,6 +260,11 @@ class AppState:
     lyrics: Lyrics = field(default_factory=Lyrics)
     resolving_key: str = ""
     dirty: bool = True
+    cover: CoverArt | None = None
+    # Full-screen album art shown while paused (decoded at a larger size than the
+    # small header cover). None when art is unavailable -> paused falls back to
+    # the normal now-playing layout.
+    hero_cover: CoverArt | None = None
 
     def active_line_index(self) -> int:
         if not self.lyrics.synced:
@@ -307,6 +337,8 @@ class AppState:
             lyrics=self.lyrics,
             resolving_key=self.resolving_key,
             dirty=False,
+            cover=self.cover,
+            hero_cover=self.hero_cover,
         )
 
 
@@ -442,6 +474,222 @@ SQUARE_PROGRESS_GEOM = ProgressGeom(
     time_size=11, left_x=12, left_w=48, right_x=180, right_w=48,
     baseline_y=95, bar_x=66, bar_w=108, center_y=91, dot_r=3.5,
 )
+
+# Album-art cover: a dithered square in the header's top-right, above the
+# progress row, wrapped in a Tend hairline "card" frame. Title/artist reflow
+# into the left column when a cover is present; the karaoke lyric band below is
+# untouched. One placement per board profile (the ESP32 e-ink is 400x300; the
+# ESP8266 SmallTV is 240x240).
+@dataclass(frozen=True)
+class CoverPlacement:
+    x: int          # art top-left (top-origin), the reserved blit rect
+    y: int
+    size: int       # square art edge, in pixels
+    title_w: int    # header left-column width for title/artist when art present
+    frame_pad: int  # gap between art edge and the hairline card frame
+
+
+COVER_PLACEMENTS = {
+    "400x300": CoverPlacement(x=324, y=32, size=60, title_w=324 - 14 - 8, frame_pad=2),
+    "240x240": CoverPlacement(x=174, y=30, size=52, title_w=174 - 12 - 8, frame_pad=2),
+}
+
+
+def cover_placement(profile: "RenderProfile") -> CoverPlacement | None:
+    return COVER_PLACEMENTS.get(profile.name)
+
+
+def max_cover_size(profiles: "list[RenderProfile]") -> int:
+    sizes = [p.size for p in (cover_placement(pr) for pr in profiles) if p is not None]
+    return max(sizes) if sizes else 0
+
+
+def hero_cover_size(profiles: "list[RenderProfile]") -> int:
+    """Decode size for the paused full-screen art: the largest square that fits
+    any connected board that supports covers (400x300 -> 300, 240x240 -> 240).
+
+    Decoded once at the max across boards; each board centers and clips this
+    single cover, so a board smaller than the decode size simply crops the edges
+    (still full-bleed) while the board it was sized for gets an exact fit.
+    """
+    sizes = [min(pr.width, pr.height) for pr in profiles if cover_placement(pr) is not None]
+    return max(sizes) if sizes else 0
+
+
+def blit_cover_centered(frame: bytes, cover: CoverArt, profile: RenderProfile) -> bytes:
+    """Assign a dithered square cover centered on the frame, clipped to bounds.
+
+    Same bit convention as blit_cover (byte = x//8, bit = 1 << (x & 7), lit=set),
+    but centered rather than placed in a header rect. When the cover is larger
+    than the frame it crops (full-bleed); when smaller it leaves the surrounding
+    background untouched (the caller pre-fills it, e.g. black side bars).
+    """
+    buf = bytearray(frame)
+    row_bytes = profile.width // 8
+    size = cover.size
+    origin_x = (profile.width - size) // 2
+    origin_y = (profile.height - size) // 2
+    for row in range(size):
+        fy = origin_y + row
+        if not (0 <= fy < profile.height):
+            continue
+        base = fy * row_bytes
+        src_row = row * size
+        for col in range(size):
+            fx = origin_x + col
+            if not (0 <= fx < profile.width):
+                continue
+            mask = 1 << (fx & 7)
+            idx = base + (fx >> 3)
+            if cover.bits[src_row + col]:
+                buf[idx] |= mask
+            else:
+                buf[idx] &= ~mask & 0xFF
+    return bytes(buf)
+
+
+def composite_chip(
+    frame: bytes,
+    value: bytes,
+    chip_mask: bytes,
+    x: int,
+    y: int,
+    chip_w: int,
+    chip_h: int,
+    profile: RenderProfile,
+) -> bytes:
+    """Stamp a rounded PAUSED chip over the art at top-origin (x, y).
+
+    ``value`` and ``chip_mask`` are 1-bpp row-packed bitmaps of the same size:
+    ``value`` is the white pill with black label text; ``chip_mask`` is the pill
+    coverage (lit = inside pill). Only masked pixels are written, so the pill's
+    rounded corners keep the album art behind them instead of a black box.
+    """
+    buf = bytearray(frame)
+    row_bytes = profile.width // 8
+    chip_row_bytes = (chip_w + 7) // 8
+    for cy in range(chip_h):
+        fy = y + cy
+        if not (0 <= fy < profile.height):
+            continue
+        base = fy * row_bytes
+        src = cy * chip_row_bytes
+        for cx in range(chip_w):
+            fx = x + cx
+            if not (0 <= fx < profile.width):
+                continue
+            if not (chip_mask[src + (cx >> 3)] & (1 << (cx & 7))):
+                continue
+            mask = 1 << (fx & 7)
+            idx = base + (fx >> 3)
+            if value[src + (cx >> 3)] & (1 << (cx & 7)):
+                buf[idx] |= mask
+            else:
+                buf[idx] &= ~mask & 0xFF
+    return bytes(buf)
+
+# Domains the daemon will fetch cover art from. A browser page hands us the URL,
+# so we restrict fetches to Google's public image CDNs (SSRF hygiene: never
+# fetch an arbitrary URL, even over localhost). YT Music's mediaSession artwork
+# is served from assorted googleusercontent.com / ggpht.com subdomains (lh3,
+# yt3, ...), so we suffix-match the base domain rather than exact hostnames --
+# otherwise the art is silently dropped and we fall back to the video-id
+# thumbnail, which only resolves on the watch page (?v=...).
+COVER_ALLOWED_DOMAINS = (
+    "googleusercontent.com",
+    "ggpht.com",
+    "ytimg.com",
+    "youtube.com",
+)
+COVER_FETCH_TIMEOUT_SECONDS = 6.0
+COVER_MAX_BYTES = 4 * 1024 * 1024
+
+
+def cover_host_allowed(url: str) -> bool:
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return False
+    if parsed.scheme != "https":
+        return False
+    host = (parsed.hostname or "").lower()
+    return any(host == d or host.endswith("." + d) for d in COVER_ALLOWED_DOMAINS)
+
+
+def cover_url_for(track: "TrackInfo") -> str | None:
+    """Pick a fetchable cover URL for a track, or None.
+
+    Prefers the page-supplied ``art_url`` (mediaSession artwork -- a clean square
+    cover, available on any page while something plays) when it is on an allowed
+    Google image CDN, and otherwise derives a thumbnail from the video id, which
+    is only present on the watch page.
+    """
+    url = (track.art_url or "").strip()
+    if url and cover_host_allowed(url):
+        return url
+    if track.video_id:
+        return f"https://i.ytimg.com/vi/{urllib.parse.quote(track.video_id)}/hqdefault.jpg"
+    return None
+
+
+def fetch_cover_bytes(url: str) -> bytes:
+    req = urllib.request.Request(url, headers={"User-Agent": LRCLIB_USER_AGENT})
+    with urllib.request.urlopen(req, timeout=COVER_FETCH_TIMEOUT_SECONDS) as resp:
+        return resp.read(COVER_MAX_BYTES + 1)[:COVER_MAX_BYTES]
+
+
+def floyd_steinberg_1bit(gray: list[int], width: int, height: int) -> bytes:
+    """Error-diffusion dither of an 8-bit grayscale buffer to 1-bit (lit=1)."""
+    buf = [float(v) for v in gray]
+    out = bytearray(width * height)
+    for y in range(height):
+        for x in range(width):
+            i = y * width + x
+            old = buf[i]
+            new = 255.0 if old >= 128.0 else 0.0
+            out[i] = 1 if new else 0
+            err = old - new
+            if x + 1 < width:
+                buf[i + 1] += err * 7 / 16
+            if y + 1 < height:
+                if x > 0:
+                    buf[i + width - 1] += err * 3 / 16
+                buf[i + width] += err * 5 / 16
+                if x + 1 < width:
+                    buf[i + width + 1] += err * 1 / 16
+    return bytes(out)
+
+
+def blit_cover(frame: bytes, cover: CoverArt, profile: RenderProfile) -> bytes:
+    """Assign the cover's 1-bit pixels into the profile's reserved header rect.
+
+    Assigns (clears then sets) each pixel so a dithered cover's 0-bits also land
+    -- a plain OR would leave stale lit pixels showing through dark art. Bit
+    order matches pack_1bpp: byte = x//8, bit = 1 << (x & 7), lit = set.
+    """
+    place = cover_placement(profile)
+    if place is None:
+        return frame
+    buf = bytearray(frame)
+    row_bytes = profile.width // 8
+    size = cover.size
+    for row in range(size):
+        fy = place.y + row
+        if not (0 <= fy < profile.height):
+            continue
+        base = fy * row_bytes
+        src_row = row * size
+        for col in range(size):
+            fx = place.x + col
+            if not (0 <= fx < profile.width):
+                continue
+            mask = 1 << (fx & 7)
+            idx = base + (fx >> 3)
+            if cover.bits[src_row + col]:
+                buf[idx] |= mask
+            else:
+                buf[idx] &= ~mask & 0xFF
+    return bytes(buf)
 
 
 def profile_from_board_path(path: str) -> RenderProfile:
@@ -1011,7 +1259,7 @@ class CoreTextFrameRenderer(FrameRenderer):
     def __init__(self, font_name: str = "Tahoma") -> None:
         import CoreText  # type: ignore
         import Quartz  # type: ignore
-        from Foundation import NSAttributedString, NSString, NSURL  # type: ignore
+        from Foundation import NSAttributedString, NSString  # type: ignore
 
         self.CoreText = CoreText
         self.Quartz = Quartz
@@ -1019,35 +1267,31 @@ class CoreTextFrameRenderer(FrameRenderer):
         self.NSString = NSString
         self.font_name = font_name
         self.color_space = Quartz.CGColorSpaceCreateDeviceGray()
-        self.brand_fonts = self._load_brand_fonts(NSURL)
+        self.brand_fonts = self._load_brand_fonts()
         # Height of the frame currently being rendered; the Core Text primitives
         # need it to flip top-origin layout coords into Quartz's bottom-origin
         # space. render() sets it per call (rendering is single-threaded).
         self._h = DISPLAY_HEIGHT
 
-    def _load_brand_fonts(self, NSURL: Any) -> dict[str, str]:
-        """Register vendored brand TTFs and resolve their real PostScript names.
+    def _load_brand_fonts(self) -> dict[str, str]:
+        """Resolve the Sukhumvit Set weight used for each Tend type role.
 
-        Registering by file and reading back the descriptor's name avoids
-        guessing PostScript names, which can differ across font releases.
+        Sukhumvit Set is a macOS system family, so there is nothing to register.
+        CTFontCreateWithName silently substitutes a default face when a name
+        does not resolve, so we confirm each weight actually maps to Sukhumvit
+        (its PostScript names start with "SukhumvitSet") and otherwise fall back
+        to self.font_name for that role.
         """
         ct = self.CoreText
         resolved: dict[str, str] = {}
-        for role, filename in BRAND_FONT_FILES.items():
-            path = BRAND_FONTS_DIR / filename
-            try:
-                url = NSURL.fileURLWithPath_(str(path))
-                ok, err = ct.CTFontManagerRegisterFontsForURL(url, ct.kCTFontManagerScopeProcess, None)
-                already_registered = err is not None and err.code() == 105
-                if not (ok or already_registered):
-                    raise ValueError(str(err) if err is not None else "font registration failed")
-                descriptors = ct.CTFontManagerCreateFontDescriptorsFromURL(url)
-                if not descriptors:
-                    raise ValueError("could not read font descriptor")
-                name = ct.CTFontDescriptorCopyAttribute(descriptors[0], ct.kCTFontNameAttribute)
-                resolved[role] = str(name)
-            except Exception as exc:
-                print(f"brand font {filename!r} unavailable ({exc}); {role!r} falls back to {self.font_name!r}")
+        for role, name in BRAND_FONT_NAMES.items():
+            font = ct.CTFontCreateWithName(name, 24.0, None)
+            ps_name = str(ct.CTFontCopyPostScriptName(font))
+            if ps_name.startswith("SukhumvitSet"):
+                resolved[role] = name
+            else:
+                print(f"font {name!r} unavailable (resolved to {ps_name!r}); "
+                      f"{role!r} falls back to {self.font_name!r}")
         return resolved
 
     def _role_font(self, role: str) -> str:
@@ -1075,7 +1319,115 @@ class CoreTextFrameRenderer(FrameRenderer):
         stride = q.CGImageGetBytesPerRow(image)
         return pack_1bpp(pixels, profile.width, profile.height, stride)
 
-    def _draw_lyric_band(self, ctx: Any, state: AppState, profile: RenderProfile, display_font: str) -> LyricLayout:
+    def decode_cover(self, data: bytes, size: int) -> CoverArt | None:
+        """Decode image bytes, center-crop square, downscale, dither to 1-bit.
+
+        Runs off the event loop (called via asyncio.to_thread). It only touches
+        the immutable color space and local Core Graphics contexts, so it is safe
+        alongside the main render.
+        """
+        q = self.Quartz
+        from Foundation import NSData  # type: ignore
+
+        ns_data = NSData.dataWithBytes_length_(data, len(data))
+        src = q.CGImageSourceCreateWithData(ns_data, None)
+        if src is None or q.CGImageSourceGetCount(src) < 1:
+            return None
+        image = q.CGImageSourceCreateImageAtIndex(src, 0, None)
+        if image is None:
+            return None
+        iw = int(q.CGImageGetWidth(image))
+        ih = int(q.CGImageGetHeight(image))
+        if iw <= 0 or ih <= 0:
+            return None
+        side = min(iw, ih)
+        crop = q.CGImageCreateWithImageInRect(
+            image, q.CGRectMake((iw - side) // 2, (ih - side) // 2, side, side)
+        )
+        ctx = q.CGBitmapContextCreate(
+            None, size, size, 8, 0, self.color_space, q.kCGImageAlphaNone
+        )
+        if ctx is None:
+            return None
+        q.CGContextSetInterpolationQuality(ctx, q.kCGInterpolationHigh)
+        q.CGContextDrawImage(ctx, q.CGRectMake(0, 0, size, size), crop or image)
+        out = q.CGBitmapContextCreateImage(ctx)
+        pixels = bytes(q.CGDataProviderCopyData(q.CGImageGetDataProvider(out)))
+        stride = int(q.CGImageGetBytesPerRow(out))
+        # Core Graphics bitmap memory is top-origin (row 0 = top), matching the
+        # frame buffer, so no vertical flip is needed here.
+        gray = [pixels[y * stride + x] for y in range(size) for x in range(size)]
+        return CoverArt(size=size, bits=floyd_steinberg_1bit(gray, size, size))
+
+    def render_pause_chip(self, profile: RenderProfile) -> tuple[bytes, bytes, int, int]:
+        """Render the small PAUSED chip stamped over the paused full-screen art.
+
+        Returns (value, mask, chip_w, chip_h): two 1-bpp row-packed bitmaps of
+        the same size. ``value`` is the white pill with black label; ``mask`` is
+        the pill's coverage (lit = inside pill). The daemon composites them over
+        the album art so the pill's rounded corners keep the photo behind them.
+        """
+        ct = self.CoreText
+        font_name = self._role_font("label")
+        if profile.name == SQUARE_PROFILE.name:
+            size, pad_x, chip_h, rise = 11, 7, 16, 11
+        else:
+            size, pad_x, chip_h, rise = 13, 9, 20, 14
+        text = "PAUSED"
+        font = ct.CTFontCreateWithName(font_name, size, None)
+        attrs = {
+            ct.kCTFontAttributeName: font,
+            ct.kCTForegroundColorFromContextAttributeName: True,
+            ct.kCTKernAttributeName: TRACKING_MEGA * size,
+        }
+        line = ct.CTLineCreateWithAttributedString(
+            self.NSAttributedString.alloc().initWithString_attributes_(text, attrs)
+        )
+        _left, text_w, _advance = self._line_visual_metrics(line)
+        chip_w = int(text_w) + pad_x * 2
+        value = self._render_chip_layer(text, size, pad_x, rise, chip_w, chip_h, font_name, True)
+        mask = self._render_chip_layer(text, size, pad_x, rise, chip_w, chip_h, font_name, False)
+        return value, mask, chip_w, chip_h
+
+    def _render_chip_layer(
+        self,
+        text: str,
+        size: int,
+        pad_x: int,
+        rise: int,
+        chip_w: int,
+        chip_h: int,
+        font_name: str,
+        with_text: bool,
+    ) -> bytes:
+        q = self.Quartz
+        ctx = q.CGBitmapContextCreate(
+            None, chip_w, chip_h, 8, 0, self.color_space, q.kCGImageAlphaNone
+        )
+        q.CGContextSetGrayFillColor(ctx, 0.0, 1.0)
+        q.CGContextFillRect(ctx, q.CGRectMake(0, 0, chip_w, chip_h))
+        q.CGContextSetShouldAntialias(ctx, True)
+        q.CGContextSetTextMatrix(ctx, q.CGAffineTransformIdentity)
+        prev_h = self._h
+        self._h = chip_h
+        try:
+            q.CGContextSetGrayFillColor(ctx, 1.0, 1.0)
+            q.CGContextAddPath(ctx, self._pill_path(0, 0, chip_w, chip_h))
+            q.CGContextFillPath(ctx)
+            if with_text:
+                self._draw_text(
+                    ctx, text, size, pad_x, rise, chip_w, "left",
+                    font_name=font_name, tracking=TRACKING_MEGA, gray=0.0,
+                )
+        finally:
+            self._h = prev_h
+        image = q.CGBitmapContextCreateImage(ctx)
+        pixels = bytes(q.CGDataProviderCopyData(q.CGImageGetDataProvider(image)))
+        stride = q.CGImageGetBytesPerRow(image)
+        return pack_1bpp(pixels, chip_w, chip_h, stride)
+
+    def _draw_lyric_band(self, ctx: Any, state: AppState, profile: RenderProfile) -> LyricLayout:
+        lyric_font = self._role_font("lyric")
         current, _next_line, _third = state.current_lines()
         current_layout = fit_lyric_layout(
             current,
@@ -1102,7 +1454,7 @@ class CoreTextFrameRenderer(FrameRenderer):
                 baseline_y,
                 profile.lyric_box_width,
                 row_fraction if karaoke else 1.0,
-                display_font,
+                lyric_font,
             )
             consumed_chars += len(row)
         return current_layout
@@ -1126,17 +1478,21 @@ class CoreTextFrameRenderer(FrameRenderer):
             )
             self._screen_rect(ctx, 14, 168, DISPLAY_WIDTH - 28, 20)
             self._draw_text(
-                ctx, "g4pys.company", 13, 260, 292, 126, "right", font_name=MONO_FONT_NAME, tracking=TRACKING_WIDE
+                ctx, "POWERED BY CLAUDE", 13, 260, 292, 126, "right", font_name=MONO_FONT_NAME, tracking=TRACKING_WIDE
             )
             return
 
-        self._draw_text(ctx, state.track.title, 28, 14, 60, DISPLAY_WIDTH - 28, "left", font_name=display_font)
-        self._draw_text(ctx, state.track.artist, 18, 14, 88, DISPLAY_WIDTH - 28, "left", font_name=body_medium_font)
+        place = cover_placement(profile) if state.cover is not None else None
+        header_w = place.title_w if place is not None else DISPLAY_WIDTH - 28
+        self._draw_text(ctx, state.track.title, 28, 14, 60, header_w, "left", font_name=display_font)
+        self._draw_text(ctx, state.track.artist, 18, 14, 88, header_w, "left", font_name=body_medium_font)
+        if place is not None:
+            self._draw_cover_card(ctx, place)
         self._draw_progress(ctx, state, MONO_FONT_NAME, WIDE_PROGRESS_GEOM)
         self._draw_rule(ctx, 12, 130, DISPLAY_WIDTH - 24)
 
         _current, next_line, third = state.current_lines()
-        current_layout = self._draw_lyric_band(ctx, state, profile, display_font)
+        current_layout = self._draw_lyric_band(ctx, state, profile)
         self._draw_text(ctx, next_line, 21, 14, 224, DISPLAY_WIDTH - 28, "center", font_name=body_font)
         if not current_layout.hide_third and third:
             self._draw_text(ctx, third, 16, 14, 252, DISPLAY_WIDTH - 28, "center", font_name=body_font)
@@ -1179,13 +1535,17 @@ class CoreTextFrameRenderer(FrameRenderer):
             )
             return
 
-        self._draw_text(ctx, state.track.title, 20, 12, 52, width - 24, "left", font_name=display_font)
-        self._draw_text(ctx, state.track.artist, 14, 12, 74, width - 24, "left", font_name=body_medium_font)
+        place = cover_placement(profile) if state.cover is not None else None
+        header_w = place.title_w if place is not None else width - 24
+        self._draw_text(ctx, state.track.title, 20, 12, 52, header_w, "left", font_name=display_font)
+        self._draw_text(ctx, state.track.artist, 14, 12, 74, header_w, "left", font_name=body_medium_font)
+        if place is not None:
+            self._draw_cover_card(ctx, place)
         self._draw_progress(ctx, state, MONO_FONT_NAME, SQUARE_PROGRESS_GEOM)
         self._draw_rule(ctx, 10, 104, width - 20)
 
         _current, next_line, third = state.current_lines()
-        current_layout = self._draw_lyric_band(ctx, state, profile, display_font)
+        current_layout = self._draw_lyric_band(ctx, state, profile)
         self._draw_text(ctx, next_line, 14, 12, 202, width - 24, "center", font_name=body_font)
         if not current_layout.hide_third and third:
             self._draw_text(ctx, third, 12, 12, 222, width - 24, "center", font_name=body_font)
@@ -1323,6 +1683,27 @@ class CoreTextFrameRenderer(FrameRenderer):
         q = self.Quartz
         q.CGContextAddPath(ctx, self._pill_path(x, y, w, h))
         q.CGContextStrokePath(ctx)
+
+    def _draw_cover_card(self, ctx: Any, place: "CoverPlacement") -> None:
+        """Tend hairline card frame around the album art (radius-8 rounded rect).
+
+        Drawn in the pre-invert pass as set bits, so after the light-theme flip
+        it reads as a 1px ink hairline on paper -- the same card chrome the other
+        Tend screens use (u8g2 DrawRFrame, radius 8). The art is blitted inside
+        this frame later, in _render, so it keeps its natural tonality.
+        """
+        q = self.Quartz
+        pad = place.frame_pad
+        fx = place.x - pad
+        fw = place.size + 2 * pad
+        fy_top = place.y - pad
+        rect = q.CGRectMake(fx, self._h - fy_top - fw, fw, fw)
+        q.CGContextSaveGState(ctx)
+        q.CGContextSetGrayStrokeColor(ctx, 1.0, 1.0)
+        q.CGContextSetLineWidth(ctx, 1.0)
+        q.CGContextAddPath(ctx, q.CGPathCreateWithRoundedRect(rect, 8.0, 8.0, None))
+        q.CGContextStrokePath(ctx)
+        q.CGContextRestoreGState(ctx)
 
     def _line_visual_metrics(self, line: Any) -> tuple[float, float, float]:
         """Return (visual_left, visual_width, advance_width) for a CTLine.
@@ -1806,6 +2187,8 @@ class LyricsDisplayDaemon:
         self._background_tasks: set[asyncio.Task[None]] = set()
         self._resolve_cancel: threading.Event | None = None
         self.media_timeline_offset_sec = 0.0
+        # Album art dithered to 1-bit, cached per (cover URL, size) (bounded).
+        self.cover_cache: dict[tuple[str, int], CoverArt | None] = {}
 
     def _cancel_inflight_resolve(self) -> None:
         if self._resolve_cancel is not None:
@@ -1846,6 +2229,7 @@ class LyricsDisplayDaemon:
                 artist=str(payload.get("artist") or ""),
                 album=str(payload.get("album") or ""),
                 duration_sec=float(payload.get("durationSec") or 0),
+                art_url=str(payload.get("artUrl") or ""),
             )
             await self.set_track(track)
         elif msg_type == "tick":
@@ -1861,6 +2245,8 @@ class LyricsDisplayDaemon:
                     self.state.track = TrackInfo()
                     self.state.lyrics = Lyrics()
                     self.state.resolving_key = ""
+                    self.state.cover = None
+                    self.state.hero_cover = None
                     self.state.dirty = True
         elif msg_type == "set-theme":
             await self.set_theme(str(payload.get("theme") or ""))
@@ -1879,6 +2265,21 @@ class LyricsDisplayDaemon:
             self.state.clock.update(0.0, self.state.clock.paused, self.state.clock.playback_rate)
             self.state.lyrics = cached or Lyrics()
             self.state.resolving_key = track.key if cached is None else ""
+            # Drop the previous cover immediately; the new one loads async below,
+            # and a cache hit is applied before we return so it shows on frame 1.
+            cover_url = cover_url_for(track)
+            cover_size = self._cover_size()
+            hero_size = self._hero_cover_size()
+            self.state.cover = (
+                self.cover_cache.get((cover_url, cover_size))
+                if cover_url and cover_size
+                else None
+            )
+            self.state.hero_cover = (
+                self.cover_cache.get((cover_url, hero_size))
+                if cover_url and hero_size
+                else None
+            )
             self.state.dirty = True
         if track.title and cached is None:
             cancel = threading.Event()
@@ -1886,6 +2287,81 @@ class LyricsDisplayDaemon:
             task = asyncio.create_task(self.resolve_track(track, cancel))
             self._background_tasks.add(task)
             task.add_done_callback(self._background_tasks.discard)
+        self._ensure_cover(track)
+
+    def _cover_size(self) -> int:
+        """Cover decode size for currently connected boards (0 = none want art).
+
+        Keyed off real connections, not the no-board render fallback, so a
+        headless daemon does zero cover network I/O.
+        """
+        return max_cover_size([conn.profile for conn in self.boards])
+
+    def _hero_cover_size(self) -> int:
+        """Full-screen paused-art decode size for connected boards (0 = none)."""
+        return hero_cover_size([conn.profile for conn in self.boards])
+
+    def _ensure_cover(self, track: TrackInfo) -> None:
+        """Fetch this track's cover once, decoded to both the header size and the
+        full-screen paused-art size for the largest connected board.
+
+        Only fetches when a board whose profile supports covers is connected, so
+        a headless daemon (or a board with no cover slot) does no network I/O.
+        Both sizes come from a single HTTP fetch (decoded twice), so the paused
+        hero art costs no extra network round trip.
+        """
+        url = cover_url_for(track)
+        small = self._cover_size()
+        hero = self._hero_cover_size()
+        # TEMP DEBUG: reveals exactly what the extension sent and what we chose.
+        print(
+            f"[cover] title={track.title!r} video_id={track.video_id!r} "
+            f"art_url={track.art_url!r} -> url={url!r} sizes=small:{small},hero:{hero}"
+        )
+        if not track.title or not url:
+            return
+        wanted = {s for s in (small, hero) if s > 0}
+        needed = sorted(s for s in wanted if (url, s) not in self.cover_cache)
+        if not needed:
+            return
+        task = asyncio.create_task(self.resolve_cover(track, url, needed))
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+    async def resolve_cover(self, track: TrackInfo, url: str, sizes: list[int]) -> None:
+        try:
+            decoded = await asyncio.to_thread(self._resolve_cover_sync, url, sizes)
+        except Exception as exc:
+            print(f"cover fetch failed for {track.title!r}: {exc}")
+            # Cache None per size to avoid re-fetching a URL that won't decode.
+            decoded = {size: None for size in sizes}
+        if len(self.cover_cache) > 64:
+            self.cover_cache.clear()
+        for size, cover in decoded.items():
+            self.cover_cache[(url, size)] = cover
+        # Re-read sizes at completion: a board may have (dis)connected mid-fetch.
+        small = self._cover_size()
+        hero = self._hero_cover_size()
+        small_cover = self.cover_cache.get((url, small)) if small > 0 else None
+        hero_cover = self.cover_cache.get((url, hero)) if hero > 0 else None
+        if small_cover is None and hero_cover is None:
+            return
+        async with self.state_lock:
+            if self.state.track.key != track.key:
+                return
+            if small_cover is not None:
+                self.state.cover = small_cover
+            if hero_cover is not None:
+                self.state.hero_cover = hero_cover
+            self.state.dirty = True
+        await self.render_and_broadcast()
+
+    def _resolve_cover_sync(self, url: str, sizes: list[int]) -> dict[int, CoverArt | None]:
+        data = fetch_cover_bytes(url)
+        decode = getattr(self.renderer, "decode_cover", None)
+        if not data or decode is None:  # no bytes, or headless test renderer
+            return {size: None for size in sizes}
+        return {size: decode(data, size) for size in sizes}
 
     async def update_clock(self, payload: dict[str, Any], update_duration: bool = True) -> None:
         async with self.state_lock:
@@ -1954,8 +2430,43 @@ class LyricsDisplayDaemon:
             self.last_frames[DEFAULT_PROFILE.name] = frame
 
     def _render(self, state: AppState, profile: RenderProfile) -> bytes:
+        # Paused with art available: fill the panel with the album cover instead
+        # of the now-playing layout. Falls through to the normal render whenever
+        # art is unavailable (instrumental, fetch failure, headless renderer).
+        if (
+            state.clock.paused
+            and state.track.title
+            and state.hero_cover is not None
+            and hasattr(self.renderer, "render_pause_chip")
+        ):
+            return self._render_paused_hero(state, profile)
         frame = self.renderer.render(state, profile)
-        return invert_frame(frame) if self.theme == "light" else frame
+        if self.theme == "light":
+            frame = invert_frame(frame)
+        # Blit after the theme flip: a photo keeps its natural tonality
+        # (luminance -> lit) in both themes, unlike the ink-on-paper UI chrome.
+        if state.cover is not None and state.track.title and cover_placement(profile) is not None:
+            frame = blit_cover(frame, state.cover, profile)
+        return frame
+
+    def _render_paused_hero(self, state: AppState, profile: RenderProfile) -> bytes:
+        """Full-screen paused view: centered album art on black, with a PAUSED chip.
+
+        Theme-independent -- the photo keeps its natural tonality (the same reason
+        covers are blitted post-flip in _render), and the chip is an overlay, not
+        ink-on-paper chrome.
+        """
+        cover = state.hero_cover
+        frame = bytes(profile.frame_bytes)  # all-black background (0 = off)
+        frame = blit_cover_centered(frame, cover, profile)
+        value, chip_mask, chip_w, chip_h = self.renderer.render_pause_chip(profile)
+        art_x = max(0, (profile.width - cover.size) // 2)
+        art_y = max(0, (profile.height - cover.size) // 2)
+        margin = 12 if profile.name == SQUARE_PROFILE.name else 14
+        frame = composite_chip(
+            frame, value, chip_mask, art_x + margin, art_y + margin, chip_w, chip_h, profile
+        )
+        return frame
 
     def _active_profiles(self) -> list[RenderProfile]:
         profiles: dict[str, RenderProfile] = {conn.profile.name: conn.profile for conn in self.boards}
@@ -2002,6 +2513,14 @@ class LyricsDisplayDaemon:
             conn.start_sender()
             self.boards.add(conn)
             print(f"board connected ({conn.profile.name}, proto={'2' if conn.tx_key else '1'})")
+            # A board may have joined after the track was set; fetch its cover now
+            # (no-op if already cached). Also covers the case where the header art
+            # is present but this board needs a not-yet-decoded full-screen size.
+            async with self.state_lock:
+                needs_cover = self.state.cover is None or self.state.hero_cover is None
+                pending_cover_track = self.state.track if needs_cover else None
+            if pending_cover_track is not None:
+                self._ensure_cover(pending_cover_track)
             await self.send_current_frame(conn, now=True)
             heartbeat = asyncio.create_task(conn.heartbeat())
             while True:
@@ -2136,6 +2655,13 @@ class LyricsDisplayDaemon:
 
     async def send_frame(self, conn: WebSocketConnection, frame: bytes, now: bool, swap_in_ms: int) -> None:
         profile = conn.profile
+        # The board already shows this exact frame -- skip the resend. Without
+        # this, a paused re-render (theme toggle, a late cover resolve) would push
+        # an identical full-screen photo and flash the panel. Only for immediate
+        # frames: scheduled frames are now=False, and a fresh/cleared board has
+        # board_frame_base=None so it still gets the frame.
+        if now and swap_in_ms <= 0 and conn.board_frame_base == frame:
+            return
         rect = (
             dirty_rect(conn.board_frame_base, frame, profile.width, profile.height)
             if now and swap_in_ms <= 0
@@ -2561,7 +3087,7 @@ def main() -> int:
         target.add_argument("--board-host", default=os.environ.get("G4PYS_LYRICS_BOARD_HOST", BOARD_HOST))
         target.add_argument("--board-port", type=int, default=int(os.environ.get("G4PYS_LYRICS_BOARD_PORT", str(BOARD_PORT))))
         target.add_argument("--db", default=os.environ.get("G4PYS_LYRICS_DB", default_db_path()))
-        target.add_argument("--font", default=os.environ.get("G4PYS_LYRICS_FONT", "Tahoma"))
+        target.add_argument("--font", default=os.environ.get("G4PYS_LYRICS_FONT", "Sukhumvit Set Semi Bold"))
         target.add_argument("--mdns-instance", default=os.environ.get("G4PYS_LYRICS_MDNS_INSTANCE", "g4pys Lyrics Display"))
         target.add_argument("--board-token", default=os.environ.get("G4PYS_LYRICS_BOARD_TOKEN", ""))
         target.add_argument("--identity", default=os.environ.get("G4PYS_LYRICS_IDENTITY", str(default_identity_path())))
