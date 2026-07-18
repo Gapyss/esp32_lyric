@@ -24,7 +24,7 @@
     <key>G4PYS_DEVICE_URL</key>
     <string>http://g4pys-company.local</string>
     <key>G4PYS_RENDER_FONT</key>
-    <string>Thonburi</string>
+    <string>Sukhumvit Set Semi Bold</string>
   </dict>
 
   <key>RunAtLoad</key>
