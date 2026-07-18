@@ -32,8 +32,31 @@
     return {
       title: metadata.title || "",
       artist: metadata.artist || "",
-      album: metadata.album || ""
+      album: metadata.album || "",
+      artUrl: bestArtwork(metadata.artwork)
     };
+  }
+
+  function bestArtwork(artwork) {
+    if (!Array.isArray(artwork) || artwork.length === 0) {
+      return "";
+    }
+    // Pick the largest declared size; the daemon downscales to the panel anyway.
+    let best = "";
+    let bestArea = -1;
+    for (const entry of artwork) {
+      const src = entry && entry.src;
+      if (!src) {
+        continue;
+      }
+      const dims = String((entry && entry.sizes) || "").split("x");
+      const area = (Number.parseInt(dims[0], 10) || 0) * (Number.parseInt(dims[1], 10) || 0);
+      if (area >= bestArea) {
+        bestArea = area;
+        best = src;
+      }
+    }
+    return best;
   }
 
   function textFromSelectors(selectors) {
@@ -116,6 +139,7 @@
       title: cleanTitle(title || document.title),
       artist,
       album: md.album || textFromSelectors(["ytmusic-player-bar .album", "ytmusic-player-bar [class*='album']"]),
+      artUrl: md.artUrl || "",
       durationSec: state.durationSec
     };
   }
@@ -169,14 +193,54 @@
     video.addEventListener("ratechange", () => sendTick(true), true);
   }
 
+  // After the extension is reloaded/updated, the copy of this script already
+  // injected into open tabs is orphaned: its chrome.* context is gone, so any
+  // chrome API access throws "Extension context invalidated". Detect that and
+  // tear ourselves down instead of throwing on every timer tick.
+  function extensionAlive() {
+    try {
+      return Boolean(chrome.runtime && chrome.runtime.id);
+    } catch (_err) {
+      return false;
+    }
+  }
+
+  function teardown() {
+    window.clearInterval(tickTimer);
+    window.clearInterval(trackTimer);
+    window.clearTimeout(reconnectTimer);
+    if (domObserver) {
+      domObserver.disconnect();
+      domObserver = null;
+    }
+    try {
+      if (ws) {
+        ws.close();
+      }
+    } catch (_err) {
+      // ws already gone; nothing to do.
+    }
+    ws = null;
+  }
+
   function startLoops() {
     window.clearInterval(tickTimer);
     window.clearInterval(trackTimer);
     trackTimer = window.setInterval(() => {
+      if (!extensionAlive()) {
+        teardown();
+        return;
+      }
       bindVideoEvents();
       sendTrackIfChanged(false);
     }, TRACK_SCAN_MS);
-    tickTimer = window.setInterval(() => sendTick(false), TICK_MS);
+    tickTimer = window.setInterval(() => {
+      if (!extensionAlive()) {
+        teardown();
+        return;
+      }
+      sendTick(false);
+    }, TICK_MS);
     bindVideoEvents();
     sendTrackIfChanged(true);
     sendTick(true);
@@ -196,12 +260,20 @@
     }
 
     ws.addEventListener("open", () => {
+      if (!extensionAlive()) {
+        teardown();
+        return;
+      }
       startLoops();
-      chrome.storage.local.get(["theme"], (result) => {
-        if (result.theme) {
-          sendTheme(result.theme);
-        }
-      });
+      try {
+        chrome.storage.local.get(["theme"], (result) => {
+          if (result && result.theme) {
+            sendTheme(result.theme);
+          }
+        });
+      } catch (_err) {
+        // Context invalidated between the alive-check and the call; ignore.
+      }
     });
     ws.addEventListener("close", () => {
       window.clearInterval(tickTimer);
@@ -209,6 +281,10 @@
       if (domObserver) {
         domObserver.disconnect();
         domObserver = null;
+      }
+      if (!extensionAlive()) {
+        teardown();
+        return;
       }
       reconnectTimer = window.setTimeout(connect, RECONNECT_MS);
     });

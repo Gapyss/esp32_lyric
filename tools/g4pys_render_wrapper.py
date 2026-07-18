@@ -196,10 +196,12 @@ def main() -> int:
     parser.add_argument("--host", default=os.environ.get("G4PYS_WRAPPER_HOST", "127.0.0.1"))
     parser.add_argument("--port", type=int, default=int(os.environ.get("G4PYS_WRAPPER_PORT", "8123")))
     parser.add_argument("--device-url", default=os.environ.get("G4PYS_DEVICE_URL", "http://g4pys-company.local"))
-    # Tahoma has only Regular + Bold faces; the plain "Tahoma" name selects the
-    # lighter Regular weight (there is no dedicated Tahoma Light). It covers both
-    # Thai and Latin, which the lyric/title/artist slots need.
-    parser.add_argument("--font", default=os.environ.get("G4PYS_RENDER_FONT", "Tahoma"))
+    # Sukhumvit Set covers both Thai and Latin in one face (no cascade seam),
+    # which the lyric/title/artist slots need. The exact string "Sukhumvit Set
+    # Semi Bold" resolves to SukhumvitSet-SemiBold; the Semi Bold weight keeps
+    # stems thick enough to survive 1-bit thresholding on the reflective LCD
+    # (plain "Sukhumvit Set" would select the lighter Text weight).
+    parser.add_argument("--font", default=os.environ.get("G4PYS_RENDER_FONT", "Sukhumvit Set Semi Bold"))
     parser.add_argument("--timeout", type=float, default=float(os.environ.get("G4PYS_FORWARD_TIMEOUT", "2.0")))
     args = parser.parse_args()
 
