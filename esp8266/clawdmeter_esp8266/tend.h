@@ -55,8 +55,8 @@
 extern Arduino_GFX *gfx;
 
 // ---- Screen registry -------------------------------------------------------
-// Mirrors the ESP32 app_mode list; MUSIC is this firmware's own on-device
-// lyrics screen (kept, not ported).
+// Mirrors the ESP32 app_mode list; MUSIC is the lyrics screen, rendered solely
+// by the Mac's lyrics_display_daemon.py frame stream (see lyrics_stream.cpp).
 static const uint8_t SCREEN_MUSIC = 0;
 static const uint8_t SCREEN_CLOCK = 1;
 static const uint8_t SCREEN_POMODORO = 2;
@@ -170,12 +170,14 @@ bool swarmRoaming(void);
 // Lyrics frame stream (lyrics_stream.cpp). While the MUSIC screen is visible
 // the box dials back to the Mac that pushes /usage & /nowplaying and speaks
 // the lyrics_display_daemon.py LYR1 WebSocket protocol (:8766) at 240x240:
-// Core Text-rendered frames with real Thai shaping and syllable karaoke. The
-// on-device MUSIC renderer stays as the fallback whenever no frame flows.
+// Core Text-rendered frames with real Thai shaping and syllable karaoke. This
+// is the sole MUSIC renderer; when no frame flows the screen shows a simple
+// paper placeholder (see musicDrawPlaceholder in the .ino), not a fallback card.
 void lyricsStreamNoteHost(const IPAddress &host);  // Mac's IP, from daemon pushes
 void lyricsStreamTick(void);   // pump the socket; call each loop while MUSIC shows
 void lyricsStreamStop(void);   // close + free buffers (leaving MUSIC, OTA start)
 bool lyricsStreamActive(void); // a streamed frame currently owns the panel
+bool lyricsStreamConnecting(void); // Mac IP known but frames not flowing yet (dialing)
 
 // Comic (xkcd) + APOD daily images. Metadata (image URL + title) is pushed by
 // the daemon over /daily -- this chip cannot afford BearSSL heap for the HTTPS

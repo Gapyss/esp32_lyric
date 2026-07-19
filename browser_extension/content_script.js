@@ -140,7 +140,10 @@
       artist,
       album: md.album || textFromSelectors(["ytmusic-player-bar .album", "ytmusic-player-bar [class*='album']"]),
       artUrl: md.artUrl || "",
-      durationSec: state.durationSec
+      durationSec: state.durationSec,
+      positionSec: state.positionSec,
+      paused: state.paused,
+      playbackRate: state.playbackRate
     };
   }
 

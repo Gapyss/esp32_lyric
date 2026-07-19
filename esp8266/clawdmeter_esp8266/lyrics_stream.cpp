@@ -1,27 +1,38 @@
-// Lyrics frame stream — the ESP8266 side of the Mac's lyrics_display_daemon.py
-// (the same LYR1 protocol the ESP32 board_client.cpp speaks, at 240x240).
+// Lyrics frame stream — the ESP8266 side of the Mac's lyrics_display_daemon.py.
 //
-// While the MUSIC screen is visible this module keeps a WebSocket to the
-// daemon's board port (:8766). The daemon renders 240x240 1-bpp frames with
-// Core Text (real Thai shaping, syllable karaoke) and pushes them as binary
-// LYR1 envelopes: full frames, dirty-rect deltas, and pre-scheduled frames
-// that swap on a millis() deadline (so lyric lines flip on-beat between
-// pushes). Set bits are paper, clear bits ink — the daemon's light theme
-// matches the Tend look 1:1.
+// This is the unauthenticated proto=1 client. The ESP8266 does NOT have the heap
+// for the secure proto=2 (SEC2) path the ESP32 uses: SEC2 must buffer a whole
+// record to verify its HMAC before the frame is trusted, which means a second
+// ~7.2 KB buffer on top of the framebuffer. Two big buffers plus the on-device
+// marquee canvases exhaust the heap the WiFi SDK needs and the radio crashes
+// (ieee80211_parse_beacon, StoreProhibited on a NULL alloc). So on this chip we
+// drop authentication and stream frames straight into ONE framebuffer.
 //
-// Everything is millis()-polled from loop() (no timer ISR, no extra library):
-// a hand-rolled WS client over WiFiClient with a byte-wise state machine, so
-// a 7.2 KB frame arriving across TCP segments never blocks the web server.
-// The daemon's address is not configured anywhere — it is the Mac that
-// already POSTs /usage and /nowplaying to this box, so the .ino hands us the
-// source IP of those pushes (lyricsStreamNoteHost) and we dial back to it.
+// Run the daemon with --insecure (no identity): it then speaks proto=1, sends a
+// plaintext hello, and pushes bare LYR1 envelopes (no SEC2 wrapper). We dial the
+// Mac whose IP arrives on /nowplaying (lyricsStreamNoteHost) — the daemon address
+// is never configured here.
 //
-// Memory: one current frame + one pending (scheduled) frame, 7200 B each,
-// malloc'd only while streaming and freed on lyricsStreamStop(). The .ino
-// frees the on-device music marquee canvases (~17 KB) while a stream owns
-// the panel, so the two render paths never hold heap at the same time.
+// While the MUSIC screen is visible this module keeps a hand-rolled WebSocket to
+// the daemon's board port (:8766). The daemon renders 240x240 1-bpp frames with
+// Core Text (real Thai shaping, karaoke) — full frames and dirty-rect deltas.
+// Set bits are paper, clear bits ink; the full-screen album-art hero frames
+// (track intro / paused) arrive the same way and blit as a correct positive.
+//
+// Memory: exactly one framebuffer (7200 B), malloc'd on the first stream and
+// freed on lyricsStreamStop(). Incoming frame bytes are applied *incrementally*
+// into it as they arrive off the socket (no separate record buffer), so peak
+// heap while streaming is ~7.2 KB. The .ino frees the on-device marquee canvases
+// (~17 KB) while a stream owns the panel, so the two render paths never hold heap
+// at the same time.
+//
+// Pre-scheduled frames (swap_in_ms > 0, kind FULL_SCHED/RECT_SCHED) would need a
+// second "pending" buffer to hold the future frame until its deadline — heap we
+// don't have. We drop them: lyric lines flip on the daemon's next now-frame push
+// (one tick coarser than on-beat) instead of pre-scheduled to the millisecond.
 
 #include <ESP8266WiFi.h>
+#include <esp8266_peri.h>   // RANDOM_REG32 — hardware RNG (valid while RF is on)
 #include "tend.h"
 
 #define LYR_PORT        8766
@@ -30,21 +41,27 @@
 #define LYR_ROW_BYTES   (LYR_W / 8)
 #define LYR_FRAME_BYTES (LYR_ROW_BYTES * LYR_H)
 #define LYR_ENV_HDR     28          // "LYR1" + ver/kind + 7x u16 + 2x u32
+#define LYR_MAX_PAYLOAD (LYR_ENV_HDR + LYR_FRAME_BYTES)   // largest WS frame we accept
 #define LYR_RETRY_MS    8000UL      // reconnect backoff
 #define LYR_CONNECT_TIMEOUT_MS 1200UL  // TCP connect budget (blocking; keep small)
 #define LYR_HANDSHAKE_TIMEOUT_MS 3000UL
+#define LYR_HELLO_TIMEOUT_MS 4000UL  // budget for the hello/ready exchange
 #define LYR_HOST_FRESH_MS (10UL * 60UL * 1000UL)  // dial only a recently-seen Mac
 
-// Envelope kinds (swap_in_ms > 0 is what actually selects the pending buffer,
-// mirroring the ESP32 client; the kinds are validated for shape only).
+// LYR1 envelope kinds. NOW frames are applied; SCHED frames are dropped (no
+// pending buffer on this chip — see file header).
 static const uint8_t LYR_KIND_FULL_NOW = 1;
 static const uint8_t LYR_KIND_FULL_SCHED = 2;
 static const uint8_t LYR_KIND_RECT_NOW = 3;
 static const uint8_t LYR_KIND_RECT_SCHED = 4;
 
-enum LyrState : uint8_t { LYR_OFF = 0, LYR_HANDSHAKE, LYR_OPEN };
-enum LyrPhase : uint8_t { PH_HDR2 = 0, PH_EXT, PH_PAY };
-enum LyrPayMode : uint8_t { PAY_DISCARD = 0, PAY_TEXT, PAY_CTL, PAY_ENV };
+// Connection lifecycle.
+enum LyrState : uint8_t {
+  LYR_OFF = 0,
+  LYR_HANDSHAKE,   // waiting for the HTTP 101
+  LYR_HELLO,       // connected; waiting for the plaintext hello (then send "ready")
+  LYR_OPEN,        // frames flow
+};
 
 static WiFiClient lyrClient;
 static IPAddress lyrHost;
@@ -53,42 +70,46 @@ static unsigned long lyrHostSeenMs = 0;
 static uint8_t lyrState = LYR_OFF;
 static unsigned long lyrNextAttemptMs = 0;
 static unsigned long lyrHandshakeDeadlineMs = 0;
+static unsigned long lyrHelloDeadlineMs = 0;
 
-// Frame buffers: current (what the panel shows) and pending (a scheduled
-// frame waiting for its swap deadline).
+// The one framebuffer: what the panel shows. malloc'd on first stream.
 static uint8_t *lyrFrame = nullptr;
-static uint8_t *lyrPending = nullptr;
 static bool lyrFrameValid = false;    // stream owns the MUSIC panel
-static bool lyrPendingValid = false;
-static unsigned long lyrSwapAtMs = 0;
+
+// Small control-frame buffer (hello / clear / ping). Binary frame bodies are NOT
+// buffered here — they stream straight into lyrFrame.
+static uint8_t lyrCtrl[256];
 
 // Handshake response accumulator (looking for "\r\n\r\n", " 101 " on line 1).
 static char lyrHsBuf[256];
 static uint16_t lyrHsLen = 0;
 
-// WebSocket frame parser.
-static LyrPhase lyrPhase = PH_HDR2;
-static uint8_t lyrHdr[2];
-static uint8_t lyrExtNeed = 0, lyrExtGot = 0;
-static uint8_t lyrExtBuf[8];
-static uint8_t lyrOpcode = 0;
-static uint32_t lyrPayLen = 0, lyrPayOff = 0;
-static LyrPayMode lyrPayMode = PAY_DISCARD;
-static uint8_t lyrTxtBuf[192];
-static uint8_t lyrCtlBuf[125];
-static uint8_t lyrCtlLen = 0;
+// Non-blocking WebSocket frame reader state.
+enum WsPhase : uint8_t { WS_HDR = 0, WS_PAY };
+static uint8_t lyrWsPhase = WS_HDR;
+static uint8_t lyrWsHdr[10];
+static uint8_t lyrWsHdrGot = 0;
+static uint8_t lyrWsHdrNeed = 2;
+static uint8_t lyrWsOpcode = 0;
+static uint32_t lyrWsPayLen = 0;
+static uint32_t lyrWsPayGot = 0;
 
-// Parsed LYR1 envelope of the binary message in flight.
-static uint8_t lyrEnvBuf[LYR_ENV_HDR];
-static uint8_t *lyrEnvTarget = nullptr;
+// Per-binary-frame incremental-apply state (valid while WS_PAY on opcode 2).
+static uint8_t lyrEnvHdr[LYR_ENV_HDR];  // the 28-byte LYR1 header, accumulated first
+static uint8_t lyrEnvHdrGot = 0;
+static bool lyrEnvApply = false;        // this is a NOW frame we should paint
 static bool lyrEnvFull = false;
-static uint16_t lyrEnvX = 0, lyrEnvY = 0, lyrEnvRW = 0, lyrEnvRH = 0, lyrEnvRowB = 0;
-static uint32_t lyrEnvSwapMs = 0;
+static uint16_t lyrEnvX = 0, lyrEnvY = 0, lyrEnvRw = 0, lyrEnvRh = 0, lyrEnvRowB = 0;
+static uint32_t lyrEnvBodyGot = 0;      // body bytes consumed
+static uint32_t lyrEnvRowBase = 0;      // lyrFrame offset of the current row's first byte
+static uint16_t lyrEnvCol = 0;          // byte within the current row
 
 static uint16_t lyrBe16(const uint8_t *p) { return ((uint16_t)p[0] << 8) | p[1]; }
 static uint32_t lyrBe32(const uint8_t *p) {
   return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
 }
+
+// ---- Panel blit -------------------------------------------------------------
 
 // 1-bpp (LSB-first, row-major) -> RGB565 rows on the panel. Set bit = paper,
 // clear = ink (the daemon's light theme). One 240-px line buffer, row by row;
@@ -107,51 +128,74 @@ static void lyrBlit(int x, int y, int w, int h) {
   }
 }
 
-// Client->server frames must be masked (the daemon rejects unmasked ones).
-static bool lyrSendFrame(uint8_t opcode, const uint8_t *payload, uint8_t len) {
-  uint8_t buf[6 + 125];
-  buf[0] = 0x80 | opcode;
-  buf[1] = 0x80 | len;
-  uint32_t mask = micros() ^ (millis() << 16) ^ 0xA5C3;
-  memcpy(buf + 2, &mask, 4);
-  for (uint8_t i = 0; i < len; i++) buf[6 + i] = payload[i] ^ buf[2 + (i & 3)];
-  return lyrClient.write(buf, (size_t)6 + len) == (size_t)6 + len;
+// ---- WebSocket send (client->server frames must be masked) ------------------
+
+static bool lyrSendWs(uint8_t opcode, const uint8_t *payload, uint32_t len) {
+  uint8_t hdr[8];
+  size_t hl = 0;
+  hdr[hl++] = 0x80 | opcode;
+  if (len < 126) {
+    hdr[hl++] = 0x80 | (uint8_t)len;
+  } else if (len <= 0xFFFF) {
+    hdr[hl++] = 0x80 | 126;
+    hdr[hl++] = (uint8_t)(len >> 8);
+    hdr[hl++] = (uint8_t)(len & 0xFF);
+  } else {
+    return false;   // we never send anything this large
+  }
+  uint8_t mask[4];
+  uint32_t r = RANDOM_REG32;
+  memcpy(mask, &r, 4);
+  memcpy(hdr + hl, mask, 4);
+  hl += 4;
+  if (lyrClient.write(hdr, hl) != hl) return false;
+
+  uint8_t scratch[128];
+  uint32_t off = 0;
+  while (off < len) {
+    const uint32_t chunk = (len - off) < sizeof(scratch) ? (len - off) : sizeof(scratch);
+    for (uint32_t i = 0; i < chunk; i++) scratch[i] = payload[off + i] ^ mask[(off + i) & 3];
+    if (lyrClient.write(scratch, chunk) != chunk) return false;
+    off += chunk;
+  }
+  return true;
 }
 
-static bool lyrSendReady() {
-  static const uint8_t ready[] = { 'r', 'e', 'a', 'd', 'y' };
-  return lyrSendFrame(1, ready, sizeof(ready));
+// ---- Buffers + teardown -----------------------------------------------------
+
+static void lyrResetWs(void) {
+  lyrWsPhase = WS_HDR;
+  lyrWsHdrGot = 0;
+  lyrWsHdrNeed = 2;
+  lyrWsPayGot = 0;
+  lyrEnvHdrGot = 0;
 }
 
-static void lyrResetParser() {
-  lyrPhase = PH_HDR2;
-  lyrExtNeed = lyrExtGot = 0;
-  lyrPayLen = lyrPayOff = 0;
-  lyrPayMode = PAY_DISCARD;
-  lyrCtlLen = 0;
-}
-
-// Drop the connection and everything the stream painted; the MUSIC screen's
-// tick sees lyricsStreamActive() go false and repaints the on-device fallback.
+// Drop the connection and everything the stream painted; the MUSIC screen's tick
+// sees lyricsStreamActive() go false and repaints the on-device fallback.
 static void lyrDrop(unsigned long retryDelayMs) {
   lyrClient.stop();
   lyrState = LYR_OFF;
   lyrFrameValid = false;
-  lyrPendingValid = false;
-  lyrResetParser();
+  lyrResetWs();
   lyrNextAttemptMs = millis() + retryDelayMs;
 }
 
 void lyricsStreamStop(void) {
   lyrDrop(0);
   free(lyrFrame);
-  free(lyrPending);
   lyrFrame = nullptr;
-  lyrPending = nullptr;
 }
 
 bool lyricsStreamActive(void) {
   return lyrState == LYR_OPEN && lyrFrameValid;
+}
+
+// True while a Mac IP is known (learned from a /nowplaying or /usage push) but
+// the stream hasn't reached LYR_OPEN — the "reaching out to the daemon" window
+// the MUSIC screen shows before rendered frames take over the panel.
+bool lyricsStreamConnecting(void) {
+  return lyrHostKnown && lyrState != LYR_OPEN;
 }
 
 void lyricsStreamNoteHost(const IPAddress &host) {
@@ -164,209 +208,195 @@ void lyricsStreamNoteHost(const IPAddress &host) {
   lyrHostSeenMs = millis();
 }
 
-// Ensure a frame buffer exists; nullptr on OOM (the message is then discarded
-// and the on-device renderer keeps the screen).
-static uint8_t *lyrEnsure(uint8_t **buf, bool zero) {
-  if (*buf == nullptr) {
-    *buf = (uint8_t *)malloc(LYR_FRAME_BYTES);
-    if (*buf != nullptr && zero) memset(*buf, 0, LYR_FRAME_BYTES);
-  } else if (zero) {
-    memset(*buf, 0, LYR_FRAME_BYTES);
-  }
-  return *buf;
-}
+// ---- Incremental LYR1 envelope application ----------------------------------
 
-// Parse the 28-byte LYR1 header once buffered; picks the target buffer and
-// payload mode for the rest of the message.
-static void lyrParseEnvelope() {
-  lyrPayMode = PAY_DISCARD;
-  if (memcmp(lyrEnvBuf, "LYR1", 4) != 0 || lyrEnvBuf[4] != 1) return;
-  const uint8_t kind = lyrEnvBuf[5];
-  const uint16_t width = lyrBe16(lyrEnvBuf + 6);
-  const uint16_t height = lyrBe16(lyrEnvBuf + 8);
-  lyrEnvX = lyrBe16(lyrEnvBuf + 10);
-  lyrEnvY = lyrBe16(lyrEnvBuf + 12);
-  lyrEnvRW = lyrBe16(lyrEnvBuf + 14);
-  lyrEnvRH = lyrBe16(lyrEnvBuf + 16);
-  lyrEnvRowB = lyrBe16(lyrEnvBuf + 18);
-  lyrEnvSwapMs = lyrBe32(lyrEnvBuf + 20);
-  const uint32_t dataLen = lyrBe32(lyrEnvBuf + 24);
+// The 28-byte header of a binary frame is complete in lyrEnvHdr. Parse it, decide
+// whether we paint it (a NOW frame) or discard it (SCHED, or malformed), and set
+// up the per-byte apply cursor. Body bytes then stream in via lyrEnvBody().
+static void lyrEnvBeginBody(void) {
+  lyrEnvApply = false;
+  lyrEnvBodyGot = 0;
+  lyrEnvCol = 0;
+
+  const uint8_t *d = lyrEnvHdr;
+  if (memcmp(d, "LYR1", 4) != 0 || d[4] != 1) return;   // discard body
+  const uint8_t kind = d[5];
+  const uint16_t width = lyrBe16(d + 6);
+  const uint16_t height = lyrBe16(d + 8);
+  const uint16_t x = lyrBe16(d + 10);
+  const uint16_t y = lyrBe16(d + 12);
+  const uint16_t rw = lyrBe16(d + 14);
+  const uint16_t rh = lyrBe16(d + 16);
+  const uint16_t rowB = lyrBe16(d + 18);
+  const uint32_t dataLen = lyrBe32(d + 24);
 
   if (width != LYR_W || height != LYR_H) return;
-  if (dataLen != lyrPayLen - LYR_ENV_HDR) return;
+  if (dataLen != lyrWsPayLen - LYR_ENV_HDR) return;
 
+  bool full;
   if (kind == LYR_KIND_FULL_NOW || kind == LYR_KIND_FULL_SCHED) {
-    if (lyrEnvX != 0 || lyrEnvY != 0 || lyrEnvRW != LYR_W || lyrEnvRH != LYR_H ||
-        lyrEnvRowB != LYR_ROW_BYTES || dataLen != LYR_FRAME_BYTES) {
+    if (x != 0 || y != 0 || rw != LYR_W || rh != LYR_H ||
+        rowB != LYR_ROW_BYTES || dataLen != LYR_FRAME_BYTES) {
       return;
     }
-    lyrEnvFull = true;
+    full = true;
   } else if (kind == LYR_KIND_RECT_NOW || kind == LYR_KIND_RECT_SCHED) {
-    if ((lyrEnvX & 7) != 0 || lyrEnvRW == 0 || lyrEnvRH == 0 || lyrEnvRowB == 0 ||
-        lyrEnvX + lyrEnvRW > LYR_W || lyrEnvY + lyrEnvRH > LYR_H ||
-        dataLen != (uint32_t)lyrEnvRowB * lyrEnvRH) {
+    if ((x & 7) != 0 || rw == 0 || rh == 0 || rowB == 0 ||
+        x + rw > LYR_W || y + rh > LYR_H || dataLen != (uint32_t)rowB * rh) {
       return;
     }
-    lyrEnvFull = false;
+    full = false;
   } else {
     return;
   }
 
-  if (lyrEnvSwapMs > 0) {
-    // Scheduled frame -> pending buffer. A scheduled rect patches a copy of
-    // the current frame (same seeding as the ESP32 client).
-    if (lyrEnsure(&lyrPending, false) == nullptr) return;
-    if (!lyrEnvFull && !lyrPendingValid) {
-      if (lyrFrame != nullptr && lyrFrameValid) memcpy(lyrPending, lyrFrame, LYR_FRAME_BYTES);
-      else memset(lyrPending, 0, LYR_FRAME_BYTES);
-    }
-    lyrEnvTarget = lyrPending;
-  } else {
-    // Now-frame -> current buffer (zero-seeded for a rect with no base yet).
-    if (lyrEnsure(&lyrFrame, !lyrEnvFull && !lyrFrameValid) == nullptr) return;
-    lyrEnvTarget = lyrFrame;
-  }
-  lyrPayMode = PAY_ENV;
-}
+  // Scheduled frames need a pending buffer we don't have — drop (discard body).
+  if (kind == LYR_KIND_FULL_SCHED || kind == LYR_KIND_RECT_SCHED) return;
 
-// A complete, valid envelope arrived: commit it (swap bookkeeping + blit).
-static void lyrApplyEnvelope() {
-  if (lyrEnvSwapMs > 0) {
-    lyrPendingValid = true;
-    lyrSwapAtMs = millis() + lyrEnvSwapMs;
-    return;
-  }
-  lyrFrameValid = true;
-  lyrPendingValid = false;   // a now-frame supersedes any queued swap
-  if (lyrEnvFull) lyrBlit(0, 0, LYR_W, LYR_H);
-  else lyrBlit(lyrEnvX, lyrEnvY, lyrEnvRW, lyrEnvRH);
-}
-
-static void lyrHandleText() {
-  lyrTxtBuf[lyrPayLen < sizeof(lyrTxtBuf) ? lyrPayLen : sizeof(lyrTxtBuf) - 1] = '\0';
-  const char *text = (const char *)lyrTxtBuf;
-  if (strstr(text, "\"type\":\"hello\"") != nullptr) {
-    lyrSendReady();
-  } else if (strstr(text, "\"type\":\"clear\"") != nullptr) {
-    // No track: hand the panel back to the on-device renderer.
+  // A now-rect must patch an existing frame; if we have none yet, zero-seed it so
+  // the untouched region is ink, not garbage.
+  if (lyrFrame == nullptr) {
+    lyrFrame = (uint8_t *)malloc(LYR_FRAME_BYTES);
+    if (lyrFrame == nullptr) return;   // no heap -> discard; blit stays on fallback
     lyrFrameValid = false;
-    lyrPendingValid = false;
+  }
+  if (!full && !lyrFrameValid) memset(lyrFrame, 0, LYR_FRAME_BYTES);
+
+  lyrEnvApply = true;
+  lyrEnvFull = full;
+  lyrEnvX = x;
+  lyrEnvY = y;
+  lyrEnvRw = rw;
+  lyrEnvRh = rh;
+  lyrEnvRowB = rowB;
+  lyrEnvRowBase = full ? 0 : ((uint32_t)y * LYR_ROW_BYTES + (x >> 3));
+}
+
+// Apply one streamed body byte at its position in lyrFrame (now frames only).
+static inline void lyrEnvBody(uint8_t b) {
+  if (lyrEnvApply) {
+    if (lyrEnvFull) {
+      lyrFrame[lyrEnvBodyGot] = b;
+    } else {
+      lyrFrame[lyrEnvRowBase + lyrEnvCol] = b;
+      if (++lyrEnvCol >= lyrEnvRowB) { lyrEnvCol = 0; lyrEnvRowBase += LYR_ROW_BYTES; }
+    }
+  }
+  lyrEnvBodyGot++;
+}
+
+// The whole binary frame arrived: paint it if it was a NOW frame we applied.
+static void lyrEnvComplete(void) {
+  if (!lyrEnvApply) return;
+  lyrFrameValid = true;
+  if (lyrEnvFull) lyrBlit(0, 0, LYR_W, LYR_H);
+  else lyrBlit(lyrEnvX, lyrEnvY, lyrEnvRw, lyrEnvRh);
+}
+
+// ---- Control frames (text / ping) -------------------------------------------
+
+static void lyrHandleText(const uint8_t *payload, uint32_t len) {
+  char text[128];
+  const uint32_t n = len < sizeof(text) - 1 ? len : sizeof(text) - 1;
+  memcpy(text, payload, n);
+  text[n] = '\0';
+  if (lyrState == LYR_HELLO && strstr(text, "\"type\":\"hello\"") != nullptr) {
+    static const uint8_t ready[] = "ready";
+    if (lyrSendWs(1, ready, sizeof(ready) - 1)) lyrState = LYR_OPEN;
+    else lyrDrop(LYR_RETRY_MS);
+  } else if (strstr(text, "\"type\":\"clear\"") != nullptr) {
+    // No track: drop our frame so the MUSIC screen repaints its placeholder.
+    lyrFrameValid = false;
   }
 }
 
-static void lyrDispatchMessage() {
-  switch (lyrOpcode) {
-    case 1: lyrHandleText(); break;
-    case 2: if (lyrPayMode == PAY_ENV) lyrApplyEnvelope(); break;
-    case 8: lyrDrop(LYR_RETRY_MS); break;
-    case 9: lyrSendFrame(10, lyrCtlBuf, lyrCtlLen); break;   // ping -> pong
-    default: break;                                          // pong/other: ignore
-  }
+// ---- Non-blocking WebSocket pump --------------------------------------------
+
+// Called when a full control-frame payload (buffered in lyrCtrl) has arrived.
+static void lyrDispatchControl(void) {
+  if (lyrWsOpcode == 8) { lyrDrop(LYR_RETRY_MS); return; }                 // close
+  if (lyrWsOpcode == 9) { lyrSendWs(10, lyrCtrl, lyrWsPayGot); return; }   // ping -> pong
+  if (lyrWsOpcode == 10) return;                                          // pong: ignore
+  if (lyrWsOpcode == 1) lyrHandleText(lyrCtrl, lyrWsPayGot);              // text
 }
 
-// Feed one payload byte to the current message's consumer.
-static inline void lyrPayloadByte(uint8_t b) {
-  switch (lyrPayMode) {
-    case PAY_TEXT:
-      if (lyrPayOff < sizeof(lyrTxtBuf) - 1) lyrTxtBuf[lyrPayOff] = b;
-      break;
-    case PAY_CTL:
-      if (lyrCtlLen < sizeof(lyrCtlBuf)) lyrCtlBuf[lyrCtlLen++] = b;
-      break;
-    case PAY_ENV:
-      if (lyrEnvFull) {
-        lyrEnvTarget[lyrPayOff - LYR_ENV_HDR] = b;
-      } else {
-        const uint32_t idx = lyrPayOff - LYR_ENV_HDR;
-        const uint32_t row = idx / lyrEnvRowB;
-        const uint32_t col = idx - row * lyrEnvRowB;
-        lyrEnvTarget[(lyrEnvY + row) * LYR_ROW_BYTES + (lyrEnvX >> 3) + col] = b;
-      }
-      break;
-    default:
-      break;
-  }
-}
-
-// Pump every buffered byte through the frame parser. Byte-wise on purpose:
-// simple, and even a full 7.2 KB frame costs only a few ms.
-static void lyrPump() {
+static void lyrPump(void) {
   while (lyrClient.available() > 0) {
     int c = lyrClient.read();
     if (c < 0) break;
-    uint8_t b = (uint8_t)c;
+    const uint8_t b = (uint8_t)c;
 
-    switch (lyrPhase) {
-      case PH_HDR2:
-        lyrHdr[lyrExtGot++] = b;
-        if (lyrExtGot < 2) break;
-        lyrExtGot = 0;
+    if (lyrWsPhase == WS_HDR) {
+      lyrWsHdr[lyrWsHdrGot++] = b;
+      if (lyrWsHdrGot == 2) {
         // Server frames must be FIN + unmasked (the daemon never fragments).
-        if ((lyrHdr[0] & 0x80) == 0 || (lyrHdr[1] & 0x80) != 0) { lyrDrop(LYR_RETRY_MS); return; }
-        lyrOpcode = lyrHdr[0] & 0x0F;
-        lyrPayLen = lyrHdr[1] & 0x7F;
-        lyrPayOff = 0;
-        if (lyrPayLen == 126) { lyrExtNeed = 2; lyrPhase = PH_EXT; break; }
-        if (lyrPayLen == 127) { lyrExtNeed = 8; lyrPhase = PH_EXT; break; }
-        goto payload_start;
+        if ((lyrWsHdr[0] & 0x80) == 0 || (lyrWsHdr[1] & 0x80) != 0) { lyrDrop(LYR_RETRY_MS); return; }
+        const uint8_t len7 = lyrWsHdr[1] & 0x7F;
+        if (len7 == 126) lyrWsHdrNeed = 4;
+        else if (len7 == 127) lyrWsHdrNeed = 10;
+        else lyrWsHdrNeed = 2;
+      }
+      if (lyrWsHdrGot < lyrWsHdrNeed) continue;
 
-      case PH_EXT:
-        lyrExtBuf[lyrExtGot++] = b;
-        if (lyrExtGot < lyrExtNeed) break;
-        if (lyrExtNeed == 2) {
-          lyrPayLen = ((uint32_t)lyrExtBuf[0] << 8) | lyrExtBuf[1];
-        } else {
-          // 64-bit length: anything past 32 bits (or 16, really) is bogus here.
-          for (int i = 0; i < 4; i++) {
-            if (lyrExtBuf[i] != 0) { lyrDrop(LYR_RETRY_MS); return; }
-          }
-          lyrPayLen = lyrBe32(lyrExtBuf + 4);
-        }
-        lyrExtGot = 0;
-        goto payload_start;
+      lyrWsOpcode = lyrWsHdr[0] & 0x0F;
+      const uint8_t len7 = lyrWsHdr[1] & 0x7F;
+      if (len7 == 126) {
+        lyrWsPayLen = lyrBe16(lyrWsHdr + 2);
+      } else if (len7 == 127) {
+        // 64-bit length: anything past 32 bits is bogus for our frames.
+        for (int i = 0; i < 4; i++) if (lyrWsHdr[2 + i] != 0) { lyrDrop(LYR_RETRY_MS); return; }
+        lyrWsPayLen = lyrBe32(lyrWsHdr + 6);
+      } else {
+        lyrWsPayLen = len7;
+      }
+      if (lyrWsPayLen > LYR_MAX_PAYLOAD) { lyrDrop(LYR_RETRY_MS); return; }
+      // A control opcode (text/ping/close/pong) must fit the small buffer.
+      if (lyrWsOpcode != 2 && lyrWsPayLen > sizeof(lyrCtrl)) { lyrDrop(LYR_RETRY_MS); return; }
+      // A binary frame must at least carry a full envelope header.
+      if (lyrWsOpcode == 2 && lyrWsPayLen < LYR_ENV_HDR) { lyrDrop(LYR_RETRY_MS); return; }
+      lyrWsPayGot = 0;
+      lyrEnvHdrGot = 0;
+      lyrWsPhase = WS_PAY;
+      if (lyrWsPayLen == 0) {   // zero-length control frame (e.g. empty ping)
+        lyrDispatchControl();
+        if (lyrState == LYR_OFF) return;
+        lyrResetWs();
+      }
+      continue;
+    }
 
-      payload_start:
-        lyrCtlLen = 0;
-        if (lyrOpcode == 8 || lyrOpcode == 9 || lyrOpcode == 10) {
-          if (lyrPayLen > 125) { lyrDrop(LYR_RETRY_MS); return; }
-          lyrPayMode = PAY_CTL;
-        } else if (lyrOpcode == 1) {
-          lyrPayMode = lyrPayLen < sizeof(lyrTxtBuf) ? PAY_TEXT : PAY_DISCARD;
-        } else if (lyrOpcode == 2) {
-          // The LYR1 header is buffered by the PH_PAY special case below;
-          // lyrParseEnvelope flips the mode to PAY_ENV once it checks out.
-          lyrPayMode = PAY_DISCARD;
-          lyrEnvTarget = nullptr;
-        } else {
-          lyrPayMode = PAY_DISCARD;
-        }
-        if (lyrPayLen == 0) { lyrDispatchMessage(); lyrResetParser(); break; }
-        lyrPhase = PH_PAY;
-        break;
-
-      case PH_PAY:
-        if (lyrOpcode == 2 && lyrPayOff < LYR_ENV_HDR) {
-          // Buffer the LYR1 header; parse it when complete.
-          if (lyrPayLen >= LYR_ENV_HDR && lyrPayLen <= LYR_ENV_HDR + LYR_FRAME_BYTES) {
-            lyrEnvBuf[lyrPayOff] = b;
-            if (lyrPayOff == LYR_ENV_HDR - 1) lyrParseEnvelope();
-          }
-        } else {
-          lyrPayloadByte(b);
-        }
-        lyrPayOff++;
-        if (lyrPayOff >= lyrPayLen) {
-          lyrDispatchMessage();
-          if (lyrState == LYR_OFF) return;   // dispatch may have dropped us
-          lyrResetParser();
-        }
-        break;
+    // WS_PAY.
+    if (lyrWsOpcode == 2) {
+      // Binary LYR1 frame: header first (into lyrEnvHdr), then body straight into
+      // the framebuffer.
+      if (lyrEnvHdrGot < LYR_ENV_HDR) {
+        lyrEnvHdr[lyrEnvHdrGot++] = b;
+        if (lyrEnvHdrGot == LYR_ENV_HDR) lyrEnvBeginBody();
+      } else {
+        lyrEnvBody(b);
+      }
+      lyrWsPayGot++;
+      if (lyrWsPayGot >= lyrWsPayLen) {
+        lyrEnvComplete();
+        if (lyrState == LYR_OFF) return;
+        lyrResetWs();
+      }
+    } else {
+      // Control frame: accumulate into the small buffer, then dispatch.
+      if (lyrWsPayGot < sizeof(lyrCtrl)) lyrCtrl[lyrWsPayGot] = b;
+      lyrWsPayGot++;
+      if (lyrWsPayGot >= lyrWsPayLen) {
+        lyrDispatchControl();
+        if (lyrState == LYR_OFF) return;
+        lyrResetWs();
+      }
     }
   }
 }
 
-// Read the HTTP 101 handshake response without blocking.
-static void lyrPumpHandshake() {
+// ---- HTTP 101 handshake -----------------------------------------------------
+
+static void lyrPumpHandshake(void) {
   while (lyrClient.available() > 0) {
     int c = lyrClient.read();
     if (c < 0) break;
@@ -374,8 +404,9 @@ static void lyrPumpHandshake() {
     lyrHsBuf[lyrHsLen] = '\0';
     if (lyrHsLen >= 4 && memcmp(lyrHsBuf + lyrHsLen - 4, "\r\n\r\n", 4) == 0) {
       if (strstr(lyrHsBuf, " 101 ") != nullptr) {
-        lyrState = LYR_OPEN;
-        lyrResetParser();
+        lyrResetWs();
+        lyrState = LYR_HELLO;
+        lyrHelloDeadlineMs = millis() + LYR_HELLO_TIMEOUT_MS;
       } else {
         lyrDrop(LYR_RETRY_MS);
       }
@@ -385,7 +416,7 @@ static void lyrPumpHandshake() {
   }
 }
 
-static void lyrTryConnect() {
+static void lyrTryConnect(void) {
   unsigned long now = millis();
   if (!lyrHostKnown || now - lyrHostSeenMs > LYR_HOST_FRESH_MS) return;
   if ((long)(now - lyrNextAttemptMs) < 0) return;
@@ -398,9 +429,9 @@ static void lyrTryConnect() {
   }
   lyrClient.setNoDelay(true);
 
-  char request[224];
+  char request[256];
   snprintf(request, sizeof(request),
-           "GET /board?w=%d&h=%d HTTP/1.1\r\n"
+           "GET /board?proto=1&w=%d&h=%d HTTP/1.1\r\n"
            "Host: %s:%d\r\n"
            "Upgrade: websocket\r\n"
            "Connection: Upgrade\r\n"
@@ -435,20 +466,14 @@ void lyricsStreamTick(void) {
     if (lyrState == LYR_HANDSHAKE && (long)(millis() - lyrHandshakeDeadlineMs) >= 0) {
       lyrDrop(LYR_RETRY_MS);
     }
-    if (lyrState != LYR_OPEN) return;
+    if (lyrState == LYR_OFF || lyrState == LYR_HANDSHAKE) return;
   }
 
   lyrPump();
+  if (lyrState == LYR_OFF) return;
 
-  // Promote a scheduled frame when its deadline passes (this is how lyric
-  // lines flip on-beat between daemon pushes).
-  if (lyrState == LYR_OPEN && lyrPendingValid && lyrPending != nullptr &&
-      (long)(millis() - lyrSwapAtMs) >= 0) {
-    if (lyrEnsure(&lyrFrame, false) != nullptr) {
-      memcpy(lyrFrame, lyrPending, LYR_FRAME_BYTES);
-      lyrFrameValid = true;
-      lyrBlit(0, 0, LYR_W, LYR_H);
-    }
-    lyrPendingValid = false;
+  // The hello/ready exchange must complete promptly, or drop and retry.
+  if (lyrState == LYR_HELLO && (long)(millis() - lyrHelloDeadlineMs) >= 0) {
+    lyrDrop(LYR_RETRY_MS);
   }
 }

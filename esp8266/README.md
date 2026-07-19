@@ -35,7 +35,7 @@ gestures became dashboard controls):
 | Screen | What it shows / does |
 |---|---|
 | `clock` | Time from the daemon push (no RTC/NTP needed once pushed) |
-| `music` | Now-playing title/artist, progress, synced lyrics. When the Mac's `lyrics_display_daemon.py` is running, the screen upgrades itself to a streamed 240×240 frame from the Mac (Core Text Thai shaping + syllable karaoke, same pipeline as the ESP32); otherwise it renders on-device (Thai+Latin fonts) |
+| `music` | Streamed lyrics screen, rendered **only** by the Mac's `lyrics_display_daemon.py`: a 240×240 frame stream (Core Text Thai shaping + syllable karaoke, same pipeline as the ESP32). When no frame is flowing (daemon off, Mac asleep, no track) it shows a simple paper placeholder — there is no on-device now-playing renderer |
 | `pomodoro` | Focus timer — start/pause/reset from the dashboard |
 | `water` | Hydration reminders — log drinks, snooze, configurable window |
 | `stats` | Claude usage + Mac metrics trend |
@@ -123,16 +123,31 @@ python3 daemon/claudemeter_daemon.py
   `local` to scan Claude Code's local JSONL transcripts instead (set
   `CLAWDMETER_SESSION_TOKEN_LIMIT` / `CLAWDMETER_WEEKLY_TOKEN_LIMIT` to taste).
 - Now-playing/lyrics pushes to `/nowplaying` work with no extra configuration.
-- **Streamed lyrics (optional):** if the lyrics daemon
-  (`daemon/lyrics_display_daemon.py` + the browser extension) is running on
-  the same Mac, the MUSIC screen automatically upgrades from on-device text
-  to Mac-rendered 240×240 frames — real Thai shaping and syllable-karaoke
-  highlighting over WebSocket (`:8766/board?w=240&h=240`). Zero configuration:
-  the device learns the Mac's IP from the `/usage`//`/nowplaying` pushes and
-  dials back. If the stream drops (Mac asleep, daemon stopped), the screen
-  falls back to the on-device renderer within seconds. Note the ESP8266
-  client does not send a board token, so leave `G4PYS_LYRICS_BOARD_TOKEN`
-  unset (its default).
+- **Streamed lyrics (required for the MUSIC screen):** the MUSIC screen is
+  rendered entirely by the lyrics daemon (`daemon/lyrics_display_daemon.py` +
+  the browser extension) running on the same Mac — Mac-rendered 240×240 frames
+  with real Thai shaping and syllable-karaoke highlighting over WebSocket
+  (`:8766/board?w=240&h=240`). The device learns the Mac's IP from the
+  `/usage`//`/nowplaying` pushes and dials back. There is no on-device
+  now-playing renderer: if the stream drops (Mac asleep, daemon stopped) the
+  screen shows a paper placeholder and reconnects on its own within seconds.
+
+  **Run the lyrics daemon with `--insecure` (required for this board).** By
+  default the daemon creates an identity and requires a mutual HMAC-SHA256
+  handshake (secure proto=2) — the scheme the ESP32 board uses. The ESP8266
+  lacks the heap to buffer-and-verify a whole SEC2 record on top of its
+  framebuffer, so it speaks the unauthenticated proto=1 instead. Start the
+  lyrics daemon with `--insecure` and it drops the identity, advertises
+  `proto=1`, and streams unwrapped frames the board can render:
+
+  ```sh
+  python3 daemon/lyrics_display_daemon.py serve --insecure
+  ```
+
+  (Or set `G4PYS_LYRICS_INSECURE=1`.) There is no pairing step and no token —
+  the trade is LAN-link authentication for ~7 KB of heap, so run it on a
+  trusted home network. Without `--insecure` the board can't complete the
+  handshake and the MUSIC screen just stays on the placeholder.
 - The daemon also resolves the daily xkcd/APOD metadata and pushes it to
   `/daily` every 6 h (the ESP8266 can't afford the TLS heap to call those
   HTTPS APIs itself). It turns on automatically with usage pushing; set
@@ -148,7 +163,47 @@ launchctl unload ~/Library/LaunchAgents/company.g4pys.claudemeter-daemon.plist
 launchctl load  ~/Library/LaunchAgents/company.g4pys.claudemeter-daemon.plist
 ```
 
-### 5. Updating later (OTA, no USB)
+### 5. Connect the lyrics stream (end-to-end)
+
+The MUSIC screen is rendered only by the Mac-rendered stream (real Thai shaping +
+syllable karaoke); until it connects it shows a placeholder. To light it up,
+connect these pieces — the board is **not** told the Mac's address; it learns it
+from the `/usage`//`/nowplaying` pushes and then dials back to the lyrics
+WebSocket on `:8766`, so both daemons must run:
+
+1. **Run the usage/now-playing daemon** (this is what teaches the board the Mac's
+   IP — step 4 above):
+   ```sh
+   CLAWDMETER_DEVICE_URL=http://clawdmeter.local CLAWDMETER_USAGE_SOURCE=api \
+     python3 daemon/claudemeter_daemon.py
+   ```
+2. **Run the lyrics daemon with `--insecure`** (serves the unauthenticated
+   240×240 proto=1 frame stream on `:8766` — see step 4 for why this board needs
+   `--insecure`):
+   ```sh
+   python3 daemon/lyrics_display_daemon.py serve --insecure
+   ```
+3. **Load the browser extension** (`browser_extension/` → `chrome://extensions`
+   → Developer mode → Load unpacked) and play a track in **YouTube Music**. It
+   feeds title/artist/position to the lyrics daemon.
+4. **Switch the LCD to MUSIC** from the dashboard's screen row.
+
+Within a few seconds the screen switches from the placeholder to the stream.
+There's no pairing or status endpoint on this board — the one thing you observe
+is the MUSIC screen itself. **If it stays on the placeholder** instead of the
+crisp Mac-rendered frames, work down this list:
+
+| Check | Fix |
+|---|---|
+| Lyrics daemon started **without** `--insecure`? | It's demanding a proto=2 handshake this board can't do → restart it with `--insecure`. |
+| Usage daemon (step 1) not running / can't reach the board? | The board never learned the Mac's IP → start it and confirm the dashboard shows live usage. |
+| Lyrics daemon (step 2) not running, or `:8766` blocked? | Start it; make sure a firewall isn't blocking `:8766` between Mac and board. |
+
+If the stream drops (Mac asleep, daemon stopped), the screen returns to the
+paper placeholder within seconds and reconnects on its own when the daemon
+returns.
+
+### 6. Updating later (OTA, no USB)
 
 The firmware serves an update page at `http://clawdmeter.local/update`.
 Export a compiled `.bin` (Arduino IDE: **Sketch → Export Compiled Binary**, or
@@ -171,11 +226,9 @@ esp8266/
 │   ├── pet_screen.cpp, sand_screen.cpp, swarm_screen.cpp, daily_screen.cpp
 │   ├── lyrics_stream.cpp        # MUSIC frame stream: WS client for the lyrics daemon
 │   ├── tjpgd.c/.h, tjpgdcnf.h   # vendored TJpgDec (streams comic/APOD JPEGs)
-│   ├── index_html_gz.h          # generated — gzipped dashboard served at /
-│   └── thai_font.h              # generated — Thai/Latin GFX fonts for the MUSIC screen
+│   └── index_html_gz.h          # generated — gzipped dashboard served at /
 └── tools/
-    ├── gen_index_gz.py          # regenerate index_html_gz.h after editing INDEX_HTML
-    └── gen_thai_font.sh         # regenerate thai_font.h (needs Adafruit fontconvert)
+    └── gen_index_gz.py          # regenerate index_html_gz.h after editing INDEX_HTML
 ```
 
 ## Device HTTP API
@@ -200,12 +253,12 @@ esp8266/
 | `/restart`, `/factory-reset` | GET/POST | Maintenance |
 | `/update` | GET/POST | OTA firmware upload |
 
-## Editing the dashboard or fonts
+## Editing the dashboard
 
 - The dashboard HTML lives in the `INDEX_HTML` raw string inside the sketch.
   After editing it run `python3 esp8266/tools/gen_index_gz.py` to refresh
   `index_html_gz.h` (the sketch serves the gzipped copy; a 15 KB uncompressed
   send truncates on lossy WiFi, and the generator enforces a 5 KB gzip cap).
-- Thai fonts for the MUSIC screen are generated by
-  `esp8266/tools/gen_thai_font.sh` (needs Adafruit fontconvert; see the script
-  header).
+- MUSIC-screen text (title/artist/lyrics, including Thai) is rendered on the Mac
+  by `lyrics_display_daemon.py`, not on-device — there are no bundled fonts to
+  regenerate here anymore.

@@ -437,6 +437,26 @@ class AppStateTests(unittest.TestCase):
 
 
 class ExtensionPlaybackTests(unittest.TestCase):
+    def test_now_playing_applies_position_before_intro_decision(self) -> None:
+        async def run() -> tuple[float, bool]:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                store = LyricsStore(Path(tmpdir) / "lyrics.sqlite3")
+                track = TrackInfo(video_id="video-1")
+                store.save_lrclib(track, Lyrics(resolved=True))
+                daemon = LyricsDisplayDaemon(store, FallbackFrameRenderer())
+
+                await daemon.handle_extension_message(
+                    '{"type":"now-playing","payload":'
+                    '{"videoId":"video-1","title":"Song","artist":"Artist",'
+                    '"durationSec":180,"positionSec":42,"paused":false,"playbackRate":1}}'
+                )
+                return daemon.state.clock.position_sec, daemon.state.in_album_art_intro()
+
+        position_sec, in_intro = asyncio.run(run())
+
+        self.assertEqual(position_sec, 42)
+        self.assertFalse(in_intro)
+
     def test_autoplay_tick_normalizes_cumulative_video_timeline_after_ended(self) -> None:
         async def run() -> tuple[float, float]:
             with tempfile.TemporaryDirectory() as tmpdir:
@@ -621,8 +641,8 @@ class DirtyRectTests(unittest.TestCase):
         self.assertEqual(rect.payload, b"\x80")
 
 
-class PausedHeroArtTests(unittest.TestCase):
-    """Full-screen album art shown while paused (fit + PAUSED chip)."""
+class HeroArtTests(unittest.TestCase):
+    """Full-screen album art shown at track start and while paused."""
 
     WIDE = lyrics_display_daemon.WIDE_PROFILE
     SQUARE = lyrics_display_daemon.SQUARE_PROFILE
@@ -677,6 +697,32 @@ class PausedHeroArtTests(unittest.TestCase):
         self.assertEqual(self._get(frame, 19, 5, self.WIDE), 0)  # masked -> value 0
         self.assertEqual(self._get(frame, 20, 5, self.WIDE), 1)  # unmasked -> art kept
         self.assertEqual(self._get(frame, 23, 5, self.WIDE), 1)  # unmasked -> art kept
+
+    def test_playing_track_uses_clean_hero_art_only_during_first_five_seconds(self) -> None:
+        class _Stub:
+            theme = "light"
+            renderer = FallbackFrameRenderer()
+            _render_hero_art = LyricsDisplayDaemon._render_hero_art
+
+        cover = lyrics_display_daemon.CoverArt(
+            size=300, bits=bytes([1]) * (300 * 300)
+        )
+        state = AppState(
+            track=TrackInfo(title="Song", duration_sec=100),
+            hero_cover=cover,
+        )
+        state.clock.update(position_sec=4.9, paused=False, playback_rate=1)
+        intro = LyricsDisplayDaemon._render(_Stub(), state, self.WIDE)
+        self.assertEqual(
+            intro,
+            lyrics_display_daemon.blit_cover_centered(
+                bytes(self.WIDE.frame_bytes), cover, self.WIDE
+            ),
+        )
+
+        state.clock.update(position_sec=5.0, paused=False, playback_rate=1)
+        lyrics = LyricsDisplayDaemon._render(_Stub(), state, self.WIDE)
+        self.assertNotEqual(lyrics, intro)
 
     def test_paused_without_hero_cover_uses_normal_layout(self) -> None:
         # No art (instrumental/fetch-fail/headless): paused must fall back, not blank.
@@ -906,8 +952,78 @@ class WebSocketConnectionTests(unittest.TestCase):
         self.assertFalse(wrong_token)
         self.assertFalse(wrong_path)
 
+    def test_insecure_board_connects_over_plaintext_proto1(self) -> None:
+        """--insecure (no identity) is what the ESP8266 needs: the board GETs
+        /board?proto=1 and the daemon must answer 101 -> a *plaintext* proto=1
+        hello -> accept a plaintext "ready", with frames left unwrapped (no SEC2).
+        This is the exact wire lyrics_stream.cpp speaks; the secure proto=2 path
+        (identity set) is covered by test_mutual_authentication_derives_secure_session.
+        Guards the two halves -- daemon emit and firmware consume -- against drift."""
+        async def run() -> tuple[bytes, list[tuple[int, bytes]]]:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                daemon = LyricsDisplayDaemon(
+                    LyricsStore(Path(tmpdir) / "lyrics.sqlite3"), FallbackFrameRenderer()
+                )  # no identity -> insecure proto=1, same as `serve --insecure`
+                self.assertIsNone(daemon.identity)
+                reader = asyncio.StreamReader()
+                writer = FakeWriter()
+                reader.feed_data(
+                    b"GET /board?proto=1&w=240&h=240 HTTP/1.1\r\n"
+                    b"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+                    + masked_client_frame(1, b"ready")
+                )
+                reader.feed_eof()
+                await daemon.handle_board(reader, writer)
+                # writes[0] is the HTTP 101 upgrade; the rest are WebSocket frames.
+                return writer.writes[0], server_frame_payloads(b"".join(writer.writes[1:]))
+
+        upgrade, frames = asyncio.run(run())
+
+        self.assertIn(b"101 Switching Protocols", upgrade)
+        opcode, payload = frames[0]
+        self.assertEqual(opcode, 1)  # plaintext text frame, not a SEC2 binary wrapper
+        self.assertEqual(
+            json.loads(payload),
+            {"type": "hello", "proto": 1, "daemonUuid": "", "width": 240, "height": 240},
+        )
+
 
 class SchedulerTests(unittest.TestCase):
+    def test_album_art_intro_schedules_lyrics_at_five_seconds(self) -> None:
+        async def run() -> list[dict[str, object]]:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                daemon = LyricsDisplayDaemon(
+                    LyricsStore(Path(tmpdir) / "lyrics.sqlite3"), FallbackFrameRenderer()
+                )
+                conn = WebSocketConnection(asyncio.StreamReader(), FakeWriter())  # type: ignore[arg-type]
+                daemon.boards.add(conn)
+                daemon.state = AppState(
+                    track=TrackInfo(title="Song", duration_sec=30),
+                    lyrics=Lyrics(synced=[(0, "first"), (10_000, "second")], resolved=True),
+                    hero_cover=lyrics_display_daemon.CoverArt(
+                        size=300, bits=bytes([1]) * (300 * 300)
+                    ),
+                )
+                daemon.state.clock.update(position_sec=2, paused=False, playback_rate=1)
+
+                await daemon.render_and_broadcast()
+                if daemon.scheduled_task is not None:
+                    daemon.scheduled_task.cancel()
+
+                return [
+                    parse_frame_envelope(payload)
+                    for opcode, payload in server_frame_payloads(b"".join(conn.writer.writes))
+                    if opcode == 2
+                ]
+
+        envelopes = asyncio.run(run())
+
+        self.assertEqual(envelopes[0]["kind"], lyrics_display_daemon.FRAME_KIND_FULL_NOW)
+        self.assertEqual(envelopes[1]["kind"], lyrics_display_daemon.FRAME_KIND_FULL_SCHEDULED)
+        self.assertGreaterEqual(envelopes[1]["swap_in_ms"], 2900)
+        self.assertLessEqual(envelopes[1]["swap_in_ms"], 3000)
+        self.assertNotEqual(envelopes[0]["payload"], envelopes[1]["payload"])
+
     def test_synced_playback_queues_next_line_frame_with_swap_delay(self) -> None:
         async def run() -> list[dict[str, object]]:
             with tempfile.TemporaryDirectory() as tmpdir:

@@ -62,6 +62,7 @@ LRCLIB_RETRYABLE_STATUS = (429, 502, 503, 504)
 LRCLIB_MAX_RETRY_AFTER_SECONDS = 10.0
 LRCLIB_USER_AGENT = "g4pys-lyrics-display/0.1"
 MIN_SCHEDULE_SWAP_MS = 25
+ALBUM_ART_INTRO_SECONDS = 5.0
 MDNS_GROUP = "224.0.0.251"
 MDNS_PORT = 5353
 FRAME_ENVELOPE_MAGIC = b"LYR1"
@@ -261,10 +262,19 @@ class AppState:
     resolving_key: str = ""
     dirty: bool = True
     cover: CoverArt | None = None
-    # Full-screen album art shown while paused (decoded at a larger size than the
-    # small header cover). None when art is unavailable -> paused falls back to
-    # the normal now-playing layout.
+    # Full-screen album art used for the five-second track intro and while
+    # paused (decoded at a larger size than the small header cover). None when
+    # art is unavailable -> both states fall back to the normal lyrics layout.
     hero_cover: CoverArt | None = None
+
+    def in_album_art_intro(self) -> bool:
+        """True while a playing track is inside its first five seconds."""
+        return (
+            bool(self.track.title)
+            and not self.clock.paused
+            and self.clock.playback_rate > 0
+            and self.clock.interpolated_position() < ALBUM_ART_INTRO_SECONDS
+        )
 
     def active_line_index(self) -> int:
         if not self.lyrics.synced:
@@ -505,7 +515,7 @@ def max_cover_size(profiles: "list[RenderProfile]") -> int:
 
 
 def hero_cover_size(profiles: "list[RenderProfile]") -> int:
-    """Decode size for the paused full-screen art: the largest square that fits
+    """Decode size for the full-screen art: the largest square that fits
     any connected board that supports covers (400x300 -> 300, 240x240 -> 240).
 
     Decoded once at the max across boards; each board centers and clips this
@@ -1360,7 +1370,7 @@ class CoreTextFrameRenderer(FrameRenderer):
         return CoverArt(size=size, bits=floyd_steinberg_1bit(gray, size, size))
 
     def render_pause_chip(self, profile: RenderProfile) -> tuple[bytes, bytes, int, int]:
-        """Render the small PAUSED chip stamped over the paused full-screen art.
+        """Render the small PAUSED chip stamped over paused full-screen art.
 
         Returns (value, mask, chip_w, chip_h): two 1-bpp row-packed bitmaps of
         the same size. ``value`` is the white pill with black label; ``mask`` is
@@ -2197,12 +2207,12 @@ class LyricsDisplayDaemon:
 
     async def handle_extension(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         conn = WebSocketConnection(reader, writer)
-        path = await conn.handshake()
-        if path != "/extension":
-            conn.close()
-            return
-        print("extension connected")
         try:
+            path = await conn.handshake()
+            if path != "/extension":
+                conn.close()
+                return
+            print("extension connected")
             while True:
                 message = await conn.recv()
                 if message is None:
@@ -2211,7 +2221,10 @@ class LyricsDisplayDaemon:
                 if opcode != 1:
                     continue
                 await self.handle_extension_message(payload.decode("utf-8"))
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError, ConnectionError, asyncio.IncompleteReadError,
+                asyncio.LimitOverrunError) as exc:
+            # Same probe/half-open handling as handle_board: the handshake read
+            # can EOF or overrun before a request arrives -- log, don't crash.
             print(f"extension websocket closed: {exc}")
         print("extension disconnected")
 
@@ -2232,6 +2245,11 @@ class LyricsDisplayDaemon:
                 art_url=str(payload.get("artUrl") or ""),
             )
             await self.set_track(track)
+            # Newer extensions include the current media time with the track so
+            # reconnecting halfway through a song cannot flash the start intro.
+            # Keep accepting the old track-only payload for compatibility.
+            if any(field in payload for field in ("positionSec", "paused", "playbackRate")):
+                await self.update_clock(payload)
         elif msg_type == "tick":
             await self.update_clock(payload)
         elif msg_type == "event":
@@ -2298,17 +2316,17 @@ class LyricsDisplayDaemon:
         return max_cover_size([conn.profile for conn in self.boards])
 
     def _hero_cover_size(self) -> int:
-        """Full-screen paused-art decode size for connected boards (0 = none)."""
+        """Full-screen art decode size for connected boards (0 = none)."""
         return hero_cover_size([conn.profile for conn in self.boards])
 
     def _ensure_cover(self, track: TrackInfo) -> None:
         """Fetch this track's cover once, decoded to both the header size and the
-        full-screen paused-art size for the largest connected board.
+        full-screen art size for the largest connected board.
 
         Only fetches when a board whose profile supports covers is connected, so
         a headless daemon (or a board with no cover slot) does no network I/O.
-        Both sizes come from a single HTTP fetch (decoded twice), so the paused
-        hero art costs no extra network round trip.
+        Both sizes come from a single HTTP fetch (decoded twice), so hero art
+        costs no extra network round trip.
         """
         url = cover_url_for(track)
         small = self._cover_size()
@@ -2430,16 +2448,18 @@ class LyricsDisplayDaemon:
             self.last_frames[DEFAULT_PROFILE.name] = frame
 
     def _render(self, state: AppState, profile: RenderProfile) -> bytes:
-        # Paused with art available: fill the panel with the album cover instead
-        # of the now-playing layout. Falls through to the normal render whenever
-        # art is unavailable (instrumental, fetch failure, headless renderer).
+        # During the first five seconds, fill the panel with clean album art.
+        # Paused playback uses the same hero art with a PAUSED chip. Both states
+        # fall through to lyrics when art is unavailable.
+        if state.in_album_art_intro() and state.hero_cover is not None:
+            return self._render_hero_art(state, profile, show_paused_chip=False)
         if (
             state.clock.paused
             and state.track.title
             and state.hero_cover is not None
             and hasattr(self.renderer, "render_pause_chip")
         ):
-            return self._render_paused_hero(state, profile)
+            return self._render_hero_art(state, profile, show_paused_chip=True)
         frame = self.renderer.render(state, profile)
         if self.theme == "light":
             frame = invert_frame(frame)
@@ -2449,8 +2469,10 @@ class LyricsDisplayDaemon:
             frame = blit_cover(frame, state.cover, profile)
         return frame
 
-    def _render_paused_hero(self, state: AppState, profile: RenderProfile) -> bytes:
-        """Full-screen paused view: centered album art on black, with a PAUSED chip.
+    def _render_hero_art(
+        self, state: AppState, profile: RenderProfile, *, show_paused_chip: bool
+    ) -> bytes:
+        """Full-screen centered album art, optionally with a PAUSED chip.
 
         Theme-independent -- the photo keeps its natural tonality (the same reason
         covers are blitted post-flip in _render), and the chip is an overlay, not
@@ -2459,6 +2481,8 @@ class LyricsDisplayDaemon:
         cover = state.hero_cover
         frame = bytes(profile.frame_bytes)  # all-black background (0 = off)
         frame = blit_cover_centered(frame, cover, profile)
+        if not show_paused_chip:
+            return frame
         value, chip_mask, chip_w, chip_h = self.renderer.render_pause_chip(profile)
         art_x = max(0, (profile.width - cover.size) // 2)
         art_y = max(0, (profile.height - cover.size) // 2)
@@ -2530,7 +2554,11 @@ class LyricsDisplayDaemon:
                 opcode, payload = message
                 if opcode == 1 and conn.tx_key is None and payload.decode("utf-8", "replace") == "ready":
                     await self.send_current_frame(conn, now=True)
-        except (OSError, ValueError, ConnectionError, asyncio.TimeoutError, json.JSONDecodeError) as exc:
+        except (OSError, ValueError, ConnectionError, asyncio.TimeoutError, json.JSONDecodeError,
+                asyncio.IncompleteReadError, asyncio.LimitOverrunError) as exc:
+            # IncompleteReadError/LimitOverrunError: a peer opened the socket and
+            # closed (or never finished the HTTP request) before the handshake --
+            # a probe or a board that dropped. Log it, don't crash the task.
             print(f"board websocket closed: {exc}")
         finally:
             if 'heartbeat' in locals():
@@ -2702,7 +2730,13 @@ class LyricsDisplayDaemon:
             conn.board_frame_base = frame
 
     def _next_scheduled_frame_locked(self, profiles: list[RenderProfile]) -> ScheduledFrame | None:
-        next_ms = self.state.next_line_time_ms()
+        # While hero art hides the lyrics, the next visible change is the end of
+        # the five-second intro. Schedule that exact lyrics frame instead of an
+        # earlier hidden line transition.
+        if self.state.in_album_art_intro() and self.state.hero_cover is not None:
+            next_ms = int(ALBUM_ART_INTRO_SECONDS * 1000)
+        else:
+            next_ms = self.state.next_line_time_ms()
         if next_ms is None:
             return None
         position_ms = int(self.state.clock.interpolated_position() * 1000)
@@ -3037,32 +3071,46 @@ def cache_command(args: argparse.Namespace) -> int:
 
 async def run(args: argparse.Namespace) -> None:
     store = LyricsStore(Path(args.db))
-    identity = load_or_create_identity(Path(args.identity))
-    if args.board_token:
-        if not re.fullmatch(r"[0-9a-fA-F]{64}", args.board_token):
-            raise ValueError("--board-token must be exactly 64 hexadecimal characters")
-        identity = DaemonIdentity(identity.daemon_uuid, args.board_token)
-    daemon = LyricsDisplayDaemon(store, build_renderer(args.font), board_token=identity.token,
+    # --insecure: run with no identity at all. Boards then connect over proto=1
+    # with no token and frames go out unwrapped (no SEC2/HMAC). This is what the
+    # ESP8266 needs -- it lacks the heap to buffer-and-verify a whole SEC2 record
+    # on top of its framebuffer. Trades LAN-link authentication for ~7 KB of heap.
+    if args.insecure:
+        identity = None
+    else:
+        identity = load_or_create_identity(Path(args.identity))
+        if args.board_token:
+            if not re.fullmatch(r"[0-9a-fA-F]{64}", args.board_token):
+                raise ValueError("--board-token must be exactly 64 hexadecimal characters")
+            identity = DaemonIdentity(identity.daemon_uuid, args.board_token)
+    daemon = LyricsDisplayDaemon(store, build_renderer(args.font),
+                                 board_token=identity.token if identity else "",
                                  identity=identity, allow_legacy_proto1=args.allow_legacy_proto1)
+    daemon_uuid = identity.daemon_uuid if identity else ""
     advertiser = DnsSdAdvertiser(
         args.mdns_instance,
         "_lyrics",
         "_tcp",
         args.board_port,
-        txt={"path": "/board", "proto": "2", "auth": "hmac-sha256", "uuid": identity.daemon_uuid},
+        txt=({"path": "/board", "proto": "2", "auth": "hmac-sha256", "uuid": daemon_uuid}
+             if identity else
+             {"path": "/board?proto=1", "proto": "1", "auth": "none"}),
     )
     legacy_advertiser = DnsSdAdvertiser(
         args.mdns_instance + " Legacy", "_lyrics", "_tcp", args.board_port,
-        txt={"path": "/board?proto=1", "proto": "1", "auth": "token", "uuid": identity.daemon_uuid},
-    ) if args.allow_legacy_proto1 else None
+        txt={"path": "/board?proto=1", "proto": "1", "auth": "token", "uuid": daemon_uuid},
+    ) if (identity and args.allow_legacy_proto1) else None
     extension_server = await asyncio.start_server(
         daemon.handle_extension, args.extension_host, args.extension_port
     )
     board_server = await asyncio.start_server(daemon.handle_board, args.board_host, args.board_port)
     print(f"extension WebSocket: ws://{args.extension_host}:{args.extension_port}/extension")
     print(f"board WebSocket: ws://{args.board_host}:{args.board_port}/board")
-    print(f"secure board identity: {identity.daemon_uuid}")
-    print("board WebSocket auth: mutual nonce/HMAC (proto=2)")
+    if identity:
+        print(f"secure board identity: {identity.daemon_uuid}")
+        print("board WebSocket auth: mutual nonce/HMAC (proto=2)")
+    else:
+        print("board WebSocket auth: DISABLED (--insecure): proto=1, unauthenticated")
     if not args.no_mdns:
         advertiser.start()
         if legacy_advertiser is not None:
@@ -3093,6 +3141,11 @@ def main() -> int:
         target.add_argument("--identity", default=os.environ.get("G4PYS_LYRICS_IDENTITY", str(default_identity_path())))
         target.add_argument("--allow-legacy-proto1", action="store_true",
                             default=os.environ.get("G4PYS_LYRICS_ALLOW_LEGACY_PROTO1") == "1")
+        target.add_argument("--insecure", action="store_true",
+                            default=os.environ.get("G4PYS_LYRICS_INSECURE") == "1",
+                            help="run with no board identity: boards connect unauthenticated "
+                                 "(proto=1, unwrapped frames, no pairing token). Needed for the "
+                                 "ESP8266, which lacks the heap for the SEC2 record layer.")
         target.add_argument("--no-mdns", action="store_true", default=os.environ.get("G4PYS_LYRICS_NO_MDNS") == "1")
 
     import_parser = subparsers.add_parser("import-lrc", help="import one or more .lrc files as manual lyrics")
