@@ -14,6 +14,7 @@ idf_component_register(
         "swarm_screen.cpp"
         "comic_screen.cpp"
         "http_api.cpp"
+        "ota_update.cpp"
         "board_client.cpp"
         "network_manager.cpp"
         "provisioning_portal.cpp"
@@ -23,12 +24,14 @@ idf_component_register(
     REQUIRES
         u8g2_st7305
         esp_timer
+        esp_pm
         nvs_flash
         esp_wifi
         esp_event
         esp_netif
         esp_http_client
         esp_http_server
+        app_update
         qrcode
         json
         mbedtls
