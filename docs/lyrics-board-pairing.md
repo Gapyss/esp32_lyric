@@ -142,6 +142,34 @@ Expected TXT fields are `proto=2`, `auth=hmac-sha256`, and `uuid=<UUID>`.
 Ensure the Mac and board are on the same LAN and that Wi-Fi client isolation is
 disabled. After correcting the cause, allow up to 30 seconds for another retry.
 
+### `RETRY_WAIT` with the daemon running and `_lyrics._tcp` visible
+
+If `dns-sd -B` shows the service but the board still never connects, resolve the
+TXT record with `dns-sd -L` as above and read it carefully. The board rejects any
+service whose TXT is not `proto=2` / `auth=hmac-sha256` / valid `uuid`, and it
+never opens a TCP connection to a rejected service.
+
+A stale advertisement is the usual cause. The daemon registers through a
+`dns-sd -R` child process; if the daemon exits without running its cleanup, that
+child survives, reparented to `init`, and keeps advertising. Every run registers
+the same instance name, so Bonjour lets the oldest registration own the name and
+the board reads the dead daemon's TXT — including `proto=1 auth=none` left behind
+by an old `--insecure` run.
+
+List every registration and check for orphans (`PPID` of `1`):
+
+```sh
+ps -eo pid,ppid,command | grep '[d]ns-sd -R'
+```
+
+Kill only the entries whose `PPID` is `1`, leaving the child owned by the running
+daemon. The board recovers on its own within one backoff cycle; no reset or
+re-pairing is needed.
+
+Current daemon builds reap these orphans automatically at startup and unwind
+cleanly on `SIGTERM`/`SIGHUP`, so this should only affect registrations left by
+an older build.
+
 ### Restart without erasing pairing
 
 Restart the ESP32 with its RESET button and restart the daemon with the `serve`

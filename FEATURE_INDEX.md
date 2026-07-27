@@ -259,6 +259,10 @@ Features:
 - Reads PCF85063 RTC time.
 - Reads SHTC3 temperature and humidity.
 - Validates SHTC3 CRC.
+- Reads VBAT on GPIO4 (ADC1_CH3) through the ~3:1 divider and smooths it.
+- Maps pack voltage to charge percent through an 18650 Li-ion discharge curve.
+- Estimates time-to-empty by least-squares fitting charge percent against
+  timestamped samples, and reports charging/steady when no drain is measurable.
 - Supplies idle screen metrics to `music_screen`.
 
 ### Firefly Clock Screen
@@ -331,6 +335,35 @@ Features:
 - `GET /mode?set=<mode>` selects `music`, `water`, `stats`, `pomodoro`, `clock`, `pet`, `sand`, `swarm`, `comic`, or `apod`.
 - `GET /diag/display` can show orientation, polarity, or timing diagnostic frames.
 - `GET /diag/display?pattern=clear` clears full-frame override mode.
+- `GET /ota` reports the running/next OTA slot, build time, and slot capacity.
+- `POST /ota` takes a firmware image as the raw body, gated on an `X-OTA-Token`
+  header; an empty body is answered as an auth probe.
+
+## Firmware Update Over Wi-Fi
+
+Status: Implemented
+
+Files:
+
+- `firmware/main/ota_update.cpp`
+- `firmware/main/ota_update.h`
+- `firmware/partitions.csv`
+- `tools/ota_flash.py`
+
+Features:
+
+- Dual 6 MB app slots plus `otadata`; `nvs` and `phy_init` keep their original
+  offsets so migrating from the single-factory layout preserves credentials.
+- Generates a 12-character upload token into NVS on first boot and reprints it
+  in the boot log every boot.
+- Streams the upload to the inactive slot in 4 KB chunks off the heap, retrying
+  on socket timeouts rather than aborting.
+- Rejects truncated or corrupt images at `esp_ota_end()` before repointing the
+  boot partition, so a failed update leaves the running image untouched.
+- Reboots on a timer after the response is sent.
+- No automatic rollback; recovery from a bad image is over USB.
+- `tools/ota_flash.py` uploads, waits for the reboot, and confirms the slot
+  flipped.
 
 ## Alternate HTTP Render-Wrapper Path
 
@@ -443,7 +476,7 @@ Features:
 - Documents display, I2C, microSD, ADC, and audio-related pin maps.
 - Firmware currently uses display, WiFi, mDNS, HTTP, RTC, and SHTC3 paths.
 - Audio hardware is documented but intentionally out of scope.
-- microSD and battery ADC are documented but not implemented in the current firmware feature set.
+- microSD is documented but not implemented in the current firmware feature set.
 
 ## Service Configuration
 
@@ -497,9 +530,8 @@ Items documented but not active features in the current implementation:
 - Bluetooth speaker or A2DP sink mode.
 - On-device audio playback through ES8311/ES7210.
 - Captive portal or runtime WiFi manager.
-- OTA update UI.
+- OTA update UI (OTA itself is implemented; there is no on-device UI for it).
 - Browser dashboard UI.
-- Battery/sleep behavior.
+- Sleep behavior (battery gauge is implemented; power management is not).
 - microSD features.
-- Battery voltage ADC display.
 - Full production browser-store release workflow beyond packaging/signing helpers.

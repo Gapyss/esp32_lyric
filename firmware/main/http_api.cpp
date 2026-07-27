@@ -12,6 +12,7 @@
 #include "board_client.h"
 #include "display_config.h"
 #include "music_screen.h"
+#include "ota_update.h"
 #include "water_screen.h"
 
 static const char *TAG = "http_api";
@@ -634,7 +635,12 @@ esp_err_t http_api_start(void)
     }
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 18;
+    config.max_uri_handlers = 20;
+    // A firmware image is ~1.3 MB, and the render task holds the SPI bus in
+    // bursts while it uploads, so single recv calls stall well past the 5 s
+    // default. esp_ota_write also wants more stack than the 4 KB default.
+    config.recv_wait_timeout = 30;
+    config.stack_size = 8192;
 
     esp_err_t err = httpd_start(&g_server, &config);
     if (err != ESP_OK) {
@@ -742,6 +748,7 @@ esp_err_t http_api_start(void)
     ESP_ERROR_CHECK(httpd_register_uri_handler(g_server, &diag_display));
     ESP_ERROR_CHECK(httpd_register_uri_handler(g_server, &pairing_get));
     ESP_ERROR_CHECK(httpd_register_uri_handler(g_server, &pairing_post));
+    ESP_ERROR_CHECK(ota_update_register(g_server));
 
     ESP_LOGI(TAG, "HTTP API listening on port %d", config.server_port);
     return ESP_OK;

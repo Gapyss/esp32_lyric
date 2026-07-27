@@ -1,5 +1,13 @@
-# Name,   Type, SubType, Offset,  Size, Flags
+# Name,   Type, SubType, Offset,   Size,     Flags
 # Note: if you have increased the bootloader size, make sure to update the offsets to avoid overlap
-nvs,      data, nvs,     ,         0x6000,
-phy_init, data, phy,     ,         0x1000,
-factory,  app,  factory, ,         8M,
+# nvs and phy_init keep the offsets and sizes they had under the old
+# single-factory layout, so migrating to OTA preserves WiFi credentials, the
+# pairing token, and the pet/hydrate state instead of erasing them.
+nvs,      data, nvs,     0x9000,   0x6000,
+phy_init, data, phy,     0xF000,   0x1000,
+otadata,  data, ota,     0x10000,  0x2000,
+# App slots are 64 KB aligned, so ota_0 starts at 0x20000 rather than directly
+# after otadata. 6 MB each leaves plenty over the ~1.3 MB image and still fits
+# the 16 MB part with room to spare (ends at 0xC20000).
+ota_0,    app,  ota_0,   0x20000,  0x600000,
+ota_1,    app,  ota_1,   0x620000, 0x600000,

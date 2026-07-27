@@ -28,7 +28,8 @@ WebSocket → the board blits them to its LCD.**
 
 Two boards speak this protocol today: the ESP32-S3 (400×300, the original target) and the
 ESP8266 GeekMagic SmallTV (240×240 color TFT, `esp8266/clawdmeter_esp8266/lyrics_stream.cpp`),
-which draws the 1-bit frames as Tend ink-on-paper and keeps its on-device text renderer as
+which maps 1-bit UI masks to the Tend color palette, streams album-art overlays in
+real RGB565, and keeps its on-device text renderer as
 the fallback whenever no stream flows.
 
 ```
@@ -224,12 +225,14 @@ Arduino sketch on a much smaller chip, so the client is shaped differently:
   the web server or the other screens). No extra library, no task, no timer ISR.
 - **No mDNS query and no configuration**: the Mac already POSTs `/usage` and
   `/nowplaying` to the device, so the sketch remembers the source IP of those pushes
-  and dials back to `:8766/board?w=240&h=240`. Connects only while the MUSIC screen is
+  and dials back to `:8766/board?w=240&h=240&color=rgb565`. Connects only while the MUSIC screen is
   visible; a stale host (no push in 10 min) is never dialed.
-- Frames blit as Tend ink-on-paper RGB565 rows (set bit = paper, clear = ink — the
-  daemon's light theme). Two 7.2 KB buffers (current + scheduled) are malloc'd only
-  while streaming, and the on-device marquee canvases (~17 KB) are freed while the
-  stream owns the panel, so the two render paths never hold heap at once.
+- Frames blit as Tend-palette RGB565 rows: stable bands in the compact layout
+  colorize the 1-bit UI mask. The daemon follows an overwritten cover region with an
+  `ART1` big-endian RGB565 rectangle, streamed one scanline at a time so even a
+  full-screen cover needs no 115 KB color framebuffer. One 7.2 KB mono framebuffer is
+  malloc'd while streaming, and the on-device marquee canvases (~17 KB) are freed while
+  the stream owns the panel, so the two render paths never hold heap at once.
 - The on-device Thai/Latin text renderer remains the fallback: stream drops, daemon
   `clear`, or the Mac going away all hand the panel back within seconds.
 - Sends no board token — leave `G4PYS_LYRICS_BOARD_TOKEN` unset when ESP8266 boards

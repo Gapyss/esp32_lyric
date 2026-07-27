@@ -685,6 +685,38 @@ class HeroArtTests(unittest.TestCase):
         self.assertEqual(self._get(frame, 200, 150, self.WIDE), 0)  # inside art: cleared
         self.assertEqual(self._get(frame, 0, 150, self.WIDE), 1)    # side bar untouched
 
+    def test_color_cover_rect_center_crops_rgb565_to_slot(self) -> None:
+        rgb565 = b"".join(i.to_bytes(2, "big") for i in range(16))
+        cover = lyrics_display_daemon.CoverArt(
+            size=4, bits=bytes(16), rgb565=rgb565
+        )
+        rect = lyrics_display_daemon.color_cover_rect(
+            cover,
+            self.SQUARE,
+            slot_x=10,
+            slot_y=20,
+            slot_width=2,
+            slot_height=2,
+        )
+        self.assertIsNotNone(rect)
+        assert rect is not None
+        self.assertEqual((rect.x, rect.y, rect.width, rect.height), (10, 20, 2, 2))
+        self.assertEqual(
+            rect.payload,
+            b"".join(i.to_bytes(2, "big") for i in (5, 6, 9, 10)),
+        )
+
+    def test_color_envelope_uses_art1_and_rgb565_row_bytes(self) -> None:
+        rect = lyrics_display_daemon.ColorRect(4, 7, 2, 1, b"\x12\x34\xab\xcd")
+        envelope = parse_frame_envelope(
+            lyrics_display_daemon.make_color_envelope(rect, self.SQUARE)
+        )
+        self.assertEqual(envelope["magic"], lyrics_display_daemon.COLOR_ENVELOPE_MAGIC)
+        self.assertEqual(envelope["kind"], lyrics_display_daemon.COLOR_KIND_RECT_NOW)
+        self.assertEqual((envelope["x"], envelope["y"]), (4, 7))
+        self.assertEqual(envelope["row_bytes"], 4)
+        self.assertEqual(envelope["payload"], b"\x12\x34\xab\xcd")
+
     def test_composite_chip_only_writes_masked_pixels(self) -> None:
         # 8x1 chip, mask lit only in the left half; art underneath stays elsewhere.
         art = bytes([0xFF]) * self.WIDE.frame_bytes
@@ -763,7 +795,10 @@ class WebSocketConnectionTests(unittest.TestCase):
             {"proto": "2", "auth": "hmac-sha256"},
         )
         process = mock.Mock()
+        # Reaping is exercised separately; stub it out so the module-wide Popen
+        # patch below only ever sees the registration call.
         with mock.patch.object(lyrics_display_daemon.shutil, "which", return_value="/usr/bin/dns-sd"), \
+             mock.patch.object(advertiser, "_reap_stale_dns_sd"), \
              mock.patch.object(lyrics_display_daemon.subprocess, "Popen", return_value=process) as popen:
             advertiser._start_dns_sd()
 
@@ -771,6 +806,33 @@ class WebSocketConnectionTests(unittest.TestCase):
         self.assertEqual(command[:7], [
             "/usr/bin/dns-sd", "-R", "Lyrics Test", "_lyrics._tcp", "local", "8766", "proto=2",
         ])
+
+    def test_reap_stale_dns_sd_kills_only_matching_instance(self) -> None:
+        advertiser = lyrics_display_daemon.DnsSdAdvertiser(
+            "Lyrics Test", "_lyrics", "_tcp", 8766, {"proto": "2"},
+        )
+        listing = (
+            "101 /usr/bin/dns-sd -R Lyrics Test _lyrics._tcp local 8766 proto=1 auth=none\n"
+            "102 /usr/bin/dns-sd -R Lyrics Test Legacy _lyrics._tcp local 8766 proto=1\n"
+            "103 /usr/bin/dns-sd -R Other Board _lyrics._tcp local 8766 proto=2\n"
+            "104 /usr/sbin/mDNSResponder\n"
+        )
+        with mock.patch.object(lyrics_display_daemon.subprocess, "run",
+                               return_value=mock.Mock(stdout=listing)), \
+             mock.patch.object(lyrics_display_daemon.os, "kill") as kill:
+            advertiser._reap_stale_dns_sd()
+
+        # Only the registration that would collide on our exact instance name.
+        self.assertEqual([call.args[0] for call in kill.call_args_list], [101])
+
+    def test_reap_stale_dns_sd_survives_missing_ps(self) -> None:
+        advertiser = lyrics_display_daemon.DnsSdAdvertiser(
+            "Lyrics Test", "_lyrics", "_tcp", 8766, {"proto": "2"},
+        )
+        with mock.patch.object(lyrics_display_daemon.subprocess, "run", side_effect=OSError), \
+             mock.patch.object(lyrics_display_daemon.os, "kill") as kill:
+            advertiser._reap_stale_dns_sd()
+        kill.assert_not_called()
 
     def test_identity_is_stable_and_private(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -986,6 +1048,33 @@ class WebSocketConnectionTests(unittest.TestCase):
             json.loads(payload),
             {"type": "hello", "proto": 1, "daemonUuid": "", "width": 240, "height": 240},
         )
+
+    def test_rgb565_board_gets_color_cover_after_mono_frame(self) -> None:
+        async def run() -> list[tuple[int, bytes]]:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                daemon = LyricsDisplayDaemon(
+                    LyricsStore(Path(tmpdir) / "lyrics.sqlite3"), FallbackFrameRenderer()
+                )
+                writer = FakeWriter()
+                conn = WebSocketConnection(asyncio.StreamReader(), writer)  # type: ignore[arg-type]
+                conn.profile = lyrics_display_daemon.SQUARE_PROFILE
+                conn.supports_rgb565 = True
+                size = lyrics_display_daemon.COVER_PLACEMENTS["240x240"].size
+                daemon.state = AppState(
+                    track=TrackInfo(title="Song", duration_sec=100),
+                    cover=lyrics_display_daemon.CoverArt(
+                        size=size,
+                        bits=bytes([1]) * (size * size),
+                        rgb565=b"\xf8\x00" * (size * size),
+                    ),
+                )
+                await daemon.send_current_frame(conn, now=True)
+                return server_frame_payloads(b"".join(writer.writes))
+
+        frames = asyncio.run(run())
+        binary = [parse_frame_envelope(payload) for opcode, payload in frames if opcode == 2]
+        self.assertEqual([item["magic"] for item in binary], [b"LYR1", b"ART1"])
+        self.assertEqual(binary[1]["payload"], b"\xf8\x00" * (52 * 52))
 
 
 class SchedulerTests(unittest.TestCase):
