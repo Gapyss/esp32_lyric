@@ -32,9 +32,9 @@ static void refresh_if_due(void)
 }
 
 // This panel's memory-in-pixel controller renders draw color 1 as the
-// light/reflective state and 0 as dark ink -- see the matching note in
-// water_screen.cpp. Every stats frame starts by filling the card light so it
-// reads correctly regardless of whatever the previous screen left behind.
+// light/reflective state and 0 as dark ink. Every stats frame starts by
+// filling the card light so it reads correctly regardless of whatever the
+// previous screen left behind.
 static void begin_light_theme(u8g2_t *u8)
 {
     const int width = (int)u8g2_GetDisplayWidth(u8);

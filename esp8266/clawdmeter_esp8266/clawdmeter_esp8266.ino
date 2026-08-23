@@ -27,7 +27,7 @@ ESP8266WebServer server(80);
 Arduino_DataBus *bus = new Arduino_HWSPI(LCD_DC, GFX_NOT_DEFINED /* CS -> GND */);
 Arduino_GFX *gfx = new Arduino_ST7789(bus, LCD_RST, LCD_ROT, true /* IPS */, 240, 240);
 
-// EEPROM layout v2 (see tend.h): brightness + water config + pet counters.
+// EEPROM layout v2 (see tend.h): brightness; bytes 2..15 stay reserved.
 // v1 (marker 0xC1) carried only brightness; loadBrightness migrates it.
 static const uint8_t EEPROM_MARKER_V1 = 0xC1;
 static const uint8_t EEPROM_MARKER = 0xC2;
@@ -55,16 +55,17 @@ static void backlightStopForFlash() {
   analogWrite(LCD_BL, 0);
 }
 
-// Commit wrapped in the flash guard, shared with the screen modules (water
-// config, pet counters). See backlightStopForFlash above for why.
+// Commit wrapped in the flash guard. See backlightStopForFlash above for why.
 void tendEepromCommit() {
   backlightStopForFlash();
   EEPROM.commit();
   setBacklight(lcdBrightness);
 }
 
-// Migrate v1 (brightness only) to v2 and default the new fields; on a fresh
-// chip default everything. Runs once in setup before any screen reads config.
+// Stamp the v2 marker, migrating a v1 (brightness-only) chip in place; on a
+// fresh chip default the brightness too. Bytes 2..15 held water config and pet
+// counters before those screens were removed and are now left untouched.
+// Runs once in setup before any screen reads config.
 static void eepromInitLayout() {
   const uint8_t marker = EEPROM.read(EE_MARKER_ADDR);
   if (marker == EEPROM_MARKER) return;
@@ -72,11 +73,6 @@ static void eepromInitLayout() {
     EEPROM.write(EE_BRIGHTNESS_ADDR, LCD_BRIGHTNESS);
   }
   EEPROM.write(EE_MARKER_ADDR, EEPROM_MARKER);
-  EEPROM.put(EE_WATER_INTERVAL, (uint16_t)45);
-  EEPROM.put(EE_WATER_START, (uint16_t)(9 * 60));
-  EEPROM.put(EE_WATER_END, (uint16_t)(18 * 60));
-  EEPROM.put(EE_PET_TOTAL, (uint32_t)0);
-  EEPROM.put(EE_PET_ADOPT, (uint32_t)0);
   tendEepromCommit();
 }
 
@@ -221,11 +217,8 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
     <button class="btn" data-scr="clock" data-get="/mode?screen=clock">clock</button>
     <button class="btn" data-scr="music" data-get="/mode?screen=music">lyrics</button>
     <button class="btn" data-scr="pomodoro" data-get="/mode?screen=pomodoro">pomodoro</button>
-    <button class="btn" data-scr="water" data-get="/mode?screen=water">water</button>
     <button class="btn" data-scr="stats" data-get="/mode?screen=stats">stats</button>
-    <button class="btn" data-scr="pet" data-get="/mode?screen=pet">pet</button>
     <button class="btn" data-scr="sand" data-get="/mode?screen=sand">sand</button>
-    <button class="btn" data-scr="swarm" data-get="/mode?screen=swarm">swarm</button>
     <button class="btn" data-scr="comic" data-get="/mode?screen=comic">comic</button>
     <button class="btn" data-scr="apod" data-get="/mode?screen=apod">apod</button>
   </div>
@@ -235,12 +228,6 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
     <div class="label" style="margin-top:12px"><span class="big mono" id="pR">25:00</span><span class="mut" id="pS">idle</span></div>
     <div class="acts"><button class="btn" id="pBtn" data-get="/pomodoro">start</button><button class="btn" data-get="/pomodoro?action=reset">reset</button></div>
   </div>
-  <div class="ctx" id="cx-water">
-    <div class="label" style="margin-top:12px"><span class="big"><span class="mono" id="wD">0</span> <span style="font-size:15px;font-weight:400">drinks today</span></span><span class="mut">next &middot; <span class="mono" id="wN">--</span></span></div>
-    <div class="acts"><button class="btn" data-get="/hydrate/log">log a drink</button><button class="btn" data-get="/hydrate/now">remind now</button><button class="btn" data-get="/hydrate/snooze?min=10">snooze 10m</button></div>
-    <div class="cfg"><input id="wI" type="number" min="5" max="480" title="interval min"><input id="wS" type="text" maxlength="5" title="start hh:mm"><input id="wE" type="text" maxlength="5" title="end hh:mm"><button class="btn" id="wApply">apply</button></div>
-    <div class="mut" style="margin-top:6px">interval minutes &middot; active start &middot; active end</div>
-  </div>
   <div class="ctx" id="cx-stats">
     <div class="stats" style="margin-top:12px">
       <div class="stat"><div class="eb">mac cpu</div><div class="v mono" id="xC">--</div></div>
@@ -249,16 +236,8 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
       <div class="stat"><div class="eb">battery</div><div class="v mono" id="xB">--</div></div>
     </div>
   </div>
-  <div class="ctx" id="cx-pet">
-    <div class="label" style="margin-top:12px"><span class="big"><span class="mono" id="petD">0</span> <span style="font-size:15px;font-weight:400">pets today</span></span><span class="mut">all time &middot; <span class="mono" id="petT">0</span></span></div>
-    <div class="acts"><button class="btn" data-get="/pet">pet the pet</button></div>
-  </div>
   <div class="ctx" id="cx-sand">
     <div class="acts" style="margin-top:12px"><button class="btn" data-get="/sand?action=pour">pour sand</button><button class="btn" data-get="/sand?action=clear">clear</button></div>
-  </div>
-  <div class="ctx" id="cx-swarm">
-    <div class="mut" style="margin-top:12px">roaming &middot; <span id="swR">off</span></div>
-    <div class="acts"><button class="btn" data-get="/swarm?action=scatter">scatter</button><button class="btn" data-get="/swarm?action=roam">toggle roam</button></div>
   </div>
   <div class="ctx" id="cx-comic">
     <div class="label" style="margin-top:12px"><span class="big" id="cT">--</span><span class="mut" id="cS">--</span></div>
@@ -296,7 +275,6 @@ function clk(e){return hm(e)+':'+pad2(lt(e).getUTCSeconds())}
 var DOW=['sun','mon','tue','wed','thu','fri','sat'];
 function cd(s){if(s<=0)return 't-0m';var h=Math.floor(s/3600),m=Math.floor(s%3600/60);return h>0?'t-'+h+'h'+pad2(m)+'m':'t-'+m+'m'}
 function mmss(s){s=s>0?Math.floor(s):0;return Math.floor(s/60)+':'+pad2(s%60)}
-function m2h(m){return pad2(Math.floor(m/60))+':'+pad2(m%60)}
 function commas(n){return n>0?String(n).replace(/\B(?=(\d{3})+(?!\d))/g,','):'--'}
 function ageText(a){return a<0?'--':a<60?a+'s':Math.floor(a/60)+'m '+pad2(a%60)+'s'}
 function pct(v){return v>=0?v+'%':'--'}
@@ -304,8 +282,6 @@ function upText(s){var h=Math.floor(s/3600),m=Math.floor(s%3600/60);return h>0?h
 function meter(pId,fId,v){$(pId).textContent=v>=0?v+'%':'--';$(fId).style.width=(v>=0?Math.min(v,100):0)+'%'}
 var gs=document.querySelectorAll('[data-get]');
 for(var gi=0;gi<gs.length;gi++)gs[gi].onclick=function(e){e.preventDefault();fetch(this.getAttribute('data-get'),{cache:'no-store'}).then(tick).catch(function(_){})};
-$('wApply').onclick=function(e){e.preventDefault();
-  fetch('/hydrate/config?interval='+encodeURIComponent($('wI').value)+'&start='+encodeURIComponent($('wS').value)+'&end='+encodeURIComponent($('wE').value),{cache:'no-store'}).then(tick).catch(function(_){})};
 $('fBtn').onclick=function(e){if(!confirm('reset wifi and settings, then reboot?'))e.preventDefault()};
 $('rBtn').onclick=function(e){if(!confirm('restart clawdmeter?'))e.preventDefault()};
 $('npBtn').onclick=function(e){e.preventDefault();
@@ -318,7 +294,6 @@ $('npBtn').onclick=function(e){e.preventDefault();
 var blBusy=false,blTimer=0;
 $('bl').oninput=function(){var v=parseInt(this.value,10)||0;$('blV').textContent=v;blBusy=true;
   clearTimeout(blTimer);blTimer=setTimeout(function(){fetch('/brightness?value='+$('bl').value,{cache:'no-store',method:'POST'}).catch(function(_){});blBusy=false},120)};
-function setIf(id,v){var a=document.activeElement&&document.activeElement.id;if(a!=id)$(id).value=v}
 var ticking=false;
 async function tick(){
   if(ticking)return;
@@ -348,13 +323,8 @@ async function tick(){
     $('pR').textContent=mmss(d.pomor);
     $('pS').textContent=d.pomo;
     $('pBtn').textContent=d.pomo=='running'?'pause':'start';
-    $('wD').textContent=d.drinks;
-    $('wN').textContent=d.walert==1?'drink now':d.nextin<0?'--':d.nextin<60?d.nextin+'s':Math.ceil(d.nextin/60)+'m';
-    setIf('wI',d.winterval);setIf('wS',m2h(d.wstart));setIf('wE',m2h(d.wend));
     $('xC').textContent=pct(d.cpu);$('xM').textContent=pct(d.mem);
     $('xD').textContent=pct(d.disk);$('xB').textContent=pct(d.bat);
-    $('petD').textContent=d.pets;$('petT').textContent=d.petstotal;
-    $('swR').textContent=d.swroam==1?'on':'off';
     $('cT').textContent=d.ctitle||'--';$('cS').textContent=d.cstate;
     $('aT').textContent=d.atitle||'--';$('aS').textContent=d.astate;$('aX').textContent=d.ax||'';
     $('heap').textContent=Math.round(d.heap/1024)+'k';
@@ -453,8 +423,8 @@ void handleUsage() {
 
 // Screen id <-> name, mirroring the ESP32 app_mode names (plus music).
 static const char *const SCREEN_NAMES[] = {
-  "music", "clock", "pomodoro", "water", "stats",
-  "pet", "sand", "swarm", "comic", "apod",
+  "music", "clock", "pomodoro", "stats", "sand",
+  "comic", "apod",
 };
 static const uint8_t SCREEN_NAME_COUNT = sizeof(SCREEN_NAMES) / sizeof(SCREEN_NAMES[0]);
 
@@ -502,15 +472,6 @@ void handleUsageJson() {
              ",\"paused\":" + String(npPaused) +
              ",\"pomo\":\"" + String(pomodoroStateName()) + "\"" +
              ",\"pomor\":" + String(pomodoroRemainingSec()) +
-             ",\"drinks\":" + String(waterDrinksToday()) +
-             ",\"nextin\":" + String(waterNextInSec()) +
-             ",\"walert\":" + String(waterAlerting() ? 1 : 0) +
-             ",\"winterval\":" + String(waterIntervalMin()) +
-             ",\"wstart\":" + String(waterStartMin()) +
-             ",\"wend\":" + String(waterEndMin()) +
-             ",\"pets\":" + String(petPetsToday()) +
-             ",\"petstotal\":" + String(petPetsTotal()) +
-             ",\"swroam\":" + String(swarmRoaming() ? 1 : 0) +
              ",\"cstate\":\"" + String(dailyStateName(false)) + "\"" +
              ",\"astate\":\"" + String(dailyStateName(true)) + "\"" +
              ",\"ctitle\":\"" + jsonEscape(dailyTitle(false)) + "\"" +
@@ -606,62 +567,6 @@ void handleNowPlaying() {
 // Per-screen action endpoints (this box has no physical buttons; the ESP32's
 // BOOT/action button gestures become dashboard buttons). Every action jumps to
 // its screen so the effect is visible immediately.
-void handleHydrateLog() {
-  waterLogDrink();
-  tendShowScreen(SCREEN_WATER);
-  server.sendHeader("Connection", "close");
-  server.send(200, "text/plain", "ok");
-}
-
-void handleHydrateNow() {
-  waterFireNow();
-  tendShowScreen(SCREEN_WATER);
-  server.sendHeader("Connection", "close");
-  server.send(200, "text/plain", "ok");
-}
-
-void handleHydrateSnooze() {
-  int minutes = server.hasArg("min") ? server.arg("min").toInt() : 10;
-  if (minutes <= 0) {
-    server.send(400, "text/plain", "min must be positive");
-    return;
-  }
-  waterSnooze(minutes);
-  tendShowScreen(SCREEN_WATER);
-  server.sendHeader("Connection", "close");
-  server.send(200, "text/plain", "ok");
-}
-
-// /hydrate/config?interval=45&start=09:00&end=18:00 (any subset).
-static bool parseHhmmArg(const char *name, int *minutes) {
-  if (!server.hasArg(name)) return true;   // absent = keep current
-  int h = -1, m = -1;
-  if (sscanf(server.arg(name).c_str(), "%d:%d", &h, &m) != 2 ||
-      h < 0 || h > 23 || m < 0 || m > 59) {
-    return false;
-  }
-  *minutes = h * 60 + m;
-  return true;
-}
-
-void handleHydrateConfig() {
-  int interval = server.hasArg("interval") ? server.arg("interval").toInt()
-                                           : waterIntervalMin();
-  int start = waterStartMin();
-  int end = waterEndMin();
-  if (!parseHhmmArg("start", &start) || !parseHhmmArg("end", &end)) {
-    server.send(400, "text/plain", "start/end must be HH:MM");
-    return;
-  }
-  if (!waterConfigure(interval, start, end)) {
-    server.send(400, "text/plain", "bad hydration config");
-    return;
-  }
-  tendShowScreen(SCREEN_WATER);
-  server.sendHeader("Connection", "close");
-  server.send(200, "text/plain", "ok");
-}
-
 void handlePomodoro() {
   String action = server.hasArg("action") ? server.arg("action") : String("toggle");
   if (action == "reset") pomodoroReset();
@@ -671,27 +576,11 @@ void handlePomodoro() {
   server.send(200, "text/plain", pomodoroStateName());
 }
 
-void handlePet() {
-  petPet();
-  tendShowScreen(SCREEN_PET);
-  server.sendHeader("Connection", "close");
-  server.send(200, "text/plain", "ok");
-}
-
 void handleSand() {
   String action = server.hasArg("action") ? server.arg("action") : String("pour");
   if (action == "clear") sandClear();
   else sandPour();
   if (lcdScreen != SCREEN_SAND) tendShowScreen(SCREEN_SAND);
-  server.sendHeader("Connection", "close");
-  server.send(200, "text/plain", "ok");
-}
-
-void handleSwarm() {
-  String action = server.hasArg("action") ? server.arg("action") : String("scatter");
-  if (action == "roam") swarmToggleRoam();
-  else swarmScatter();
-  if (lcdScreen != SCREEN_SWARM) tendShowScreen(SCREEN_SWARM);
   server.sendHeader("Connection", "close");
   server.send(200, "text/plain", "ok");
 }
@@ -936,11 +825,8 @@ void drawMeter() {
       musicDrawPlaceholder();
       break;
     case SCREEN_POMODORO: pomodoroScreenBegin(); break;
-    case SCREEN_WATER:    waterScreenBegin(); break;
     case SCREEN_STATS:    statsScreenBegin(); break;
-    case SCREEN_PET:      petScreenBegin(); break;
     case SCREEN_SAND:     sandScreenBegin(); break;
-    case SCREEN_SWARM:    swarmScreenBegin(); break;
     case SCREEN_COMIC:
     case SCREEN_APOD:     dailyScreenBegin(); break;
     default:              clockScreenBegin(); break;
@@ -1090,14 +976,8 @@ void setup() {
   server.on("/brightness", HTTP_POST, handleBrightness);
   server.on("/mode", HTTP_GET, handleMode);
   server.on("/mode", HTTP_POST, handleMode);
-  server.on("/hydrate/log", handleHydrateLog);
-  server.on("/hydrate/now", handleHydrateNow);
-  server.on("/hydrate/snooze", handleHydrateSnooze);
-  server.on("/hydrate/config", handleHydrateConfig);
   server.on("/pomodoro", handlePomodoro);
-  server.on("/pet", handlePet);
   server.on("/sand", handleSand);
-  server.on("/swarm", handleSwarm);
   server.on("/daily", handleDaily);
   server.on("/refresh", handleRefresh);
   server.on("/nowplaying", HTTP_GET, handleNowPlaying);
@@ -1126,18 +1006,14 @@ void loop() {
   // ran pomodoro_tick unconditionally too). With no chime on this box, a
   // firing alert pulls its own screen forward via tendShowScreen.
   pomodoroTick();
-  waterTick();
 
   // Every screen is millis()-polled from here (never a timer ISR, so nothing
   // fights the WiFi/TCP stack and no IRAM is spent).
   switch (lcdScreen) {
     case SCREEN_MUSIC:    musicTick(); break;
     case SCREEN_POMODORO: pomodoroScreenTick(); break;
-    case SCREEN_WATER:    waterScreenTick(); break;
     case SCREEN_STATS:    statsScreenTick(); break;
-    case SCREEN_PET:      petScreenTick(); break;
     case SCREEN_SAND:     sandScreenTick(); break;
-    case SCREEN_SWARM:    swarmScreenTick(); break;
     case SCREEN_COMIC:
     case SCREEN_APOD:     dailyScreenTick(); break;
     default:              clockScreenTick(); break;

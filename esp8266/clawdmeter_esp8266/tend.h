@@ -60,19 +60,16 @@ extern Arduino_GFX *gfx;
 static const uint8_t SCREEN_MUSIC = 0;
 static const uint8_t SCREEN_CLOCK = 1;
 static const uint8_t SCREEN_POMODORO = 2;
-static const uint8_t SCREEN_WATER = 3;
-static const uint8_t SCREEN_STATS = 4;
-static const uint8_t SCREEN_PET = 5;
-static const uint8_t SCREEN_SAND = 6;
-static const uint8_t SCREEN_SWARM = 7;
-static const uint8_t SCREEN_COMIC = 8;
-static const uint8_t SCREEN_APOD = 9;
+static const uint8_t SCREEN_STATS = 3;
+static const uint8_t SCREEN_SAND = 4;
+static const uint8_t SCREEN_COMIC = 5;
+static const uint8_t SCREEN_APOD = 6;
 
 extern uint8_t lcdScreen;
 
 // Switch to a screen and repaint it from scratch (chrome + content). Safe to
-// call from screen modules (water/pomodoro alerts pull their screen forward,
-// since there is no chime on this box -- alerts are screen-only).
+// call from screen modules (pomodoro alerts pull their screen forward, since
+// there is no chime on this box -- alerts are screen-only).
 void tendShowScreen(uint8_t screen);
 
 // ---- Time ------------------------------------------------------------------
@@ -101,16 +98,14 @@ void tendHeaderClock(void);
 void tendEepromCommit(void);
 
 // EEPROM layout v2 (v1 was marker+brightness only; loadBrightness migrates).
+// Bytes 2..15 held water config and pet counters until those screens were
+// removed; the region stays reserved so EE_SIZE and the addresses above are
+// unchanged and already-flashed boards still read their stored brightness.
 static const int EE_MARKER_ADDR = 0;       // 0xC2
 static const int EE_BRIGHTNESS_ADDR = 1;   // u8
-static const int EE_WATER_INTERVAL = 2;    // u16 minutes
-static const int EE_WATER_START = 4;       // u16 minutes-of-day
-static const int EE_WATER_END = 6;         // u16 minutes-of-day
-static const int EE_PET_TOTAL = 8;         // u32
-static const int EE_PET_ADOPT = 12;        // u32 epoch day
 static const int EE_SIZE = 16;
 
-// ---- Mac metrics (fed by the daemon's /usage push, read by stats/pet) ------
+// ---- Mac metrics (fed by the daemon's /usage push, read by stats) ---------
 extern int macCpuPct;
 extern int macMemPct;
 extern int macDiskPct;
@@ -118,8 +113,8 @@ extern int macBatteryPct;
 
 // ---- Screen modules --------------------------------------------------------
 // Each Begin paints the full screen; each Tick animates in place. The global
-// pomodoroTick()/waterTick() run every loop() pass regardless of the visible
-// screen (countdowns keep advancing in the background).
+// pomodoroTick() runs every loop() pass regardless of the visible screen
+// (countdowns keep advancing in the background).
 
 void clockScreenBegin(void);
 void clockScreenTick(void);
@@ -132,40 +127,14 @@ void pomodoroReset(void);
 const char *pomodoroStateName(void);
 int pomodoroRemainingSec(void);
 
-void waterScreenBegin(void);
-void waterScreenTick(void);
-void waterTick(void);
-void waterLogDrink(void);
-void waterFireNow(void);
-void waterSnooze(int minutes);
-bool waterConfigure(int intervalMin, int startMin, int endMin);
-bool waterAlerting(void);
-int waterDrinksToday(void);
-int waterNextInSec(void);
-int waterIntervalMin(void);
-int waterStartMin(void);
-int waterEndMin(void);
-
 void statsScreenBegin(void);
 void statsScreenTick(void);
 void statsOnUsagePush(void);
-
-void petScreenBegin(void);
-void petScreenTick(void);
-void petPet(void);
-int petPetsToday(void);
-int petPetsTotal(void);
 
 void sandScreenBegin(void);
 void sandScreenTick(void);
 void sandPour(void);
 void sandClear(void);
-
-void swarmScreenBegin(void);
-void swarmScreenTick(void);
-void swarmScatter(void);
-void swarmToggleRoam(void);
-bool swarmRoaming(void);
 
 // Lyrics frame stream (lyrics_stream.cpp). While the MUSIC screen is visible
 // the box dials back to the Mac that pushes /usage & /nowplaying and speaks

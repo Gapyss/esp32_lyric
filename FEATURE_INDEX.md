@@ -11,7 +11,7 @@ Status legend:
 
 ## Product Goal
 
-The project turns a Waveshare ESP32-S3-RLCD-4.2 board into a multi-mode 400x300 monochrome ambient display. It provides synced lyrics for music playing on a Mac alongside hydration, productivity, clock, simulation, daily comic, and astronomy screens. Audio playback stays on the Mac; the board uses its speaker only for local notification chimes.
+The project turns a Waveshare ESP32-S3-RLCD-4.2 board into a multi-mode 400x300 monochrome ambient display. It provides synced lyrics for music playing on a Mac alongside productivity, clock, simulation, daily comic, and astronomy screens. Audio playback stays on the Mac; the board uses its speaker only for local notification chimes.
 
 Primary references:
 
@@ -178,21 +178,19 @@ Files:
 - `firmware/main/app_config.h`
 - `firmware/main/main.cpp`
 
-The default screen is `water`. A short press of the BOOT button on GPIO0 cycles through:
+The default screen is `stats`. A short press of the BOOT button on GPIO0 cycles through:
 
-`music` -> `water` -> `stats` -> `pomodoro` -> `clock` -> `pet` -> `sand` -> `swarm` -> `comic` -> `apod` -> `music`
+`music` -> `stats` -> `pomodoro` -> `clock` -> `sand` -> `comic` -> `apod` -> `radar` -> `music`
 
 The secondary button on GPIO18 performs an action based on the active screen:
 
 | Mode | Short press | Hold for 0.8 seconds |
 |---|---|---|
-| Water | Log a drink | No action |
 | Pomodoro | Start or pause | Reset timer |
-| Pet | Pet the creature | No action |
 | Sand | Pour sand | Clear the field |
-| Swarm | Scatter the fireflies | Toggle time/roam behavior |
 | Comic | Refresh XKCD | No action |
 | APOD | Refresh NASA APOD | No action |
+| Radar | Refresh radar and forecast | No action |
 
 Modes can also be selected over HTTP with `GET /mode?set=<mode>`. Calling `GET /mode` without `set` returns the current mode name.
 
@@ -265,23 +263,6 @@ Features:
   timestamped samples, and reports charging/steady when no drain is measurable.
 - Supplies idle screen metrics to `music_screen`.
 
-### Firefly Clock Screen
-
-Status: Implemented
-
-Files:
-
-- `firmware/main/swarm_screen.cpp`
-- `firmware/main/swarm_screen.h`
-
-Features:
-
-- Simulates 300 independently moving fireflies using fixed-point positions and velocities.
-- Attracts the swarm into large seven-segment clock digits when RTC time is available.
-- Uses gentler movement between 22:00 and 07:00.
-- Short action-button presses scatter the swarm for 1.6 seconds.
-- Long action-button presses toggle between clock formation and free-roaming behavior.
-
 ### Daily XKCD and NASA APOD Screens
 
 Status: Implemented
@@ -315,6 +296,40 @@ The firmware uses NASA's `DEMO_KEY` by default. For a private key, copy
 
 The APOD screen changes after NASA publishes a new entry and the next refresh succeeds. It does not switch exactly at local midnight; with automatic refresh enabled, a newly published image may take up to six hours to appear. Restarting the board or pressing the secondary button requests it immediately.
 
+### Rain Radar Screen
+
+Status: Implemented
+
+Files:
+
+- `firmware/main/radar_screen.cpp`
+- `firmware/main/radar_screen.h`
+- `tools/radar_landmarks.py`
+- `tools/radar_preview.py`
+- `radar-screen-design.md`
+
+Features:
+
+- Draws a 300x300 dark-field radar scope with live precipitation around a fixed home location, plus a 100-pixel panel showing the arrival time of inbound rain and the probability at +3h.
+- Runs entirely on the board. It has no dependency on the Mac or the lyrics daemon, so it keeps working while the Mac is asleep.
+- Fetches the RainViewer index, one 512-pixel radar tile, and one Open-Meteo forecast per refresh. All three endpoints are keyless.
+- Derives the tile indices and the crop window from the home coordinates at startup with Web Mercator, rather than carrying them as magic numbers.
+- Classifies RainViewer's palette by colour rather than luminance into four intensity tiers, from light rain to heavy, and draws all four. The light band is most of every frame, so it is stippled at 2/16 rather than filled; that keeps it readable as texture instead of the grey wash a denser fill produced.
+- Dithers the returns with a 4x4 Bayer matrix anchored to screen space, pre-rendered into a 1-bpp bitmap at decode time so each frame is a single bitmap blit.
+- Cross-correlates the newest frame against the previous one to measure storm motion, and draws where the rain is coming from as a radial line with a chevron on the rim, among the echoes it describes. Three gates -- enough signal, a good match, and a distinct peak -- must all pass, or the bearing and the arrival time are both withheld rather than guessed.
+- Walks an upstream corridor back from home to the first return above its own intensity floor, and reports the arrival time as `RAIN 25M`. The figure decays with the clock between frames, and Open-Meteo takes precedence on current conditions, so the panel never prints `CLEAR` while it is raining at home.
+- Refuses to time an arrival more than two hours out, showing `>2H` instead of a figure. The scope reaches 87 km, so a longer ETA means a cell moving barely faster than the noise floor of the search, over a lead time in which weather develops and decays rather than merely translating.
+- Rings the centre when a heavy contact reaches the inner range ring, 22 km out. The threshold is a ring already drawn on the scope, so the alert needs no explaining, and it is drawn solid rather than pulsed: an alert that blinks out for part of every minute is one you can miss.
+- Marks heavy rain as a radar contact: a solid dot with a ring that leaves it, expands and fades each time the sweep passes, the way a PPI scope pings a target. Contacts come from connected-component labelling of tier-3 returns with a minimum cluster size, so isolated speckle is never marked and the scope stays quiet when nothing is falling hard. The dot is a symbol rather than a footprint, sized from the cluster area but padded and clamped. It is painted by the sweep rather than standing there permanently: the beam lights it and it decays over three quarters of a turn, while the ring pings and fades in a quarter. With the beam switched off the contacts are drawn solid and static instead, so turning off the sweep costs the animation rather than the information.
+- Sweeps a 20-degree beam clockwise once a minute, phased on frame age. Its position carries no meaning; it earns its place by being what lights the aura, which is why the period is short enough for the reveal to be worth being present for. `BEAM_ENABLED` turns it off in one line, and the aura then draws flat so the legibility survives.
+- Draws range rings at 22/44/66/88 km, bearing ticks, and five labelled landmarks generated by `tools/radar_landmarks.py`.
+- Fills the centre marker when Open-Meteo reports current precipitation at home. Light drizzle sits below what the radar resolves, so this is driven by the forecast rather than the imagery.
+- Prints the capture time of the frame on screen as a `DATA HH:MM` stamp in the panel. It comes from the RainViewer frame stamp rather than the board clock, so it does not depend on SNTP having run.
+- Replaces the range label with the frame age when the newest frame is older than 25 minutes or the clock has not been set by SNTP. The sweep needs no separate stale state: 25 minutes is 2.5 revolutions, so its position already says so.
+- Fetches only while the screen is displayed, so the other screens carry no cost. Polling is aligned to the frame clock rather than free-running: RainViewer stamps every frame on a 10-minute boundary and publishes it about two minutes later, so a poll is only made once a newer stamp should plausibly exist, landing around :02, :12, :22. A publish later than the estimate stays due and is retried after a minute rather than being missed until the next period. A refresh that still finds the frame it already holds skips the tile fetch and decode entirely -- which also stops the motion solver ever correlating a frame against itself. Before SNTP has set the clock there is nothing to align to, so it falls back to a five-minute poll.
+
+`tools/radar_preview.py` renders the scope from live data on a Mac. It still mirrors the firmware's projection, tier classifier, dither, and landmark label fit. It has **not** been updated for the motion revision, so its beam timing and geometry, its panel slots, and the bearing marker no longer match the firmware.
+
 ### HTTP API on the ESP32
 
 Status: Implemented
@@ -332,7 +347,7 @@ Features:
 - Percent-decodes UTF-8 query values.
 - `GET /usage.json` returns current display state for debugging.
 - `GET /mode` returns the active firmware mode.
-- `GET /mode?set=<mode>` selects `music`, `water`, `stats`, `pomodoro`, `clock`, `pet`, `sand`, `swarm`, `comic`, or `apod`.
+- `GET /mode?set=<mode>` selects `music`, `stats`, `pomodoro`, `clock`, `sand`, `comic`, or `apod`.
 - `GET /diag/display` can show orientation, polarity, or timing diagnostic frames.
 - `GET /diag/display?pattern=clear` clears full-frame override mode.
 - `GET /ota` reports the running/next OTA slot, build time, and slot capacity.
@@ -508,7 +523,7 @@ Files:
 - `render.md`
 - `thai_font_approach.md`
 - `firmware/PLAN.md`
-- `firmware/HYDRATION_PLAN.md`
+- `firmware/HYDRATION_PLAN.md` (historical; the water screen it designed has been removed)
 - `firmware/CLAUDE_REVIEW.md`
 - `docs/lyrics-display-agent-review.md`
 
