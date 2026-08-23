@@ -648,7 +648,10 @@ void manager_task(void *)
 {
     while (true) {
         ManagerEvent event = {};
-        if (xQueueReceive(g_queue, &event, pdMS_TO_TICKS(100)) == pdTRUE) {
+        // Wi-Fi and IP events wake this immediately; the timeout only paces
+        // handle_deadlines(), which works in seconds. Polling it ten times a
+        // second was keeping the CPU busy for nothing.
+        if (xQueueReceive(g_queue, &event, pdMS_TO_TICKS(500)) == pdTRUE) {
             handle_event(event);
         }
         handle_deadlines();
@@ -735,6 +738,10 @@ extern "C" esp_err_t network_manager_start(network_service_callback_t callback, 
                         TAG, "IP event handler");
     ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_STA), TAG, "station mode");
     ESP_RETURN_ON_ERROR(esp_wifi_start(), TAG, "Wi-Fi start");
+    // Modem sleep between DTIM beacons. MIN rather than MAX on purpose: the
+    // board holds a live WebSocket for pushed lyric frames, and MAX_MODEM's
+    // longer listen interval shows up as visible lyric lag.
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_ps(WIFI_PS_MIN_MODEM));
 
     if (g_has_active) {
         snapshot_update_state(NETWORK_STATE_BOOT_CONNECTING, "Connecting to saved network");

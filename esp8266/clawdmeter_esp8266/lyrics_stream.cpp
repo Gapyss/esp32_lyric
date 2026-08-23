@@ -16,8 +16,11 @@
 // While the MUSIC screen is visible this module keeps a hand-rolled WebSocket to
 // the daemon's board port (:8766). The daemon renders 240x240 1-bpp frames with
 // Core Text (real Thai shaping, karaoke) — full frames and dirty-rect deltas.
-// Set bits are paper, clear bits ink; the full-screen album-art hero frames
-// (track intro / paused) arrive the same way and blit as a correct positive.
+// Set bits are Tend paper; clear bits are colorized by semantic screen region
+// (ember label/progress, soft metadata, moss playback state, primary lyric).
+// Color-capable clients additionally negotiate ART1: real RGB565 album art is
+// streamed directly to the TFT one row at a time after the mono UI mask. This
+// preserves the cover's source colors without a 115 KB color framebuffer.
 //
 // Memory: exactly one framebuffer (7200 B), malloc'd on the first stream and
 // freed on lyricsStreamStop(). Incoming frame bytes are applied *incrementally*
@@ -41,7 +44,8 @@
 #define LYR_ROW_BYTES   (LYR_W / 8)
 #define LYR_FRAME_BYTES (LYR_ROW_BYTES * LYR_H)
 #define LYR_ENV_HDR     28          // "LYR1" + ver/kind + 7x u16 + 2x u32
-#define LYR_MAX_PAYLOAD (LYR_ENV_HDR + LYR_FRAME_BYTES)   // largest WS frame we accept
+#define LYR_COLOR_BYTES (LYR_W * LYR_H * 2UL)
+#define LYR_MAX_PAYLOAD (LYR_ENV_HDR + LYR_COLOR_BYTES)   // full-screen ART1 overlay
 #define LYR_RETRY_MS    8000UL      // reconnect backoff
 #define LYR_CONNECT_TIMEOUT_MS 1200UL  // TCP connect budget (blocking; keep small)
 #define LYR_HANDSHAKE_TIMEOUT_MS 3000UL
@@ -103,6 +107,9 @@ static uint16_t lyrEnvX = 0, lyrEnvY = 0, lyrEnvRw = 0, lyrEnvRh = 0, lyrEnvRowB
 static uint32_t lyrEnvBodyGot = 0;      // body bytes consumed
 static uint32_t lyrEnvRowBase = 0;      // lyrFrame offset of the current row's first byte
 static uint16_t lyrEnvCol = 0;          // byte within the current row
+static bool lyrEnvColor = false;        // ART1 RGB565 overlay instead of LYR1 mask
+static uint8_t lyrColorHigh = 0;        // first byte of a network-order RGB565 pixel
+static uint16_t lyrLine[LYR_W];         // shared mono/color scanline buffer
 
 static uint16_t lyrBe16(const uint8_t *p) { return ((uint16_t)p[0] << 8) | p[1]; }
 static uint32_t lyrBe32(const uint8_t *p) {
@@ -111,19 +118,34 @@ static uint32_t lyrBe32(const uint8_t *p) {
 
 // ---- Panel blit -------------------------------------------------------------
 
-// 1-bpp (LSB-first, row-major) -> RGB565 rows on the panel. Set bit = paper,
-// clear = ink (the daemon's light theme). One 240-px line buffer, row by row;
-// a yield every 32 rows keeps the WiFi stack fed during a full-frame blit.
+// Tend semantic ink color for the compact daemon layout. The mask stays 1-bpp
+// to fit ESP8266 RAM; stable layout bands provide the richer color roles.
+static uint16_t lyrInkColorAt(int x, int y) {
+  if (y < 25) return C_MUS_EMBER;                         // eyebrow + top rule
+  if (y < 54) return C_MUS_INK;                           // title
+  if (y < 84) return C_MUS_INK_SOFT;                      // artist / cover frame
+  if (y < 100) {                                          // time + progress
+    if (x >= 62 && x <= 178) return C_MUS_EMBER;
+    return C_MUS_INK_MUTED;
+  }
+  if (y < 108) return C_MUS_PAPER_LINE;                   // lyric divider
+  if (y < 185) return C_MUS_INK;                          // active lyric
+  if (y < 224) return y < 208 ? C_MUS_INK_SOFT : C_MUS_INK_MUTED;
+  return x < 112 ? C_TND_MOSS : C_MUS_INK_MUTED;          // state + maker footer
+}
+
+// 1-bpp (LSB-first, row-major) -> Tend RGB565 rows on the panel. One shared
+// 240-px scanline, row by row; periodic yields keep the WiFi stack fed.
 static void lyrBlit(int x, int y, int w, int h) {
   if (lcdScreen != SCREEN_MUSIC || lyrFrame == nullptr) return;
-  static uint16_t line[LYR_W];
   for (int row = 0; row < h; row++) {
     const uint8_t *src = lyrFrame + (unsigned)(y + row) * LYR_ROW_BYTES;
     for (int col = 0; col < w; col++) {
       int px = x + col;
-      line[col] = ((src[px >> 3] >> (px & 7)) & 1) ? C_MUS_PAPER : C_MUS_INK;
+      lyrLine[col] = ((src[px >> 3] >> (px & 7)) & 1)
+                         ? C_MUS_PAPER : lyrInkColorAt(px, y + row);
     }
-    gfx->draw16bitRGBBitmap(x, y + row, line, w, 1);
+    gfx->draw16bitRGBBitmap(x, y + row, lyrLine, w, 1);
     if ((row & 31) == 31) yield();
   }
 }
@@ -215,11 +237,14 @@ void lyricsStreamNoteHost(const IPAddress &host) {
 // up the per-byte apply cursor. Body bytes then stream in via lyrEnvBody().
 static void lyrEnvBeginBody(void) {
   lyrEnvApply = false;
+  lyrEnvColor = false;
   lyrEnvBodyGot = 0;
   lyrEnvCol = 0;
 
   const uint8_t *d = lyrEnvHdr;
-  if (memcmp(d, "LYR1", 4) != 0 || d[4] != 1) return;   // discard body
+  const bool mono = memcmp(d, "LYR1", 4) == 0;
+  const bool color = memcmp(d, "ART1", 4) == 0;
+  if ((!mono && !color) || d[4] != 1) return;   // discard body
   const uint8_t kind = d[5];
   const uint16_t width = lyrBe16(d + 6);
   const uint16_t height = lyrBe16(d + 8);
@@ -232,6 +257,24 @@ static void lyrEnvBeginBody(void) {
 
   if (width != LYR_W || height != LYR_H) return;
   if (dataLen != lyrWsPayLen - LYR_ENV_HDR) return;
+
+  // ART1 is an immediate RGB565 rectangle. It is deliberately streamed direct
+  // to the TFT after the matching LYR1 frame, never retained in ESP8266 RAM.
+  if (color) {
+    if (kind != LYR_KIND_RECT_NOW || rw == 0 || rh == 0 ||
+        x + rw > LYR_W || y + rh > LYR_H || rowB != rw * 2U ||
+        dataLen != (uint32_t)rowB * rh || !lyrFrameValid) {
+      return;
+    }
+    lyrEnvApply = true;
+    lyrEnvColor = true;
+    lyrEnvX = x;
+    lyrEnvY = y;
+    lyrEnvRw = rw;
+    lyrEnvRh = rh;
+    lyrEnvRowB = rowB;
+    return;
+  }
 
   bool full;
   if (kind == LYR_KIND_FULL_NOW || kind == LYR_KIND_FULL_SCHED) {
@@ -275,7 +318,21 @@ static void lyrEnvBeginBody(void) {
 // Apply one streamed body byte at its position in lyrFrame (now frames only).
 static inline void lyrEnvBody(uint8_t b) {
   if (lyrEnvApply) {
-    if (lyrEnvFull) {
+    if (lyrEnvColor) {
+      const uint16_t rowByte = lyrEnvBodyGot % lyrEnvRowB;
+      if ((rowByte & 1) == 0) {
+        lyrColorHigh = b;
+      } else {
+        lyrLine[rowByte >> 1] = ((uint16_t)lyrColorHigh << 8) | b;
+        if (rowByte + 1 == lyrEnvRowB) {
+          const uint16_t row = lyrEnvBodyGot / lyrEnvRowB;
+          if (lcdScreen == SCREEN_MUSIC) {
+            gfx->draw16bitRGBBitmap(lyrEnvX, lyrEnvY + row, lyrLine, lyrEnvRw, 1);
+          }
+          if ((row & 15) == 15) yield();
+        }
+      }
+    } else if (lyrEnvFull) {
       lyrFrame[lyrEnvBodyGot] = b;
     } else {
       lyrFrame[lyrEnvRowBase + lyrEnvCol] = b;
@@ -288,6 +345,7 @@ static inline void lyrEnvBody(uint8_t b) {
 // The whole binary frame arrived: paint it if it was a NOW frame we applied.
 static void lyrEnvComplete(void) {
   if (!lyrEnvApply) return;
+  if (lyrEnvColor) return;  // already painted scanline-by-scanline
   lyrFrameValid = true;
   if (lyrEnvFull) lyrBlit(0, 0, LYR_W, LYR_H);
   else lyrBlit(lyrEnvX, lyrEnvY, lyrEnvRw, lyrEnvRh);
@@ -367,8 +425,8 @@ static void lyrPump(void) {
 
     // WS_PAY.
     if (lyrWsOpcode == 2) {
-      // Binary LYR1 frame: header first (into lyrEnvHdr), then body straight into
-      // the framebuffer.
+      // Binary LYR1/ART1 frame: header first, then body straight into the mono
+      // framebuffer or the TFT scanline buffer.
       if (lyrEnvHdrGot < LYR_ENV_HDR) {
         lyrEnvHdr[lyrEnvHdrGot++] = b;
         if (lyrEnvHdrGot == LYR_ENV_HDR) lyrEnvBeginBody();
@@ -431,7 +489,7 @@ static void lyrTryConnect(void) {
 
   char request[256];
   snprintf(request, sizeof(request),
-           "GET /board?proto=1&w=%d&h=%d HTTP/1.1\r\n"
+           "GET /board?proto=1&w=%d&h=%d&color=rgb565 HTTP/1.1\r\n"
            "Host: %s:%d\r\n"
            "Upgrade: websocket\r\n"
            "Connection: Upgrade\r\n"

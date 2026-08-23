@@ -116,6 +116,40 @@ static void draw_trend_card(u8g2_t *u8,
     }
 }
 
+// Header battery pill. `x` is the left edge of the body; the terminal nub sits
+// to its right, so the whole glyph occupies BATTERY_GLYPH_WIDTH.
+#define BATTERY_GLYPH_WIDTH 29
+
+static void draw_battery_glyph(u8g2_t *u8, int x, int y, int percent, bool valid)
+{
+    const int w = 26;
+    const int h = 13;
+    u8g2_DrawFrame(u8, x, y, w, h);
+    u8g2_DrawBox(u8, x + w, y + 4, 3, 5);
+
+    if (!valid) {
+        u8g2_DrawLine(u8, x + 3, y + h - 3, x + w - 4, y + 2);
+        return;
+    }
+    if (percent < 0) {
+        percent = 0;
+    } else if (percent > 100) {
+        percent = 100;
+    }
+    const int fill_w = (w - 4) * percent / 100;
+    if (fill_w > 0) {
+        u8g2_DrawBox(u8, x + 2, y + 2, fill_w, h - 4);
+    }
+}
+
+// Charging bolt, drawn beside the pill rather than inside it -- a filled pill
+// leaves no contrast for an inset glyph on this 1-bit panel.
+static void draw_charge_bolt(u8g2_t *u8, int x, int y)
+{
+    u8g2_DrawTriangle(u8, x + 6, y, x, y + 8, x + 5, y + 8);
+    u8g2_DrawTriangle(u8, x + 1, y + 13, x + 7, y + 5, x + 2, y + 5);
+}
+
 static void draw_stat_card(u8g2_t *u8, int x, int y, int w, int h, const char *label, const char *value)
 {
     draw_card(u8, x, y, w, h);
@@ -144,8 +178,33 @@ void stats_render_current(u8g2_t *u8)
 
     u8g2_SetFont(u8, u8g2_font_helvB14_tf);
     u8g2_DrawUTF8(u8, 14, 19, "BOARD STATS");
+
+    // Right side of the header, laid out from the edge inwards: battery pill,
+    // its percentage, a charge bolt when plugged in, then the clock.
+    int cursor = width - 14;
+    const int glyph_x = cursor - BATTERY_GLYPH_WIDTH;
+    draw_battery_glyph(u8, glyph_x, 5, g_metrics.battery_percent, g_metrics.battery_valid);
+    cursor = glyph_x - 7;
+
+    char percent_text[8];
+    if (g_metrics.battery_valid) {
+        snprintf(percent_text, sizeof(percent_text), "%d%%", g_metrics.battery_percent);
+    } else {
+        snprintf(percent_text, sizeof(percent_text), "--%%");
+    }
+    u8g2_SetFont(u8, u8g2_font_helvB10_tf);
+    const int percent_width = (int)u8g2_GetUTF8Width(u8, percent_text);
+    u8g2_DrawUTF8(u8, cursor - percent_width, 18, percent_text);
+    cursor -= percent_width + 6;
+
+    if (g_metrics.battery_valid && g_metrics.battery_trend == BOARD_BATTERY_TREND_CHARGING) {
+        draw_charge_bolt(u8, cursor - 8, 5);
+        cursor -= 14;
+    }
+
+    u8g2_SetFont(u8, u8g2_font_helvB14_tf);
     const int clock_width = (int)u8g2_GetUTF8Width(u8, clock);
-    u8g2_DrawUTF8(u8, width - 14 - clock_width, 19, clock);
+    u8g2_DrawUTF8(u8, cursor - 14 - clock_width, 19, clock);
     u8g2_DrawHLine(u8, 12, 27, width - 24);
 
     char temp_text[16];
@@ -175,16 +234,44 @@ void stats_render_current(u8g2_t *u8)
     const int left_x = 20;
     const int right_x = width - 20 - card_w;
 
-    char battery_text[16];
+    // The card carries the runtime estimate; the voltage rides along in the
+    // label, where it stays useful for sanity-checking the charge curve.
+    char battery_label[24];
     if (g_metrics.battery_valid) {
-        snprintf(battery_text, sizeof(battery_text), "%d.%02d V", g_metrics.battery_mv / 1000, (g_metrics.battery_mv / 10) % 100);
+        snprintf(battery_label,
+                 sizeof(battery_label),
+                 "BATTERY %d.%02dV",
+                 g_metrics.battery_mv / 1000,
+                 (g_metrics.battery_mv / 10) % 100);
     } else {
-        snprintf(battery_text, sizeof(battery_text), "N/A");
+        snprintf(battery_label, sizeof(battery_label), "BATTERY");
     }
+
+    char battery_text[24];
+    if (!g_metrics.battery_valid) {
+        snprintf(battery_text, sizeof(battery_text), "N/A");
+    } else if (g_metrics.battery_trend == BOARD_BATTERY_TREND_CHARGING) {
+        snprintf(battery_text, sizeof(battery_text), "CHARGING");
+    } else if (g_metrics.battery_trend == BOARD_BATTERY_TREND_DISCHARGING) {
+        const int hours = g_metrics.battery_runtime_minutes / 60;
+        const int minutes = g_metrics.battery_runtime_minutes % 60;
+        if (g_metrics.battery_runtime_minutes >= BOARD_BATTERY_RUNTIME_CAP_MINUTES) {
+            snprintf(battery_text, sizeof(battery_text), ">%dH LEFT", BOARD_BATTERY_RUNTIME_CAP_MINUTES / 60);
+        } else if (hours > 0) {
+            snprintf(battery_text, sizeof(battery_text), "%dH %02dM LEFT", hours, minutes);
+        } else {
+            snprintf(battery_text, sizeof(battery_text), "%dM LEFT", minutes);
+        }
+    } else if (g_metrics.battery_trend == BOARD_BATTERY_TREND_STEADY) {
+        snprintf(battery_text, sizeof(battery_text), "STEADY");
+    } else {
+        snprintf(battery_text, sizeof(battery_text), "ESTIMATING...");
+    }
+
     char history_text[16];
     snprintf(history_text, sizeof(history_text), "%d MIN", history.count);
 
-    draw_stat_card(u8, left_x, card_y, card_w, card_h, "BATTERY", battery_text);
+    draw_stat_card(u8, left_x, card_y, card_w, card_h, battery_label, battery_text);
     draw_stat_card(u8, right_x, card_y, card_w, card_h, "TREND SPAN", history_text);
 
     u8g2_SetFont(u8, u8g2_font_5x7_tf);

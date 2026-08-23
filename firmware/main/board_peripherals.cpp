@@ -33,6 +33,42 @@ static const int VBAT_DIVIDER_NUM = 3;
 // active, so the stats trend has data as soon as it's opened.
 static const int64_t HISTORY_SAMPLE_INTERVAL_US = 60LL * 1000000LL;
 
+// Charge curve for the single 18650 Li-ion cell in the holder, ordered full to
+// empty and interpolated between points. The pack voltage is a poor gauge on
+// its own -- it barely moves between 80% and 40% -- so the curve exists mainly
+// to linearise the reading before the runtime estimate differentiates it.
+static const struct {
+    int mv;
+    int percent;
+} VBAT_CURVE[] = {
+    {4200, 100}, {4100, 92}, {4000, 83}, {3900, 71}, {3830, 60}, {3790, 50}, {3760, 40},
+    {3730, 30},  {3690, 20}, {3630, 12}, {3540, 6},  {3420, 3},  {3200, 0},
+};
+
+// Raw ADC reads swing by tens of millivolts between frames; this smooths them
+// before anything downstream looks at the value.
+static const float VBAT_SMOOTHING = 0.125f;
+
+// Runtime is estimated by fitting a line through the recent charge level and
+// extrapolating it to empty, which sidesteps having to know the pack capacity
+// or the current draw (both of which swing with WiFi and backlight anyway).
+#define BATTERY_TREND_CAPACITY 60
+static const int64_t BATTERY_TREND_INTERVAL_US = 60LL * 1000000LL;
+static const int64_t BATTERY_TREND_MIN_SPAN_US = 15LL * 60LL * 1000000LL;
+// Past this much history with no visible movement, the drain really is too
+// slow to name -- report STEADY rather than leaving "estimating" up forever.
+static const int64_t BATTERY_TREND_SETTLED_SPAN_US = 45LL * 60LL * 1000000LL;
+// In the flat middle of the curve one percent of charge is only ~3.5 mV, which
+// is the same order as the residual ADC noise after smoothing. So the fit also
+// waits for the charge level to have visibly *moved* -- elapsed time alone
+// would happily fit a line through pure noise and report a confident number.
+// This self-adjusts: a heavy drain qualifies in minutes, a light one waits.
+static const float BATTERY_MIN_TREND_CHANGE_PCT = 3.0f;
+// Below this the drain is lost in the noise of the fit, so it reports STEADY
+// rather than an implausible multi-day figure.
+static const float BATTERY_MIN_DRAIN_PCT_PER_HOUR = 2.0f;
+static const int BATTERY_MAX_RUNTIME_MINUTES = BOARD_BATTERY_RUNTIME_CAP_MINUTES;
+
 static i2c_master_bus_handle_t g_i2c_bus;
 static i2c_master_dev_handle_t g_rtc_dev;
 static i2c_master_dev_handle_t g_shtc3_dev;
@@ -40,6 +76,16 @@ static i2c_master_dev_handle_t g_shtc3_dev;
 static adc_oneshot_unit_handle_t g_adc_handle;
 static adc_cali_handle_t g_adc_cali_handle;
 static bool g_adc_cali_ok;
+
+// Battery state is only ever touched from board_peripherals_read(), which the
+// single render task drives, so unlike the env history it needs no mutex.
+static float g_battery_mv_smoothed;
+static bool g_battery_smoothed_valid;
+static int64_t g_battery_trend_us[BATTERY_TREND_CAPACITY];
+static float g_battery_trend_percent[BATTERY_TREND_CAPACITY];
+static int g_battery_trend_count;
+static int g_battery_trend_head;
+static int64_t g_last_battery_trend_us;
 
 static SemaphoreHandle_t g_history_mutex;
 static int g_history_temp[BOARD_HISTORY_CAPACITY];
@@ -201,6 +247,95 @@ static void read_shtc3(BoardIdleMetrics *metrics)
     metrics->env_valid = true;
 }
 
+static float battery_percent_from_mv(float mv)
+{
+    const int points = (int)(sizeof(VBAT_CURVE) / sizeof(VBAT_CURVE[0]));
+    if (mv >= (float)VBAT_CURVE[0].mv) {
+        return 100.0f;
+    }
+    for (int i = 1; i < points; i++) {
+        if (mv >= (float)VBAT_CURVE[i].mv) {
+            const float span_mv = (float)(VBAT_CURVE[i - 1].mv - VBAT_CURVE[i].mv);
+            const float span_pct = (float)(VBAT_CURVE[i - 1].percent - VBAT_CURVE[i].percent);
+            return (float)VBAT_CURVE[i].percent + span_pct * (mv - (float)VBAT_CURVE[i].mv) / span_mv;
+        }
+    }
+    return 0.0f;
+}
+
+static void push_battery_trend(int64_t now_us, float percent)
+{
+    if (g_last_battery_trend_us != 0 && now_us - g_last_battery_trend_us < BATTERY_TREND_INTERVAL_US) {
+        return;
+    }
+    g_last_battery_trend_us = now_us;
+
+    int idx;
+    if (g_battery_trend_count < BATTERY_TREND_CAPACITY) {
+        idx = (g_battery_trend_head + g_battery_trend_count) % BATTERY_TREND_CAPACITY;
+        g_battery_trend_count++;
+    } else {
+        idx = g_battery_trend_head;
+        g_battery_trend_head = (g_battery_trend_head + 1) % BATTERY_TREND_CAPACITY;
+    }
+    g_battery_trend_us[idx] = now_us;
+    g_battery_trend_percent[idx] = percent;
+}
+
+// Classifies the recent charge trend by least-squares fitting charge level
+// against wall time. On a measurable drain the slope (percent per hour,
+// negative) lands in `slope_out`. The samples carry real timestamps rather
+// than being assumed one-a-minute, because screens that never call
+// board_peripherals_read() (comic, apod) leave gaps in the series whenever
+// they are on top.
+static BoardBatteryTrend battery_classify_trend(float *slope_out)
+{
+    if (g_battery_trend_count < 3) {
+        return BOARD_BATTERY_TREND_UNKNOWN;
+    }
+    const int oldest = g_battery_trend_head;
+    const int newest = (g_battery_trend_head + g_battery_trend_count - 1) % BATTERY_TREND_CAPACITY;
+    const int64_t span_us = g_battery_trend_us[newest] - g_battery_trend_us[oldest];
+    if (span_us < BATTERY_TREND_MIN_SPAN_US) {
+        return BOARD_BATTERY_TREND_UNKNOWN;
+    }
+
+    const float change = g_battery_trend_percent[newest] - g_battery_trend_percent[oldest];
+    if (change > -BATTERY_MIN_TREND_CHANGE_PCT && change < BATTERY_MIN_TREND_CHANGE_PCT) {
+        // The level hasn't visibly moved. Only call that steady once the window
+        // is long enough that a drain worth naming would have surfaced by now;
+        // before that it's still just warming up.
+        return span_us >= BATTERY_TREND_SETTLED_SPAN_US ? BOARD_BATTERY_TREND_STEADY
+                                                        : BOARD_BATTERY_TREND_UNKNOWN;
+    }
+
+    const double base_us = (double)g_battery_trend_us[oldest];
+    double sum_h = 0.0, sum_p = 0.0, sum_hh = 0.0, sum_hp = 0.0;
+    for (int i = 0; i < g_battery_trend_count; i++) {
+        const int idx = (g_battery_trend_head + i) % BATTERY_TREND_CAPACITY;
+        const double hours = ((double)g_battery_trend_us[idx] - base_us) / 3600000000.0;
+        const double percent = (double)g_battery_trend_percent[idx];
+        sum_h += hours;
+        sum_p += percent;
+        sum_hh += hours * hours;
+        sum_hp += hours * percent;
+    }
+    const double n = (double)g_battery_trend_count;
+    const double denom = n * sum_hh - sum_h * sum_h;
+    if (denom <= 0.0) {
+        return BOARD_BATTERY_TREND_UNKNOWN;
+    }
+    const float slope = (float)((n * sum_hp - sum_h * sum_p) / denom);
+    if (slope > BATTERY_MIN_DRAIN_PCT_PER_HOUR) {
+        return BOARD_BATTERY_TREND_CHARGING;
+    }
+    if (slope < -BATTERY_MIN_DRAIN_PCT_PER_HOUR) {
+        *slope_out = slope;
+        return BOARD_BATTERY_TREND_DISCHARGING;
+    }
+    return BOARD_BATTERY_TREND_STEADY;
+}
+
 static void read_battery(BoardIdleMetrics *metrics)
 {
     if (g_adc_handle == NULL) {
@@ -213,12 +348,36 @@ static void read_battery(BoardIdleMetrics *metrics)
         return;
     }
     int pin_mv = 0;
+    int pack_mv;
     if (g_adc_cali_ok && adc_cali_raw_to_voltage(g_adc_cali_handle, raw, &pin_mv) == ESP_OK) {
-        metrics->battery_mv = pin_mv * VBAT_DIVIDER_NUM;
+        pack_mv = pin_mv * VBAT_DIVIDER_NUM;
     } else {
-        metrics->battery_mv = (raw * 3300 / 4095) * VBAT_DIVIDER_NUM;
+        pack_mv = (raw * 3300 / 4095) * VBAT_DIVIDER_NUM;
     }
+
+    if (!g_battery_smoothed_valid) {
+        g_battery_mv_smoothed = (float)pack_mv;
+        g_battery_smoothed_valid = true;
+    } else {
+        g_battery_mv_smoothed += VBAT_SMOOTHING * ((float)pack_mv - g_battery_mv_smoothed);
+    }
+
+    const float percent = battery_percent_from_mv(g_battery_mv_smoothed);
+    metrics->battery_mv = (int)(g_battery_mv_smoothed + 0.5f);
+    metrics->battery_percent = (int)(percent + 0.5f);
     metrics->battery_valid = true;
+
+    push_battery_trend(esp_timer_get_time(), percent);
+
+    float slope = 0.0f;
+    metrics->battery_trend = battery_classify_trend(&slope);
+    if (metrics->battery_trend == BOARD_BATTERY_TREND_DISCHARGING) {
+        int minutes = (int)(percent / -slope * 60.0f + 0.5f);
+        if (minutes > BATTERY_MAX_RUNTIME_MINUTES) {
+            minutes = BATTERY_MAX_RUNTIME_MINUTES;
+        }
+        metrics->battery_runtime_minutes = minutes;
+    }
 }
 
 static void push_history_locked(int temperature_c_x10, int humidity_x10)

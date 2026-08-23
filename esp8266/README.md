@@ -20,7 +20,7 @@ Mac daemon ──poll 60s──> api.anthropic.com   (reads usage headers)
    └── HTTP POST /usage + /nowplaying + /daily ──> ESP8266 ──serves──> dashboard
 
 lyrics daemon (lyrics_display_daemon.py, optional)
-   └── WebSocket :8766 ──240x240 1-bit frames──> ESP8266 MUSIC screen
+   └── WebSocket :8766 ──1-bit UI + RGB565 cover art──> ESP8266 MUSIC screen
 ```
 
 Your Anthropic OAuth token never leaves the Mac. The device only receives
@@ -35,7 +35,7 @@ gestures became dashboard controls):
 | Screen | What it shows / does |
 |---|---|
 | `clock` | Time from the daemon push (no RTC/NTP needed once pushed) |
-| `music` | Streamed lyrics screen, rendered **only** by the Mac's `lyrics_display_daemon.py`: a 240×240 frame stream (Core Text Thai shaping + syllable karaoke, same pipeline as the ESP32). When no frame is flowing (daemon off, Mac asleep, no track) it shows a simple paper placeholder — there is no on-device now-playing renderer |
+| `music` | Streamed lyrics screen, rendered **only** by the Mac's `lyrics_display_daemon.py`: a Tend-color 240×240 UI (Core Text Thai shaping + syllable karaoke) with real-color album covers. When no frame is flowing (daemon off, Mac asleep, no track) it shows a simple paper placeholder — there is no on-device now-playing renderer |
 | `pomodoro` | Focus timer — start/pause/reset from the dashboard |
 | `water` | Hydration reminders — log drinks, snooze, configurable window |
 | `stats` | Claude usage + Mac metrics trend |
@@ -127,7 +127,10 @@ python3 daemon/claudemeter_daemon.py
   rendered entirely by the lyrics daemon (`daemon/lyrics_display_daemon.py` +
   the browser extension) running on the same Mac — Mac-rendered 240×240 frames
   with real Thai shaping and syllable-karaoke highlighting over WebSocket
-  (`:8766/board?w=240&h=240`). The device learns the Mac's IP from the
+  (`:8766/board?w=240&h=240&color=rgb565`). Lyrics remain a memory-efficient
+  1-bit semantic mask that the device maps to the Tend palette; cover art is a
+  negotiated RGB565 overlay streamed straight to the TFT one scanline at a
+  time. The device learns the Mac's IP from the
   `/usage`//`/nowplaying` pushes and dials back. There is no on-device
   now-playing renderer: if the stream drops (Mac asleep, daemon stopped) the
   screen shows a paper placeholder and reconnects on its own within seconds.

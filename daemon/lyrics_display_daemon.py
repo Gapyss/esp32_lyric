@@ -25,6 +25,7 @@ import math
 import os
 import re
 import shutil
+import signal
 import socket
 import sqlite3
 import struct
@@ -72,6 +73,13 @@ FRAME_KIND_FULL_SCHEDULED = 2
 FRAME_KIND_RECT_NOW = 3
 FRAME_KIND_RECT_SCHEDULED = 4
 FRAME_ENVELOPE_STRUCT = struct.Struct("!4sBBHHHHHHHII")
+# Optional RGB565 album-art overlay. Color-capable boards negotiate this with
+# ``color=rgb565`` on /board. ART1 intentionally reuses the LYR1 geometry header
+# so tiny clients can share one incremental WebSocket parser; its payload is
+# big-endian RGB565 (two bytes per pixel), row-major, and is always immediate.
+COLOR_ENVELOPE_MAGIC = b"ART1"
+COLOR_ENVELOPE_VERSION = 1
+COLOR_KIND_RECT_NOW = 3
 SEC2_MAGIC = b"SEC2"
 SEC2_VERSION = 1
 SEC2_TEXT = 1
@@ -211,15 +219,18 @@ class TrackInfo:
 
 @dataclass(frozen=True)
 class CoverArt:
-    """A track's album art, already dithered to 1-bit for the mono panel.
+    """A track's album art decoded for mono and color boards.
 
     ``bits`` holds one byte per pixel (0 or 1, row-major, top-origin), lit=1.
     The renderer blits it into a reserved square rect after the theme decision,
     so a photo keeps its natural tonality in both light and dark themes.
+    ``rgb565`` is the same image as big-endian RGB565. It is optional so old
+    cache fixtures and geometry-only renderers remain compatible.
     """
 
     size: int
     bits: bytes
+    rgb565: bytes = b""
 
 
 @dataclass
@@ -371,6 +382,19 @@ class DirtyRect:
     @property
     def bytes(self) -> int:
         return len(self.payload)
+
+
+@dataclass(frozen=True)
+class ColorRect:
+    x: int
+    y: int
+    width: int
+    height: int
+    payload: bytes
+
+    @property
+    def row_bytes(self) -> int:
+        return self.width * 2
 
 
 @dataclass(frozen=True)
@@ -683,14 +707,20 @@ def blit_cover(frame: bytes, cover: CoverArt, profile: RenderProfile) -> bytes:
     buf = bytearray(frame)
     row_bytes = profile.width // 8
     size = cover.size
+    origin_x = place.x + (place.size - size) // 2
+    origin_y = place.y + (place.size - size) // 2
     for row in range(size):
-        fy = place.y + row
+        fy = origin_y + row
+        if not (place.y <= fy < place.y + place.size):
+            continue
         if not (0 <= fy < profile.height):
             continue
         base = fy * row_bytes
         src_row = row * size
         for col in range(size):
-            fx = place.x + col
+            fx = origin_x + col
+            if not (place.x <= fx < place.x + place.size):
+                continue
             if not (0 <= fx < profile.width):
                 continue
             mask = 1 << (fx & 7)
@@ -702,6 +732,82 @@ def blit_cover(frame: bytes, cover: CoverArt, profile: RenderProfile) -> bytes:
     return bytes(buf)
 
 
+def color_cover_rect(
+    cover: CoverArt,
+    profile: RenderProfile,
+    *,
+    slot_x: int,
+    slot_y: int,
+    slot_width: int,
+    slot_height: int,
+) -> ColorRect | None:
+    """Center and clip a cover into a screen-space slot as RGB565.
+
+    This deliberately does not scale: covers are decoded at the largest size
+    needed by connected profiles, so a smaller profile center-crops the shared
+    decode just like the 1-bit hero path. The returned bytes include only the
+    visible intersection and can be streamed straight to a TFT one row at a
+    time without a color framebuffer.
+    """
+    size = cover.size
+    if size <= 0 or len(cover.rgb565) != size * size * 2:
+        return None
+    origin_x = slot_x + (slot_width - size) // 2
+    origin_y = slot_y + (slot_height - size) // 2
+    left = max(0, slot_x, origin_x)
+    top = max(0, slot_y, origin_y)
+    right = min(profile.width, slot_x + slot_width, origin_x + size)
+    bottom = min(profile.height, slot_y + slot_height, origin_y + size)
+    if right <= left or bottom <= top:
+        return None
+    width = right - left
+    height = bottom - top
+    src_x = left - origin_x
+    src_y = top - origin_y
+    payload = bytearray(width * height * 2)
+    dst = 0
+    for row in range(height):
+        start = ((src_y + row) * size + src_x) * 2
+        count = width * 2
+        payload[dst : dst + count] = cover.rgb565[start : start + count]
+        dst += count
+    return ColorRect(left, top, width, height, bytes(payload))
+
+
+def composite_rgb565_chip(
+    rect: ColorRect,
+    value: bytes,
+    chip_mask: bytes,
+    chip_x: int,
+    chip_y: int,
+    chip_w: int,
+    chip_h: int,
+    *,
+    paper: int = 0xFF9C,
+    ink: int = 0x18E2,
+) -> ColorRect:
+    """Apply the mono PAUSED pill to an RGB565 cover using Tend colors."""
+    payload = bytearray(rect.payload)
+    chip_row_bytes = (chip_w + 7) // 8
+    left = max(rect.x, chip_x)
+    top = max(rect.y, chip_y)
+    right = min(rect.x + rect.width, chip_x + chip_w)
+    bottom = min(rect.y + rect.height, chip_y + chip_h)
+    for sy in range(top, bottom):
+        cy = sy - chip_y
+        for sx in range(left, right):
+            cx = sx - chip_x
+            bit = 1 << (cx & 7)
+            src = cy * chip_row_bytes + (cx >> 3)
+            if not (chip_mask[src] & bit):
+                continue
+            color = paper if value[src] & bit else ink
+            dst = ((sy - rect.y) * rect.width + (sx - rect.x)) * 2
+            payload[dst] = color >> 8
+            payload[dst + 1] = color & 0xFF
+    return ColorRect(rect.x, rect.y, rect.width, rect.height, bytes(payload))
+
+
 def profile_from_board_path(path: str) -> RenderProfile:
     query = parse_qs(urlparse(path).query)
     try:
@@ -710,6 +816,11 @@ def profile_from_board_path(path: str) -> RenderProfile:
     except ValueError:
         return DEFAULT_PROFILE
     return PROFILES_BY_SIZE.get((width, height), DEFAULT_PROFILE)
+
+
+def board_wants_rgb565(path: str) -> bool:
+    query = parse_qs(urlparse(path).query)
+    return (query.get("color") or [""])[0].lower() == "rgb565"
 
 
 def fit_lyric_layout(
@@ -862,6 +973,24 @@ def make_frame_envelope(
         len(payload),
     )
     return header + payload
+
+
+def make_color_envelope(rect: ColorRect, profile: RenderProfile) -> bytes:
+    header = FRAME_ENVELOPE_STRUCT.pack(
+        COLOR_ENVELOPE_MAGIC,
+        COLOR_ENVELOPE_VERSION,
+        COLOR_KIND_RECT_NOW,
+        profile.width,
+        profile.height,
+        rect.x,
+        rect.y,
+        rect.width,
+        rect.height,
+        rect.row_bytes,
+        0,
+        len(rect.payload),
+    )
+    return header + rect.payload
 
 
 class LyricsStore:
@@ -1277,6 +1406,7 @@ class CoreTextFrameRenderer(FrameRenderer):
         self.NSString = NSString
         self.font_name = font_name
         self.color_space = Quartz.CGColorSpaceCreateDeviceGray()
+        self.rgb_color_space = Quartz.CGColorSpaceCreateDeviceRGB()
         self.brand_fonts = self._load_brand_fonts()
         # Height of the frame currently being rendered; the Core Text primitives
         # need it to flip top-origin layout coords into Quartz's bottom-origin
@@ -1330,7 +1460,7 @@ class CoreTextFrameRenderer(FrameRenderer):
         return pack_1bpp(pixels, profile.width, profile.height, stride)
 
     def decode_cover(self, data: bytes, size: int) -> CoverArt | None:
-        """Decode image bytes, center-crop square, downscale, dither to 1-bit.
+        """Decode, center-crop and downscale cover art for mono and RGB565.
 
         Runs off the event loop (called via asyncio.to_thread). It only touches
         the immutable color space and local Core Graphics contexts, so it is safe
@@ -1354,8 +1484,12 @@ class CoreTextFrameRenderer(FrameRenderer):
         crop = q.CGImageCreateWithImageInRect(
             image, q.CGRectMake((iw - side) // 2, (ih - side) // 2, side, side)
         )
+        # A fixed RGBA byte order gives us stable channel positions across
+        # architectures. The same decoded pixels feed the legacy 1-bit dither
+        # and the ESP8266's true-color overlay.
+        bitmap_info = q.kCGImageAlphaPremultipliedLast | q.kCGBitmapByteOrder32Big
         ctx = q.CGBitmapContextCreate(
-            None, size, size, 8, 0, self.color_space, q.kCGImageAlphaNone
+            None, size, size, 8, size * 4, self.rgb_color_space, bitmap_info
         )
         if ctx is None:
             return None
@@ -1366,8 +1500,24 @@ class CoreTextFrameRenderer(FrameRenderer):
         stride = int(q.CGImageGetBytesPerRow(out))
         # Core Graphics bitmap memory is top-origin (row 0 = top), matching the
         # frame buffer, so no vertical flip is needed here.
-        gray = [pixels[y * stride + x] for y in range(size) for x in range(size)]
-        return CoverArt(size=size, bits=floyd_steinberg_1bit(gray, size, size))
+        gray: list[int] = []
+        rgb565 = bytearray(size * size * 2)
+        dst = 0
+        for y in range(size):
+            row = y * stride
+            for x in range(size):
+                src_px = row + x * 4
+                r, g, b = pixels[src_px], pixels[src_px + 1], pixels[src_px + 2]
+                gray.append((77 * r + 150 * g + 29 * b) >> 8)
+                color = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
+                rgb565[dst] = color >> 8
+                rgb565[dst + 1] = color & 0xFF
+                dst += 2
+        return CoverArt(
+            size=size,
+            bits=floyd_steinberg_1bit(gray, size, size),
+            rgb565=bytes(rgb565),
+        )
 
     def render_pause_chip(self, profile: RenderProfile) -> tuple[bytes, bytes, int, int]:
         """Render the small PAUSED chip stamped over paused full-screen art.
@@ -1953,7 +2103,9 @@ class WebSocketConnection:
         self.writer = writer
         self.write_lock = asyncio.Lock()
         self.board_frame_base: bytes | None = None
+        self.board_color_key: tuple[int, int, int, int, bytes] | None = None
         self.profile: RenderProfile = DEFAULT_PROFILE
+        self.supports_rgb565 = False
         self.tx_key: bytes | None = None
         self.rx_key: bytes | None = None
         self.tx_sequence = 0
@@ -2522,9 +2674,15 @@ class LyricsDisplayDaemon:
             elif self.identity is not None and not self.allow_legacy_proto1:
                 raise ValueError("legacy protocol is disabled")
             conn.profile = profile_from_board_path(path)
-            await conn.send_text({"type": "hello", "proto": 2 if conn.tx_key else 1,
-                                  "daemonUuid": self.identity.daemon_uuid if self.identity else "",
-                                  "width": conn.profile.width, "height": conn.profile.height})
+            conn.supports_rgb565 = board_wants_rgb565(path)
+            hello: dict[str, Any] = {
+                "type": "hello", "proto": 2 if conn.tx_key else 1,
+                "daemonUuid": self.identity.daemon_uuid if self.identity else "",
+                "width": conn.profile.width, "height": conn.profile.height,
+            }
+            if conn.supports_rgb565:
+                hello["coverFormat"] = "rgb565be"
+            await conn.send_text(hello)
             ready = await asyncio.wait_for(conn.recv_application(), AUTH_TIMEOUT_SECONDS)
             if ready is None or ready[0] != 1:
                 raise ValueError("missing protected ready")
@@ -2536,7 +2694,8 @@ class LyricsDisplayDaemon:
                 raise ValueError("invalid legacy ready")
             conn.start_sender()
             self.boards.add(conn)
-            print(f"board connected ({conn.profile.name}, proto={'2' if conn.tx_key else '1'})")
+            color_note = ", color=rgb565" if conn.supports_rgb565 else ""
+            print(f"board connected ({conn.profile.name}, proto={'2' if conn.tx_key else '1'}{color_note})")
             # A board may have joined after the track was set; fetch its cover now
             # (no-op if already cached). Also covers the case where the header art
             # is present but this board needs a not-yet-decoded full-screen size.
@@ -2632,9 +2791,11 @@ class LyricsDisplayDaemon:
                 self.state.dirty = False
                 plan = None
                 frames = None
+                display_state = None
             else:
                 profiles = self._active_profiles()
-                frames = {profile.name: self._render(self.state, profile) for profile in profiles}
+                display_state = self.state.at_position(self.state.clock.interpolated_position())
+                frames = {profile.name: self._render(display_state, profile) for profile in profiles}
                 self.state.dirty = False
                 plan = self._next_scheduled_frame_locked(profiles)
         if frames is None:
@@ -2642,7 +2803,7 @@ class LyricsDisplayDaemon:
             await self.broadcast_clear()
             return
         self.last_frames.update(frames)
-        await self.broadcast_frames(frames, now=True, swap_in_ms=0)
+        await self.broadcast_frames(frames, now=True, swap_in_ms=0, display_state=display_state)
         await self.arm_scheduled_frame(plan, generation)
 
     async def broadcast_clear(self) -> None:
@@ -2659,6 +2820,7 @@ class LyricsDisplayDaemon:
     async def send_clear(self, conn: WebSocketConnection) -> None:
         await conn.send_text({"type": "clear"})
         conn.board_frame_base = None
+        conn.board_color_key = None
 
     async def send_current_frame(self, conn: WebSocketConnection, now: bool) -> None:
         profile = conn.profile
@@ -2669,19 +2831,24 @@ class LyricsDisplayDaemon:
                 frame = None
                 plan = None
             else:
+                display_state = self.state.at_position(self.state.clock.interpolated_position())
                 frame = self.last_frames.get(profile.name)
                 if frame is None:
-                    frame = self._render(self.state, profile)
+                    frame = self._render(display_state, profile)
                     self.last_frames[profile.name] = frame
                 plan = self._next_scheduled_frame_locked([profile])
         if not has_track or frame is None:
             await self.send_clear(conn)
             return
-        await self.send_frame(conn, frame, now=now, swap_in_ms=0)
+        painted = await self.send_frame(conn, frame, now=now, swap_in_ms=0)
+        if now:
+            await self.send_color_cover(conn, display_state, painted)
         if plan is not None:
             await self.send_frame(conn, plan.frames[profile.name], now=False, swap_in_ms=plan.swap_in_ms)
 
-    async def send_frame(self, conn: WebSocketConnection, frame: bytes, now: bool, swap_in_ms: int) -> None:
+    async def send_frame(
+        self, conn: WebSocketConnection, frame: bytes, now: bool, swap_in_ms: int
+    ) -> tuple[int, int, int, int] | None:
         profile = conn.profile
         # The board already shows this exact frame -- skip the resend. Without
         # this, a paused re-render (theme toggle, a late cover resolve) would push
@@ -2689,7 +2856,7 @@ class LyricsDisplayDaemon:
         # frames: scheduled frames are now=False, and a fresh/cleared board has
         # board_frame_base=None so it still gets the frame.
         if now and swap_in_ms <= 0 and conn.board_frame_base == frame:
-            return
+            return None
         rect = (
             dirty_rect(conn.board_frame_base, frame, profile.width, profile.height)
             if now and swap_in_ms <= 0
@@ -2710,7 +2877,7 @@ class LyricsDisplayDaemon:
             )
             await conn.send_binary(envelope)
             conn.board_frame_base = frame
-            return
+            return (rect.x, rect.y, rect.width, rect.height)
 
         kind = FRAME_KIND_FULL_NOW if now else FRAME_KIND_FULL_SCHEDULED
         envelope = make_frame_envelope(
@@ -2728,6 +2895,77 @@ class LyricsDisplayDaemon:
         await conn.send_binary(envelope)
         if now and swap_in_ms <= 0:
             conn.board_frame_base = frame
+            return (0, 0, profile.width, profile.height)
+        return None
+
+    def _color_cover_for_state(self, state: AppState, profile: RenderProfile) -> ColorRect | None:
+        hero = (
+            state.in_album_art_intro()
+            or (
+                state.clock.paused
+                and state.track.title
+                and state.hero_cover is not None
+                and hasattr(self.renderer, "render_pause_chip")
+            )
+        )
+        if hero and state.hero_cover is not None:
+            rect = color_cover_rect(
+                state.hero_cover,
+                profile,
+                slot_x=0,
+                slot_y=0,
+                slot_width=profile.width,
+                slot_height=profile.height,
+            )
+            if rect is None or not state.clock.paused or not hasattr(self.renderer, "render_pause_chip"):
+                return rect
+            value, mask, chip_w, chip_h = self.renderer.render_pause_chip(profile)  # type: ignore[attr-defined]
+            cover = state.hero_cover
+            art_x = max(0, (profile.width - cover.size) // 2)
+            art_y = max(0, (profile.height - cover.size) // 2)
+            margin = 12 if profile.name == SQUARE_PROFILE.name else 14
+            return composite_rgb565_chip(
+                rect, value, mask, art_x + margin, art_y + margin, chip_w, chip_h
+            )
+
+        place = cover_placement(profile)
+        if state.cover is None or not state.track.title or place is None:
+            return None
+        return color_cover_rect(
+            state.cover,
+            profile,
+            slot_x=place.x,
+            slot_y=place.y,
+            slot_width=place.size,
+            slot_height=place.size,
+        )
+
+    async def send_color_cover(
+        self,
+        conn: WebSocketConnection,
+        state: AppState,
+        painted: tuple[int, int, int, int] | None,
+    ) -> None:
+        """Restore true-color art after a mono frame/rect touches its pixels."""
+        if not conn.supports_rgb565:
+            return
+        rect = self._color_cover_for_state(state, conn.profile)
+        if rect is None:
+            conn.board_color_key = None
+            return
+        digest = hashlib.sha256(rect.payload).digest()
+        key = (rect.x, rect.y, rect.width, rect.height, digest)
+        touched = False
+        if painted is not None:
+            px, py, pw, ph = painted
+            touched = not (
+                px + pw <= rect.x or rect.x + rect.width <= px
+                or py + ph <= rect.y or rect.y + rect.height <= py
+            )
+        if not touched and conn.board_color_key == key:
+            return
+        await conn.send_binary(make_color_envelope(rect, conn.profile))
+        conn.board_color_key = key
 
     def _next_scheduled_frame_locked(self, profiles: list[RenderProfile]) -> ScheduledFrame | None:
         # While hero art hides the lyrics, the next visible change is the end of
@@ -2751,7 +2989,13 @@ class LyricsDisplayDaemon:
             due_monotonic_ms=monotonic_ms() + remaining_ms,
         )
 
-    async def broadcast_frames(self, frames: dict[str, bytes], now: bool, swap_in_ms: int) -> None:
+    async def broadcast_frames(
+        self,
+        frames: dict[str, bytes],
+        now: bool,
+        swap_in_ms: int,
+        display_state: AppState | None = None,
+    ) -> None:
         dead: list[WebSocketConnection] = []
         # Snapshot: send_frame awaits, during which a board may connect/disconnect
         # and mutate self.boards, which would raise "Set changed size during iteration".
@@ -2762,7 +3006,9 @@ class LyricsDisplayDaemon:
                 # send_current_frame sync covers it.
                 continue
             try:
-                await self.send_frame(board, frame, now=now, swap_in_ms=swap_in_ms)
+                painted = await self.send_frame(board, frame, now=now, swap_in_ms=swap_in_ms)
+                if now and display_state is not None:
+                    await self.send_color_cover(board, display_state, painted)
             except OSError:
                 dead.append(board)
         for board in dead:
@@ -2920,11 +3166,36 @@ class DnsSdAdvertiser:
         self._send_announcement()
         print(f"mDNS advertisement: {self.instance}.{self.service}.{self.proto}.local:{self.port}")
 
+    def _reap_stale_dns_sd(self) -> None:
+        # A daemon that exits without unwinding never reaches stop(), so its
+        # dns-sd -R child survives reparented to init and keeps advertising a
+        # stale TXT record. Because every run registers the same instance name,
+        # Bonjour lets the oldest holder own it -- boards then read the dead
+        # daemon's TXT (e.g. proto=1 from an old --insecure run), reject it, and
+        # sit in RETRY_WAIT forever. Nothing we do at shutdown can cover a
+        # SIGKILL, so clear the name at startup instead.
+        needle = f"-R {self.instance} {self.service}.{self.proto} "
+        try:
+            listing = subprocess.run(["ps", "-axo", "pid=,command="],
+                                     capture_output=True, text=True, timeout=5).stdout
+        except (OSError, subprocess.SubprocessError):
+            return
+        for line in listing.splitlines():
+            pid_text, _, command = line.strip().partition(" ")
+            if "dns-sd" not in command or needle not in command:
+                continue
+            try:
+                os.kill(int(pid_text), signal.SIGTERM)
+            except (ValueError, OSError):
+                continue
+            print(f"reaped stale dns-sd registration (pid {pid_text})")
+
     def _start_dns_sd(self) -> None:
         dns_sd = shutil.which("dns-sd")
         if dns_sd is None:
             print("dns-sd unavailable; _lyrics._tcp mDNS advertisement disabled")
             return
+        self._reap_stale_dns_sd()
         try:
             self.proc = subprocess.Popen(
                 [dns_sd, "-R", self.instance, f"{self.service}.{self.proto}", "local", str(self.port),
@@ -3115,9 +3386,28 @@ async def run(args: argparse.Namespace) -> None:
         advertiser.start()
         if legacy_advertiser is not None:
             legacy_advertiser.start()
+    # SIGTERM and SIGHUP (closed terminal) otherwise kill us outright, skipping
+    # the finally below and orphaning the dns-sd child. Turn them into a normal
+    # unwind so stop() runs. SIGKILL still can't be caught -- _reap_stale_dns_sd
+    # covers that case on the next start.
+    loop = asyncio.get_running_loop()
+    stopping = loop.create_future()
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        try:
+            loop.add_signal_handler(
+                sig, lambda: stopping.done() or stopping.set_result(None))
+        except (NotImplementedError, RuntimeError):
+            pass
     try:
         async with extension_server, board_server:
-            await asyncio.gather(extension_server.serve_forever(), board_server.serve_forever())
+            serving = [asyncio.ensure_future(extension_server.serve_forever()),
+                       asyncio.ensure_future(board_server.serve_forever())]
+            try:
+                await asyncio.wait(serving + [stopping], return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                for task in serving:
+                    task.cancel()
+                await asyncio.gather(*serving, return_exceptions=True)
     finally:
         advertiser.stop()
         if legacy_advertiser is not None:
