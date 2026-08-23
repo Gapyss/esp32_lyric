@@ -985,3 +985,43 @@ only when the outward side does not fit. Verified against all five:
 
 `tools/radar_preview.py` mirrors the new rule, so the one property
 FEATURE_INDEX still credits it with — landmark label fit — stays true.
+
+### Revision 2i — zoom becomes the single source of truth
+
+Prompted by finding `tools/radar_landmarks.py` at `ZOOM = 5` (and then `8`)
+while the firmware and the shipped landmark table were both at 7 — a 4x scale
+error waiting to be pasted in.
+
+**Ground scale is now derived.** `g_km_per_px` and `g_range_km` are computed in
+`radar_screen_init()` from `RADAR_ZOOM` and the home latitude. They were
+`0.59f` and `88` pasted in. Both feed things the screen reports as fact — the
+range footer, and the storm speed the whole ETA is built on — so a zoom change
+used to leave every label quietly lying about the imagery.
+
+The footer now reads **87 KM, not 88.** 148 px x 0.5896 km/px is 87.26; the old
+88 was a hand-rounding. Several places in this document still say 88.
+
+**Landmarks are coordinates now, not pixels.** The split that matters:
+
+| | needs | lives in |
+|---|---|---|
+| which towns | geocoding API, quadrant rule | the script |
+| where they land | `RADAR_ZOOM` | the board |
+
+`radar_project()` already ran at init to place home, so the landmarks project
+through the same maths against the same crop origin. Verified before changing
+it: 4 of the 5 reproduce the baked table exactly, `DAN CHANG` differs by 1 px
+in y from rounding.
+
+`draw_landmarks` now skips any landmark outside `SCOPE_RADIUS` — a tighter zoom
+pushes towns past the rim, and a label hanging in the corner would be a lie.
+
+The generator emits coordinates instead of pixels, so **the table can no longer
+drift out of step with the zoom it was generated at.** `tools/radar_preview.py`
+mirrors all of it.
+
+Worth knowing before changing zoom: at 8 the scope covers 44 km and only 2 of
+the current 5 landmarks are still on it — `NAKHON SAWAN`, `SING BURI` and
+`DAN CHANG` all fall off. Projection follows automatically, but the quadrant
+coverage the selection was built for does not, so a zoom change still wants the
+script re-run to pick closer towns. That is now the script's only job.

@@ -29,7 +29,10 @@ ZOOM, TILE_PX = 7, 512
 SCOPE, CENTER, RADIUS = 300, 150, 148
 ROW_BYTES = (SCOPE + 7) // 8
 PANEL_X, PANEL_W = 300, 100
-RANGE_KM = 88
+# Derived from ZOOM, mirroring radar_screen_init(). A 512 px tile covers the
+# same ground as a 256 px one at the same zoom, so its pixels are half the size.
+KM_PER_PX = 156543.03392 * math.cos(math.radians(HOME_LAT)) / (1 << ZOOM) / (TILE_PX / 256) / 1000.0
+RANGE_KM = round(RADIUS * KM_PER_PX)
 
 BAYER = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]]
 TIER_DENSITY = [2, 4, 8, 16]
@@ -38,12 +41,14 @@ TIER_FLOOR = 0  # light and above; tier 0 is stippled at 2/16
 BEAM_RAYS, BEAM_STEP_DEG, BEAM_MAX_DENSITY = 100, 0.4, 7
 STALE_AGE_SEC = 25 * 60
 
+# Coordinates, not pixels -- mirrors RADAR_LANDMARKS. Projected at render time
+# against the same crop origin as the firmware, so they follow ZOOM.
 LANDMARKS = [
-    (203, 91, "NAKHON SAWAN"),
-    (183, 152, "UTHAI THANI"),
-    (252, 245, "SING BURI"),
-    (123, 253, "DAN CHANG"),
-    (101, 138, "LAN SAK"),
+    (15.7047, 100.1372, "NAKHON SAWAN"),
+    (15.3794, 100.0245, "UTHAI THANI"),
+    (14.8879, 100.4046, "SING BURI"),
+    (14.8418, 99.6976, "DAN CHANG"),
+    (15.4529, 99.5761, "LAN SAK"),
 ]
 
 # Real u8g2 advances, read out of the font headers (max_char_width).
@@ -174,7 +179,15 @@ def main():
     # --- landmarks ---------------------------------------------------------
     small = font(7)
     problems = []
-    for lx, ly, label in LANDMARKS:
+    for mark_lat, mark_lon, label in LANDMARKS:
+        # Same origin as the firmware: tile_x * TILE_PX + crop_x reduces to
+        # round(home_x) - CENTER, so a landmark lands relative to home.
+        mark_x, mark_y = project(mark_lat, mark_lon)
+        lx = round(mark_x - (tile_x * TILE_PX + crop_x))
+        ly = round(mark_y - (tile_y * TILE_PX + crop_y))
+        if (lx - CENTER) ** 2 + (ly - CENTER) ** 2 > RADIUS * RADIUS:
+            problems.append(f"{label}: off the scope at zoom {ZOOM}")
+            continue
         width = u8g2_width(label, "5x7")
         # Mirrors draw_landmarks(): the label goes on the side AWAY from home,
         # so its knockout never blanks the corridor rain crosses on approach.
