@@ -261,6 +261,16 @@ static const int RADAR_BLIP_DOT_DENSITY = 16;
 // like. Above it the edge is what makes the dot a contact rather than a patch
 // of heavier stipple.
 static const int RADAR_BLIP_EDGE_DENSITY = 8;
+
+// A contact this close to home gets an alert ring drawn around the centre.
+// 37 px is the FIRST RANGE RING -- 22 km -- deliberately, so the threshold is
+// already drawn on the scope and needs no explaining: the alert means "there
+// is a heavy cell inside the inner ring". Distance is centroid to centre, so
+// a large cell whose edge is closer still trips it late; the ETA is what
+// reports approach, this only reports arrival in the neighbourhood.
+static const int RADAR_BLIP_NEAR_PX = 37;
+static const int RADAR_ALERT_RING_A = 10;
+static const int RADAR_ALERT_RING_B = 13;
 static const int RADAR_BLIP_RING_GAP = 3;
 static const int RADAR_BLIP_RING_EXPAND = 14;
 static const int RADAR_BLIP_RING_DENSITY = 16;
@@ -1345,6 +1355,44 @@ static void draw_dithered_circle(u8g2_t *u8, int cx, int cy, int radius, int den
     }
 }
 
+// Same halo trick as the bearing line: a 1 px knockout either side so the ring
+// reads over any density of stipple underneath it.
+static void draw_haloed_circle(u8g2_t *u8, int cx, int cy, int radius)
+{
+    u8g2_SetDrawColor(u8, 0);
+    u8g2_DrawCircle(u8, cx, cy, radius - 1, U8G2_DRAW_ALL);
+    u8g2_DrawCircle(u8, cx, cy, radius + 1, U8G2_DRAW_ALL);
+    u8g2_SetDrawColor(u8, 1);
+    u8g2_DrawCircle(u8, cx, cy, radius, U8G2_DRAW_ALL);
+}
+
+// True when a heavy contact has reached the inner range ring.
+static bool blips_near_home(void)
+{
+    for (int i = 0; i < g_blip_count; i++) {
+        const int dx = g_blips[i].x - SCOPE_CENTER;
+        const int dy = g_blips[i].y - SCOPE_CENTER;
+        if (dx * dx + dy * dy <= RADAR_BLIP_NEAR_PX * RADAR_BLIP_NEAR_PX) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Heavy rain has arrived in the neighbourhood: two rings around home, just
+// outside the centre marker's 15 px crosshair.
+//
+// Drawn solid and constant rather than pulsed with the sweep. The contacts
+// themselves are painted by the beam and decay, which is right for a target
+// -- but an alert that blinks out for a quarter of every minute is an alert
+// you can miss, and this is the one condition on the scope that matters most.
+// It also survives BEAM_ENABLED = false for the same reason.
+static void draw_close_alert(u8g2_t *u8)
+{
+    draw_haloed_circle(u8, SCOPE_CENTER, SCOPE_CENTER, RADAR_ALERT_RING_A);
+    draw_haloed_circle(u8, SCOPE_CENTER, SCOPE_CENTER, RADAR_ALERT_RING_B);
+}
+
 static void draw_dithered_disc(u8g2_t *u8, int cx, int cy, int radius, int density)
 {
     if (radius <= 0 || density <= 0) {
@@ -1780,19 +1828,24 @@ void radar_render_current(u8g2_t *u8)
         blip_lead_rad =
             (float)((-90.0 + phase / (double)BEAM_PERIOD_SEC * 360.0) * M_PI / 180.0);
     }
-    // After the beam so the contacts are not stippled over by it, and before
-    // the furniture so rings and ticks still read through.
+    draw_furniture(u8);
+    draw_landmarks(u8);
+    // After the furniture, not before it: a contact near home was being
+    // crossed out by the full-width crosshair and the range rings. A contact
+    // outranks a ring -- the landmarks already take the same liberty -- and
+    // the home marker still draws last, so home is never hidden by one.
     if (has_scope) {
         draw_blips(u8, swept, blip_lead_rad);
     }
-    draw_furniture(u8);
-    draw_landmarks(u8);
     // After the furniture: the bearing is the one mark on the scope that must
     // not be read as a range ring.
     // Withheld on stale imagery for the same reason the ETA is: the wedge and
     // the number vanish together, always.
     if (has_scope && live && g_radar.motion.valid) {
         draw_bearing(u8, g_radar.motion.bearing_rad);
+    }
+    if (has_scope && blips_near_home()) {
+        draw_close_alert(u8);
     }
     draw_home_marker(u8, g_radar.raining_home);
 

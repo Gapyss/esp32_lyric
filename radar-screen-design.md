@@ -913,3 +913,34 @@ Two details that follow from fading a dot rather than drawing it solid:
 `BEAM_ENABLED = false` still draws contacts solid and static. Turning off the
 sweep should cost the animation, not the information — and with no sweep there
 is by definition nothing to paint them.
+
+### Revision 2g — close-contact alert, and a draw-order bug
+
+**The bug.** `draw_blips` ran before `draw_furniture`, so a contact near home
+was crossed out by the full-width crosshair and the range rings — exactly the
+contact that matters most. Blips now draw *after* the furniture and landmarks.
+A contact outranks a range ring, and the landmarks already take that same
+liberty. `draw_home_marker` still runs last, so home itself is never hidden by
+a contact sitting on top of it.
+
+**The alert.** Two rings around the centre whenever a heavy contact is within
+`RADAR_BLIP_NEAR_PX`, sitting just outside the home marker's 15 px crosshair.
+
+The threshold is **37 px — the first range ring, 22 km** — chosen because it is
+already drawn on the scope. The alert then needs no legend: it means "there is
+a heavy cell inside the inner ring", and the ring it refers to is right there.
+
+Drawn **solid and constant, not pulsed with the sweep.** The contacts decay
+because that is what a painted target does, but an alert that blinks out for a
+quarter of every minute is an alert you can miss, and this is the one condition
+on the scope worth never missing. Same reason it survives
+`BEAM_ENABLED = false`.
+
+Both rings use the bearing line's halo trick — a 1 px knockout either side — so
+they read over any density of stipple underneath. A filled knockout was
+rejected: it would punch a 28 px hole in the rain right where you most want to
+see it.
+
+Known limit: distance is **centroid to centre**, so a large cell whose leading
+edge is already closer trips the alert late. The ETA is what reports approach;
+this only reports arrival in the neighbourhood.
