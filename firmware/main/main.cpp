@@ -25,17 +25,14 @@
 #include "network_manager.h"
 #include "nvs_flash.h"
 #include "ota_update.h"
-#include "pet_screen.h"
 #include "pomodoro_screen.h"
 #include "provisioning_display.h"
 #include "sand_screen.h"
 #include "stats_screen.h"
-#include "swarm_screen.h"
 #include "clock_screen.h"
 #include "comic_screen.h"
 #include "u8g2_st7305.h"
 #include "ui_error.h"
-#include "water_screen.h"
 
 static const char *TAG = "g4pys.company";
 static u8g2_st7305_t g_lcd;
@@ -199,21 +196,12 @@ static void buttons_init(void)
 
 static void action_button_short_press(AppMode mode)
 {
-    if (mode == APP_MODE_WATER) {
-        water_log_drink();
-        ESP_LOGI(TAG, "drink logged via button");
-    } else if (mode == APP_MODE_POMODORO) {
+    if (mode == APP_MODE_POMODORO) {
         pomodoro_toggle_start_pause();
         ESP_LOGI(TAG, "pomodoro start/pause toggled via button");
-    } else if (mode == APP_MODE_PET) {
-        pet_pet();
-        ESP_LOGI(TAG, "creature petted via button");
     } else if (mode == APP_MODE_SAND) {
         sand_pour();
         ESP_LOGI(TAG, "sand poured via button");
-    } else if (mode == APP_MODE_SWARM) {
-        swarm_scatter();
-        ESP_LOGI(TAG, "swarm scattered via button");
     } else if (mode == APP_MODE_COMIC) {
         comic_refresh();
         ESP_LOGI(TAG, "comic refresh requested via button");
@@ -231,9 +219,6 @@ static void action_button_long_press(AppMode mode)
     } else if (mode == APP_MODE_SAND) {
         sand_clear();
         ESP_LOGI(TAG, "sand field cleared via long-press");
-    } else if (mode == APP_MODE_SWARM) {
-        swarm_toggle_roam();
-        ESP_LOGI(TAG, "swarm roam toggled via long-press");
     }
 }
 
@@ -306,7 +291,7 @@ static bool buttons_poll(void)
         const AppMode next = app_mode_toggle();
         last_mode_action_us = now_us;
         ESP_LOGI(TAG, "BOOT button toggled mode to %s", app_mode_name(next));
-        if (next != APP_MODE_WATER && next != APP_MODE_POMODORO) {
+        if (next != APP_MODE_POMODORO) {
             audio_chime_stop();
         }
     }
@@ -381,9 +366,7 @@ static uint32_t render_period_ms(AppMode mode)
     }
     switch (mode) {
     case APP_MODE_MUSIC:  // lyrics arrive as pushed frames; latency is visible
-    case APP_MODE_PET:
     case APP_MODE_SAND:
-    case APP_MODE_SWARM:
         return RENDER_PERIOD_ANIMATED_MS;
     default:
         return RENDER_PERIOD_STATIC_MS;
@@ -425,28 +408,21 @@ static void render_task(void *arg)
                                    metrics.env_valid);
             last_metrics_us = now_us;
         }
-        // Ticks unconditionally, unlike water_tick, so a countdown started on
-        // this screen keeps advancing (and can still alert) while another
-        // screen is displayed.
+        // Ticks unconditionally, not just while the pomodoro screen is up, so a
+        // countdown started on that screen keeps advancing (and can still alert)
+        // while another screen is displayed.
         pomodoro_tick();
         u8g2_ClearBuffer(u8);
         if (network_manager_provisioning_display_active()) {
             provisioning_display_render(u8);
-        } else if (mode == APP_MODE_WATER) {
-            water_tick();
-            water_render_current(u8);
         } else if (mode == APP_MODE_STATS) {
             stats_render_current(u8);
         } else if (mode == APP_MODE_POMODORO) {
             pomodoro_render_current(u8);
         } else if (mode == APP_MODE_CLOCK) {
             clock_render_current(u8);
-        } else if (mode == APP_MODE_PET) {
-            pet_render_current(u8);
         } else if (mode == APP_MODE_SAND) {
             sand_render_current(u8);
-        } else if (mode == APP_MODE_SWARM) {
-            swarm_render_current(u8);
         } else if (mode == APP_MODE_COMIC) {
             comic_render_current(u8);
         } else if (mode == APP_MODE_APOD) {
@@ -516,13 +492,10 @@ extern "C" void app_main(void)
     app_mode_init();
     ESP_LOGI(TAG, "app mode default: %s", app_mode_name(app_mode_get()));
     music_screen_init();
-    water_screen_init();
     stats_screen_init();
     clock_screen_init();
     pomodoro_screen_init();
-    pet_screen_init();
     sand_screen_init();
-    swarm_screen_init();
     comic_screen_init();
     display_start();
     ESP_ERROR_CHECK(board_peripherals_start());

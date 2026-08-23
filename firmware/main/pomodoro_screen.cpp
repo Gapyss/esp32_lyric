@@ -137,7 +137,7 @@ static void draw_centered(u8g2_t *u8, const char *text, int y)
     u8g2_DrawUTF8(u8, (width - text_width) / 2, y, text);
 }
 
-// Same inverted-color convention as water_screen/stats_screen: this panel
+// Same inverted-color convention as stats_screen: this panel
 // renders draw color 1 as light/reflective, 0 as dark ink.
 static void begin_light_theme(u8g2_t *u8)
 {
@@ -161,7 +161,7 @@ static void draw_ring_track(u8g2_t *u8, int cx, int cy, int r_outer, int thickne
 }
 
 // Fills a clockwise pie-ring from 12 o'clock, sweeping `fraction` (0..1) of
-// the full circle -- identical to water_screen's ring helper.
+// the full circle.
 static void draw_ring_progress(u8g2_t *u8, int cx, int cy, int r_outer, int thickness, float fraction)
 {
     if (fraction <= 0.0f) {

@@ -44,7 +44,7 @@ static void refresh_if_due(void)
 
 // This panel's memory-in-pixel controller renders draw color 1 as the light/
 // reflective (paper) state and 0 as dark ink -- see the matching note in
-// stats_screen.cpp/water_screen.cpp. Every frame starts by filling the card
+// stats_screen.cpp. Every frame starts by filling the card
 // light so it reads correctly regardless of what the previous screen left.
 // This is Tend's paper surface; draw color 0 is Tend ink.
 static void begin_light_theme(u8g2_t *u8)

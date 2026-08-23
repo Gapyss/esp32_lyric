@@ -11,7 +11,7 @@ Status legend:
 
 ## Product Goal
 
-The project turns a Waveshare ESP32-S3-RLCD-4.2 board into a multi-mode 400x300 monochrome ambient display. It provides synced lyrics for music playing on a Mac alongside hydration, productivity, clock, simulation, daily comic, and astronomy screens. Audio playback stays on the Mac; the board uses its speaker only for local notification chimes.
+The project turns a Waveshare ESP32-S3-RLCD-4.2 board into a multi-mode 400x300 monochrome ambient display. It provides synced lyrics for music playing on a Mac alongside productivity, clock, simulation, daily comic, and astronomy screens. Audio playback stays on the Mac; the board uses its speaker only for local notification chimes.
 
 Primary references:
 
@@ -178,19 +178,16 @@ Files:
 - `firmware/main/app_config.h`
 - `firmware/main/main.cpp`
 
-The default screen is `water`. A short press of the BOOT button on GPIO0 cycles through:
+The default screen is `stats`. A short press of the BOOT button on GPIO0 cycles through:
 
-`music` -> `water` -> `stats` -> `pomodoro` -> `clock` -> `pet` -> `sand` -> `swarm` -> `comic` -> `apod` -> `music`
+`music` -> `stats` -> `pomodoro` -> `clock` -> `sand` -> `comic` -> `apod` -> `music`
 
 The secondary button on GPIO18 performs an action based on the active screen:
 
 | Mode | Short press | Hold for 0.8 seconds |
 |---|---|---|
-| Water | Log a drink | No action |
 | Pomodoro | Start or pause | Reset timer |
-| Pet | Pet the creature | No action |
 | Sand | Pour sand | Clear the field |
-| Swarm | Scatter the fireflies | Toggle time/roam behavior |
 | Comic | Refresh XKCD | No action |
 | APOD | Refresh NASA APOD | No action |
 
@@ -265,23 +262,6 @@ Features:
   timestamped samples, and reports charging/steady when no drain is measurable.
 - Supplies idle screen metrics to `music_screen`.
 
-### Firefly Clock Screen
-
-Status: Implemented
-
-Files:
-
-- `firmware/main/swarm_screen.cpp`
-- `firmware/main/swarm_screen.h`
-
-Features:
-
-- Simulates 300 independently moving fireflies using fixed-point positions and velocities.
-- Attracts the swarm into large seven-segment clock digits when RTC time is available.
-- Uses gentler movement between 22:00 and 07:00.
-- Short action-button presses scatter the swarm for 1.6 seconds.
-- Long action-button presses toggle between clock formation and free-roaming behavior.
-
 ### Daily XKCD and NASA APOD Screens
 
 Status: Implemented
@@ -332,7 +312,7 @@ Features:
 - Percent-decodes UTF-8 query values.
 - `GET /usage.json` returns current display state for debugging.
 - `GET /mode` returns the active firmware mode.
-- `GET /mode?set=<mode>` selects `music`, `water`, `stats`, `pomodoro`, `clock`, `pet`, `sand`, `swarm`, `comic`, or `apod`.
+- `GET /mode?set=<mode>` selects `music`, `stats`, `pomodoro`, `clock`, `sand`, `comic`, or `apod`.
 - `GET /diag/display` can show orientation, polarity, or timing diagnostic frames.
 - `GET /diag/display?pattern=clear` clears full-frame override mode.
 - `GET /ota` reports the running/next OTA slot, build time, and slot capacity.
@@ -508,7 +488,7 @@ Files:
 - `render.md`
 - `thai_font_approach.md`
 - `firmware/PLAN.md`
-- `firmware/HYDRATION_PLAN.md`
+- `firmware/HYDRATION_PLAN.md` (historical; the water screen it designed has been removed)
 - `firmware/CLAUDE_REVIEW.md`
 - `docs/lyrics-display-agent-review.md`
 
