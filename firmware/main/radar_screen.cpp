@@ -324,35 +324,59 @@ static const int64_t RETRY_INTERVAL_US = 60LL * 1000000LL;
 typedef struct {
     double lat;
     double lon;
+    int32_t population;
     const char *label;
 } RadarLandmark;
 
-// Projected once at init. Splitting the table from its pixels is the point:
-// WHICH towns needs a geocoding API and the quadrant rule, so it stays in the
-// script; WHERE they land needs only RADAR_ZOOM, so it belongs on the board.
 typedef struct {
     int16_t x;
     int16_t y;
+    const char *label;
 } RadarLandmarkPx;
 
-// Selected by tools/radar_landmarks.py, which resolves names through
-// Open-Meteo's geocoding API. Picked one per bearing quadrant: sorting by
-// population alone piles every label into the south-east and leaves half the
-// scope with nothing to read against.
+// The CANDIDATE POOL, not the selection. Coordinates and populations come from
+// Open-Meteo's geocoding API via tools/radar_landmarks.py; towns do not move,
+// so this is static data and the script is only needed to add or drop a name.
 //
-// These are COORDINATES, not pixels. The board projects them at init with the
-// same radar_project() that places home, so they follow RADAR_ZOOM on their
-// own. The old baked pixel table could -- and did -- drift out of step with
-// the zoom it was generated at.
+// The board picks from it at init, because the pick is the part that depends
+// on RADAR_ZOOM: which towns land inside the scope, and how they spread across
+// it, both change with the range. Baking a chosen five meant every zoom change
+// needed the script re-run and its output pasted back by hand -- which is how
+// the script came to be sitting at ZOOM 5, and later 8, while the shipped
+// table had been generated at 7.
 static const RadarLandmark RADAR_LANDMARKS[] = {
-    {15.7047, 100.1372, "NAKHON SAWAN"},  // N   47.1 km   41.9 deg
-    {15.3794, 100.0245, "UTHAI THANI"},   // E   19.4 km   93.5 deg
-    {14.8879, 100.4046, "SING BURI"},     // E   82.1 km  132.9 deg
-    {14.8418,  99.6976, "DAN CHANG"},     // S   62.9 km  194.4 deg
-    {15.4529,  99.5761, "LAN SAK"},       // W   29.6 km  283.7 deg
+    { 15.7047,  100.1372,   82305, "NAKHON SAWAN"},
+    { 15.3794,  100.0245,   22219, "UTHAI THANI"},
+    { 15.1864,  100.1235,   15469, "CHAI NAT"},
+    { 16.4834,   99.5215,   58787, "KAMPHAENG PHET"},
+    { 14.4742,  100.1222,   53399, "SUPHAN BURI"},
+    { 14.7981,  100.6540,   57761, "LOP BURI"},
+    { 16.4418,  100.3488,   35760, "PHICHIT"},
+    { 14.8879,  100.4046,   20046, "SING BURI"},
+    { 14.5884,  100.4528,   13738, "ANG THONG"},
+    { 16.8697,   99.1290,   24149, "TAK"},
+    { 15.2634,  100.3438,       0, "TAKHLI"},
+    { 15.0842,   99.5211,       0, "BAN RAI"},
+    { 15.4529,   99.5761,   13905, "LAN SAK"},
+    { 15.4552,  100.1353,   12271, "PHAYUHA KHIRI"},
+    { 16.0617,   99.8606,   21889, "KHANU WORALAKSABURI"},
+    { 14.8418,   99.6976,       0, "DAN CHANG"},
+    { 15.3915,   99.8415,       0, "NONG CHANG"},
+    { 17.3160,   99.8319,   19805, "SAWANKHALOK"},
+    { 16.8248,  100.2586,   62584, "PHITSANULOK"},
+    { 14.5333,  100.9167,   67763, "SARABURI"},
 };
-static const int RADAR_LANDMARK_COUNT = sizeof(RADAR_LANDMARKS) / sizeof(RADAR_LANDMARKS[0]);
-static RadarLandmarkPx g_landmark_px[sizeof(RADAR_LANDMARKS) / sizeof(RADAR_LANDMARKS[0])];
+static const int RADAR_LANDMARK_POOL = sizeof(RADAR_LANDMARKS) / sizeof(RADAR_LANDMARKS[0]);
+
+// Selection rules, ported from what the script used to apply offline.
+static const int RADAR_LANDMARK_MAX = 5;
+static const double RADAR_LANDMARK_MIN_KM = 10.0;   // nearer collides with the centre marker
+static const int RADAR_LANDMARK_RIM_PAD = 8;        // keep the label off the rim
+static const int RADAR_LANDMARK_MIN_SEP = 60;       // px, so the fifth is not crowding the four
+static const size_t RADAR_LANDMARK_MAX_CHARS = 13;  // 5x7 font: ~65 px, the widest that fits
+
+static RadarLandmarkPx g_landmark_px[RADAR_LANDMARK_MAX];
+static int g_landmark_count;
 
 typedef enum {
     RADAR_EMPTY,
@@ -422,6 +446,118 @@ static void radar_project(double lat, double lon, double *out_x, double *out_y)
     const double lat_rad = lat * M_PI / 180.0;
     *out_x = (lon + 180.0) / 360.0 * span;
     *out_y = (1.0 - log(tan(lat_rad) + 1.0 / cos(lat_rad)) / M_PI) / 2.0 * span;
+}
+
+// Picks the landmarks to draw, at init, from RADAR_LANDMARKS.
+//
+// This used to be done offline by tools/radar_landmarks.py and pasted in. It
+// depends on nothing the board cannot compute -- the pool is static, and the
+// only variable is RADAR_ZOOM -- so doing it here means changing the zoom is a
+// one-constant edit with no script step and nothing left to fall out of sync.
+//
+// Picks for SPREAD, not for size: the best town per bearing quadrant first,
+// because sorting by population alone piles every label into the east and
+// south-east and leaves half the scope with nothing to read against.
+static void select_landmarks(void)
+{
+    struct {
+        int16_t x;
+        int16_t y;
+        int quadrant;
+        int32_t population;
+        const char *label;
+    } usable[sizeof(RADAR_LANDMARKS) / sizeof(RADAR_LANDMARKS[0])];
+    int usable_count = 0;
+
+    const int rim = SCOPE_RADIUS - RADAR_LANDMARK_RIM_PAD;
+    for (int i = 0; i < RADAR_LANDMARK_POOL; i++) {
+        const RadarLandmark *mark = &RADAR_LANDMARKS[i];
+        if (strlen(mark->label) > RADAR_LANDMARK_MAX_CHARS) {
+            continue;  // wider than the 100 px the 5x7 face can carry
+        }
+        double mark_x = 0.0;
+        double mark_y = 0.0;
+        radar_project(mark->lat, mark->lon, &mark_x, &mark_y);
+        const int x = (int)lround(mark_x - (double)(g_tile_x * RADAR_TILE_PX + g_crop_x));
+        const int y = (int)lround(mark_y - (double)(g_tile_y * RADAR_TILE_PX + g_crop_y));
+        const int dx = x - SCOPE_CENTER;
+        const int dy = y - SCOPE_CENTER;
+        const double dist = sqrt((double)(dx * dx + dy * dy));
+        if (dist > rim || dist * (double)g_km_per_px < RADAR_LANDMARK_MIN_KM) {
+            continue;
+        }
+        usable[usable_count].x = (int16_t)x;
+        usable[usable_count].y = (int16_t)y;
+        // 0=N 1=E 2=S 3=W, matching the script's quadrant().
+        const double bearing = fmod(atan2((double)dx, (double)-dy) * 180.0 / M_PI + 360.0, 360.0);
+        usable[usable_count].quadrant = (int)(fmod(bearing + 45.0, 360.0) / 90.0);
+        usable[usable_count].population = mark->population;
+        usable[usable_count].label = mark->label;
+        usable_count++;
+    }
+
+    bool taken[sizeof(RADAR_LANDMARKS) / sizeof(RADAR_LANDMARKS[0])] = {};
+    g_landmark_count = 0;
+
+    // Best town per quadrant first.
+    for (int q = 0; q < 4 && g_landmark_count < RADAR_LANDMARK_MAX; q++) {
+        int best = -1;
+        for (int i = 0; i < usable_count; i++) {
+            if (usable[i].quadrant != q || taken[i]) {
+                continue;
+            }
+            if (best < 0 || usable[i].population > usable[best].population) {
+                best = i;
+            }
+        }
+        if (best >= 0) {
+            taken[best] = true;
+            g_landmark_px[g_landmark_count].x = usable[best].x;
+            g_landmark_px[g_landmark_count].y = usable[best].y;
+            g_landmark_px[g_landmark_count].label = usable[best].label;
+            g_landmark_count++;
+        }
+    }
+
+    // Top up with the largest remaining town that is not crowding one already
+    // chosen.
+    while (g_landmark_count < RADAR_LANDMARK_MAX) {
+        int best = -1;
+        for (int i = 0; i < usable_count; i++) {
+            if (taken[i] || (best >= 0 && usable[i].population <= usable[best].population)) {
+                continue;
+            }
+            bool crowded = false;
+            for (int j = 0; j < g_landmark_count; j++) {
+                const int dx = usable[i].x - g_landmark_px[j].x;
+                const int dy = usable[i].y - g_landmark_px[j].y;
+                if (dx * dx + dy * dy < RADAR_LANDMARK_MIN_SEP * RADAR_LANDMARK_MIN_SEP) {
+                    crowded = true;
+                    break;
+                }
+            }
+            if (!crowded) {
+                best = i;
+            }
+        }
+        if (best < 0) {
+            break;
+        }
+        taken[best] = true;
+        g_landmark_px[g_landmark_count].x = usable[best].x;
+        g_landmark_px[g_landmark_count].y = usable[best].y;
+        g_landmark_px[g_landmark_count].label = usable[best].label;
+        g_landmark_count++;
+    }
+
+    for (int i = 0; i < g_landmark_count; i++) {
+        ESP_LOGI(TAG,
+                 "landmark %-13s -> (%d, %d)",
+                 g_landmark_px[i].label,
+                 g_landmark_px[i].x,
+                 g_landmark_px[i].y);
+    }
+    ESP_LOGI(TAG, "landmarks: %d of %d usable, %d drawn", usable_count, RADAR_LANDMARK_POOL, g_landmark_count);
 }
 
 // ---------------------------------------------------------------- state
@@ -1339,17 +1475,9 @@ static void draw_home_marker(u8g2_t *u8, bool raining)
 static void draw_landmarks(u8g2_t *u8)
 {
     u8g2_SetFont(u8, u8g2_font_5x7_tf);
-    for (int i = 0; i < RADAR_LANDMARK_COUNT; i++) {
-        const RadarLandmark *mark = &RADAR_LANDMARKS[i];
+    for (int i = 0; i < g_landmark_count; i++) {
         const RadarLandmarkPx *at = &g_landmark_px[i];
-        // Off the scope at this zoom -- a tighter zoom can push a town past
-        // the rim, and a label hanging in the corner would be a lie.
-        const int off_x = at->x - SCOPE_CENTER;
-        const int off_y = at->y - SCOPE_CENTER;
-        if (off_x * off_x + off_y * off_y > SCOPE_RADIUS * SCOPE_RADIUS) {
-            continue;
-        }
-        const int label_width = (int)u8g2_GetUTF8Width(u8, mark->label);
+        const int label_width = (int)u8g2_GetUTF8Width(u8, at->label);
         // Place the label on the side AWAY from home, so its knockout never
         // lands in the corridor rain travels down to reach the centre. A
         // westerly landmark labelled to its right blanks exactly the strip a
@@ -1370,7 +1498,7 @@ static void draw_landmarks(u8g2_t *u8)
         u8g2_DrawBox(u8, at->x - 2, at->y - 2, 5, 5);
         u8g2_SetDrawColor(u8, 1);
         u8g2_DrawFrame(u8, at->x - 1, at->y - 1, 3, 3);
-        u8g2_DrawUTF8(u8, label_x, at->y + 3, mark->label);
+        u8g2_DrawUTF8(u8, label_x, at->y + 3, at->label);
     }
 }
 
@@ -1808,20 +1936,7 @@ void radar_screen_init(void)
     // the rounding the table did by hand.
     g_crop_x = pixel_x - g_tile_x * RADAR_TILE_PX - SCOPE_CENTER;
     g_crop_y = pixel_y - g_tile_y * RADAR_TILE_PX - SCOPE_CENTER;
-    // Landmarks project through the same maths as home, against the same crop
-    // origin, so they follow RADAR_ZOOM without the table being regenerated.
-    for (int i = 0; i < RADAR_LANDMARK_COUNT; i++) {
-        double mark_x = 0.0;
-        double mark_y = 0.0;
-        radar_project(RADAR_LANDMARKS[i].lat, RADAR_LANDMARKS[i].lon, &mark_x, &mark_y);
-        g_landmark_px[i].x = (int16_t)lround(mark_x - (double)(g_tile_x * RADAR_TILE_PX + g_crop_x));
-        g_landmark_px[i].y = (int16_t)lround(mark_y - (double)(g_tile_y * RADAR_TILE_PX + g_crop_y));
-        ESP_LOGI(TAG,
-                 "landmark %-13s -> (%d, %d)",
-                 RADAR_LANDMARKS[i].label,
-                 g_landmark_px[i].x,
-                 g_landmark_px[i].y);
-    }
+    select_landmarks();
 
     ESP_LOGI(TAG, "scale %.3f km/px, range %d km", (double)g_km_per_px, g_range_km);
     ESP_LOGI(TAG,

@@ -41,15 +41,68 @@ TIER_FLOOR = 0  # light and above; tier 0 is stippled at 2/16
 BEAM_RAYS, BEAM_STEP_DEG, BEAM_MAX_DENSITY = 100, 0.4, 7
 STALE_AGE_SEC = 25 * 60
 
-# Coordinates, not pixels -- mirrors RADAR_LANDMARKS. Projected at render time
-# against the same crop origin as the firmware, so they follow ZOOM.
-LANDMARKS = [
-    (15.7047, 100.1372, "NAKHON SAWAN"),
-    (15.3794, 100.0245, "UTHAI THANI"),
-    (14.8879, 100.4046, "SING BURI"),
-    (14.8418, 99.6976, "DAN CHANG"),
-    (15.4529, 99.5761, "LAN SAK"),
+# The candidate pool, mirroring RADAR_LANDMARKS. The five drawn are SELECTED
+# at render time by the same rules the firmware applies at init, so this
+# follows ZOOM exactly as the board does.
+LANDMARK_POOL = [
+    (15.7047, 100.1372, 82305, "NAKHON SAWAN"),
+    (15.3794, 100.0245, 22219, "UTHAI THANI"),
+    (15.1864, 100.1235, 15469, "CHAI NAT"),
+    (16.4834, 99.5215, 58787, "KAMPHAENG PHET"),
+    (14.4742, 100.1222, 53399, "SUPHAN BURI"),
+    (14.7981, 100.6540, 57761, "LOP BURI"),
+    (16.4418, 100.3488, 35760, "PHICHIT"),
+    (14.8879, 100.4046, 20046, "SING BURI"),
+    (14.5884, 100.4528, 13738, "ANG THONG"),
+    (16.8697, 99.1290, 24149, "TAK"),
+    (15.2634, 100.3438, 0, "TAKHLI"),
+    (15.0842, 99.5211, 0, "BAN RAI"),
+    (15.4529, 99.5761, 13905, "LAN SAK"),
+    (15.4552, 100.1353, 12271, "PHAYUHA KHIRI"),
+    (16.0617, 99.8606, 21889, "KHANU WORALAKSABURI"),
+    (14.8418, 99.6976, 0, "DAN CHANG"),
+    (15.3915, 99.8415, 0, "NONG CHANG"),
+    (17.3160, 99.8319, 19805, "SAWANKHALOK"),
+    (16.8248, 100.2586, 62584, "PHITSANULOK"),
+    (14.5333, 100.9167, 67763, "SARABURI"),
 ]
+LANDMARK_MAX, LANDMARK_MIN_KM, LANDMARK_RIM_PAD = 5, 10.0, 8
+LANDMARK_MIN_SEP, LANDMARK_MAX_CHARS = 60, 13
+
+
+def select_landmarks(origin_x, origin_y):
+    """Mirrors select_landmarks() in radar_screen.cpp."""
+    usable = []
+    for lat, lon, pop, label in LANDMARK_POOL:
+        if len(label) > LANDMARK_MAX_CHARS:
+            continue
+        mx, my = project(lat, lon)
+        x, y = round(mx - origin_x), round(my - origin_y)
+        dx, dy = x - CENTER, y - CENTER
+        dist = math.hypot(dx, dy)
+        if dist > RADIUS - LANDMARK_RIM_PAD or dist * KM_PER_PX < LANDMARK_MIN_KM:
+            continue
+        bearing = math.degrees(math.atan2(dx, -dy)) % 360.0
+        usable.append([x, y, int(((bearing + 45.0) % 360.0) // 90.0), pop, label])
+
+    chosen = []
+    for q in range(4):
+        in_q = [u for u in usable if u[2] == q and u not in chosen]
+        if in_q and len(chosen) < LANDMARK_MAX:
+            chosen.append(max(in_q, key=lambda u: u[3]))
+    while len(chosen) < LANDMARK_MAX:
+        best = None
+        for u in usable:
+            if u in chosen:
+                continue
+            if any(math.hypot(u[0] - c[0], u[1] - c[1]) < LANDMARK_MIN_SEP for c in chosen):
+                continue
+            if best is None or u[3] > best[3]:
+                best = u
+        if best is None:
+            break
+        chosen.append(best)
+    return [(u[0], u[1], u[4]) for u in chosen]
 
 # Real u8g2 advances, read out of the font headers (max_char_width).
 U8G2_ADVANCE = {"5x7": 5, "6x12": 6, "logisoso28": 16, "helvB10": 8, "helvB14": 10}
@@ -179,15 +232,9 @@ def main():
     # --- landmarks ---------------------------------------------------------
     small = font(7)
     problems = []
-    for mark_lat, mark_lon, label in LANDMARKS:
-        # Same origin as the firmware: tile_x * TILE_PX + crop_x reduces to
-        # round(home_x) - CENTER, so a landmark lands relative to home.
-        mark_x, mark_y = project(mark_lat, mark_lon)
-        lx = round(mark_x - (tile_x * TILE_PX + crop_x))
-        ly = round(mark_y - (tile_y * TILE_PX + crop_y))
-        if (lx - CENTER) ** 2 + (ly - CENTER) ** 2 > RADIUS * RADIUS:
-            problems.append(f"{label}: off the scope at zoom {ZOOM}")
-            continue
+    selected = select_landmarks(tile_x * TILE_PX + crop_x, tile_y * TILE_PX + crop_y)
+    print(f"  {len(selected)} landmarks selected at zoom {ZOOM}")
+    for lx, ly, label in selected:
         width = u8g2_width(label, "5x7")
         # Mirrors draw_landmarks(): the label goes on the side AWAY from home,
         # so its knockout never blanks the corridor rain crosses on approach.

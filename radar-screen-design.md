@@ -1025,3 +1025,48 @@ the current 5 landmarks are still on it — `NAKHON SAWAN`, `SING BURI` and
 `DAN CHANG` all fall off. Projection follows automatically, but the quadrant
 coverage the selection was built for does not, so a zoom change still wants the
 script re-run to pick closer towns. That is now the script's only job.
+
+### Revision 2j — the board picks its own landmarks
+
+The zoom work in 2i left one manual step: change `RADAR_ZOOM`, re-run the
+script, paste its output back. That step is why the script had drifted to
+`ZOOM = 5` and then `8` while the shipped table was 7.
+
+**The pick moved onto the board.** `RADAR_LANDMARKS` is now the 20-town
+candidate pool rather than a chosen five, and `select_landmarks()` runs at init.
+
+The split that makes this work:
+
+| | depends on | when |
+|---|---|---|
+| coordinates, population | nothing — towns do not move | baked, static |
+| which five to draw | `RADAR_ZOOM` | init, on the board |
+
+The selection needed a geocoding API only to turn *names* into *coordinates*.
+Once those are baked, everything left is arithmetic the board already does:
+project, reject inside 10 km and outside the rim, best town per bearing
+quadrant, then top up to five with the largest remaining that is not within
+60 px of one already chosen.
+
+**Verified against both references** before trusting it. At zoom 7 the on-board
+selector picks exactly the five that were previously baked, at the same pixels:
+NAKHON SAWAN, UTHAI THANI, DAN CHANG, LAN SAK, SING BURI. At zoom 8 it picks
+UTHAI THANI, CHAI NAT and LAN SAK — the same three a live run of the script
+produced.
+
+Changing zoom is now a one-constant edit. Nothing to re-run, nothing to paste,
+and nothing left that can fall out of sync with `RADAR_ZOOM`.
+
+Two consequences worth recording:
+
+- **The script's job shrank to maintaining the pool.** It no longer picks, and
+  it now emits *every* candidate that geocodes rather than only those inside
+  the scope — filtering by the current zoom would starve a wider one of the
+  towns it needs, and the board discards out-of-range entries itself. Its
+  `ZOOM` only affects the km/bearing figures it prints for reading.
+- **Zoom 8 still only yields three landmarks**, both of the east. The pool has
+  no town within 44 km to the north or south, so the quadrant rule cannot do
+  its job there. Projection and selection now follow the zoom automatically;
+  the *pool* is what a much tighter zoom would need widening.
+
+`tools/radar_preview.py` mirrors the pool and the selection.

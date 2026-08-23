@@ -20,10 +20,9 @@ import urllib.request
 
 HOME_LAT = 15.3919001
 HOME_LON = 99.8456348
-# MUST match RADAR_ZOOM in firmware/main/radar_screen.cpp, or every coordinate
-# this script emits is wrong by the ratio between the two zooms. The shipped
-# table was generated at 7; this file has since been at 5 and at 8, either of
-# which would have placed the landmarks 4x too close or 2x too far.
+# Only affects the km/bearing figures printed for reading. The emitted table is
+# coordinates, and the FIRMWARE now does the picking at init, so this no longer
+# has to agree with RADAR_ZOOM for the output to be correct.
 ZOOM = 7
 TILE_PX = 512
 SCOPE = 300
@@ -103,6 +102,11 @@ def main():
     print(f"scale          : {metres_per_px / 1000:.3f} km/px, "
           f"scope radius {SCOPE_R * metres_per_px / 1000:.1f} km\n")
 
+    # Everything that geocodes goes in the pool, whether or not it lands inside
+    # the scope AT THIS ZOOM. Filtering here would starve a wider zoom of the
+    # towns it needs, and the firmware discards out-of-range ones at init
+    # anyway. `kept` is only for the readout below.
+    resolved = []
     kept = []
     for name in CANDIDATES:
         hit = geocode(name)
@@ -122,51 +126,20 @@ def main():
         print(f"  {flag} {name:<22} {hit['latitude']:8.4f},{hit['longitude']:9.4f}  "
               f"px ({px:6.1f},{py:6.1f})  {km:5.1f} km  {bearing:5.1f} deg  "
               f"pop {hit.get('population', 0)}")
+        resolved.append((name, hit))
         if inside:
             kept.append((name, hit, round(px), round(py), km, bearing))
 
-    # Pick for spread, not for size. Sorting by population alone piles every
-    # label into the east/south-east (Nakhon Sawan, Uthai Thani, Chai Nat,
-    # Sing Buri) and leaves half the scope with nothing to read against, so
-    # take the best town per bearing quadrant first.
-    kept = [row for row in kept if row[4] >= MIN_KM and len(row[0]) <= MAX_LABEL_CHARS]
+    print(f"\n{len(resolved)} resolved, {len(kept)} inside the scope at zoom {ZOOM}\n")
 
-    def quadrant(bearing):
-        return int(((bearing + 45.0) % 360.0) // 90.0)  # 0=N 1=E 2=S 3=W
-
-    chosen = []
-    for q in range(4):
-        in_q = [row for row in kept if quadrant(row[5]) == q]
-        if in_q:
-            chosen.append(max(in_q, key=lambda row: row[1].get("population") or 0))
-
-    # Top up to five with the largest remaining town that is not crowding one
-    # already chosen.
-    remaining = sorted(
-        (row for row in kept if row not in chosen),
-        key=lambda row: row[1].get("population") or 0,
-        reverse=True,
-    )
-    for row in remaining:
-        if len(chosen) >= 5:
-            break
-        if all(math.hypot(row[2] - c[2], row[3] - c[3]) >= MIN_SEPARATION_PX for c in chosen):
-            chosen.append(row)
-
-    chosen.sort(key=lambda row: row[5])
-    names = ("N", "E", "S", "W")
-    print(f"\n{len(kept)} usable, {len(chosen)} chosen\n")
-    # Emits COORDINATES, not pixels. The board projects them at init, so the
-    # table can no longer drift out of step with the firmware's RADAR_ZOOM --
-    # which is exactly what happened when this file sat at ZOOM 5 and 8 while
-    # the shipped table had been generated at 7. The km/bearing figures in the
-    # comments are for reading only, and are what ZOOM above still affects.
-    print("// Selected by tools/radar_landmarks.py -- coordinates, not pixels.")
+    # Emits the whole POOL. Choosing which five to draw moved onto the board
+    # -- it depends only on RADAR_ZOOM, which the firmware knows and this
+    # script does not have to be told. Re-run this only to add or drop a name.
     print("static const RadarLandmark RADAR_LANDMARKS[] = {")
-    for name, hit, px, py, km, bearing in chosen:
+    for name, hit in resolved:
         label = name.upper()
-        print(f'    {{{hit["latitude"]:8.4f}, {hit["longitude"]:9.4f}, "{label}"}},'.ljust(46) +
-              f'// {names[quadrant(bearing)]}  {km:5.1f} km  {bearing:5.1f} deg')
+        pop = hit.get("population") or 0
+        print(f'    {{{hit["latitude"]:8.4f}, {hit["longitude"]:9.4f}, {pop:7d}, "{label}"}},')
     print("};")
 
 
