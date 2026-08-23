@@ -176,13 +176,16 @@ def main():
     problems = []
     for lx, ly, label in LANDMARKS:
         width = u8g2_width(label, "5x7")
-        label_x = lx + 5
+        # Mirrors draw_landmarks(): the label goes on the side AWAY from home,
+        # so its knockout never blanks the corridor rain crosses on approach.
+        outward_left = lx < CENTER
+        label_x = lx - 5 - width if outward_left else lx + 5
         flipped = False
-        if label_x + width > SCOPE - 2:
-            label_x = lx - 5 - width
+        if label_x < 2 or label_x + width > SCOPE - 2:
+            label_x = lx + 5 if outward_left else lx - 5 - width
             flipped = True
-        if label_x < 2:
-            problems.append(f"{label}: runs off the left edge at x={label_x}")
+        if label_x < 2 or label_x + width > SCOPE - 2:
+            problems.append(f"{label}: does not fit on either side at x={label_x}")
         draw.rectangle([label_x - 1, ly - 4, label_x + width, ly + 4], fill=0)
         draw.rectangle([lx - 2, ly - 2, lx + 2, ly + 2], fill=0)
         draw.rectangle([lx - 1, ly - 1, lx + 1, ly + 1], outline=1)

@@ -944,3 +944,44 @@ see it.
 Known limit: distance is **centroid to centre**, so a large cell whose leading
 edge is already closer trips the alert late. The ETA is what reports approach;
 this only reports arrival in the neighbourhood.
+
+### Revision 2h — first hardware run, two UI fixes
+
+Flashed and running. **The correlation works on real weather over this tile** —
+the panel showed `>2H`, which only prints when `motion.valid` is true, so all
+three gates passed on live frames. That was the load-bearing unknown the whole
+"Tell" branch rested on, and decision #27 chose to test it this way rather than
+with an offline probe.
+
+Two things the photo showed that no amount of design could have:
+
+**1. The bearing line was far too long.** Running the full 148 px from centre to
+rim, it read as a slash across the entire scope — more ink than the rain it
+pointed at, crossing every range ring on the way. Cut to a 30 px tail inward
+from the chevron apex, roughly 80% less ink.
+
+Shortened from the *inside*, not the outside, deliberately: the chevron has to
+stay at the rim among the echoes it describes, because that colocation is what
+removes the from/toward ambiguity without a legend. The tail only has to say
+"this is a direction, not a bearing tick". `RADAR_BEARING_APEX_PX` was a bare
+14 in the draw code and is now named alongside `RADAR_BEARING_TAIL_PX`.
+
+**2. Landmark labels were hiding the approach.** `draw_landmarks` placed every
+label to the *right* of its dot, flipping only when it would run off the scope.
+For a westerly landmark that puts the label — and its knockout, which blanks
+the field to black — directly in the strip a cell crosses on its way to home.
+Rain vanished behind "LAN SAK" exactly as it began to matter.
+
+The rule is now **place the label on the side away from home**, flipping back
+only when the outward side does not fit. Verified against all five:
+
+| label | x | was | now |
+|---|---|---|---|
+| NAKHON SAWAN | 203 | right 208..268 | unchanged |
+| UTHAI THANI | 183 | right 188..243 | unchanged |
+| SING BURI | 252 | left 202..247 | unchanged (outward does not fit) |
+| DAN CHANG | 123 | right 128..173 | **left 73..118** |
+| LAN SAK | 101 | right 106..141 | **left 61..96** |
+
+`tools/radar_preview.py` mirrors the new rule, so the one property
+FEATURE_INDEX still credits it with — landmark label fit — stays true.

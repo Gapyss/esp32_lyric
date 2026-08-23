@@ -268,6 +268,14 @@ static const int RADAR_BLIP_EDGE_DENSITY = 8;
 // is a heavy cell inside the inner ring". Distance is centroid to centre, so
 // a large cell whose edge is closer still trips it late; the ETA is what
 // reports approach, this only reports arrival in the neighbourhood.
+// The bearing mark lives at the RIM, among the echoes it describes. It used
+// to run the full 148 px from the centre, which on hardware read as a slash
+// across the whole scope -- more ink than the rain it was pointing at, and
+// crossing every range ring on the way. The chevron is the indicator; the tail
+// only has to be long enough to say "this is a direction, not a tick".
+static const int RADAR_BEARING_APEX_PX = 14;
+static const int RADAR_BEARING_TAIL_PX = 30;
+
 static const int RADAR_BLIP_NEAR_PX = 37;
 static const int RADAR_ALERT_RING_A = 10;
 static const int RADAR_ALERT_RING_B = 13;
@@ -1308,11 +1316,15 @@ static void draw_landmarks(u8g2_t *u8)
     for (int i = 0; i < RADAR_LANDMARK_COUNT; i++) {
         const RadarLandmark *mark = &RADAR_LANDMARKS[i];
         const int label_width = (int)u8g2_GetUTF8Width(u8, mark->label);
-        // Flip the label to the other side rather than letting it run off the
-        // scope; the dots nearest the rim are the ones that need it.
-        int label_x = mark->x + 5;
-        if (label_x + label_width > SCOPE - 2) {
-            label_x = mark->x - 5 - label_width;
+        // Place the label on the side AWAY from home, so its knockout never
+        // lands in the corridor rain travels down to reach the centre. A
+        // westerly landmark labelled to its right blanks exactly the strip a
+        // cell crosses on approach, which hides the thing the scope is for.
+        // Flip back only when the outward side does not fit.
+        const bool outward_left = mark->x < SCOPE_CENTER;
+        int label_x = outward_left ? mark->x - 5 - label_width : mark->x + 5;
+        if (label_x < 2 || label_x + label_width > SCOPE - 2) {
+            label_x = outward_left ? mark->x + 5 : mark->x - 5 - label_width;
         }
         // Knock the field back to black behind the mark first. A 5x7 label
         // laid straight over dithered returns is unreadable, and heavy rain is
@@ -1508,18 +1520,22 @@ static void draw_bearing(u8g2_t *u8, float bearing_rad)
     const int nx = (int)lroundf(-sa);
     const int ny = (int)lroundf(ca);
 
-    draw_haloed_line(u8,
-                     SCOPE_CENTER,
-                     SCOPE_CENTER,
-                     SCOPE_CENTER + (int)lroundf(ca * (float)SCOPE_RADIUS),
-                     SCOPE_CENTER + (int)lroundf(sa * (float)SCOPE_RADIUS),
-                     nx,
-                     ny);
-
     // Apex inboard, arms out to the rim: a V opening outward, so it reads as
     // an arrowhead aimed at the centre.
-    const int apex_x = SCOPE_CENTER + (int)lroundf(ca * (float)(SCOPE_RADIUS - 14));
-    const int apex_y = SCOPE_CENTER + (int)lroundf(sa * (float)(SCOPE_RADIUS - 14));
+    const int apex_radius = SCOPE_RADIUS - RADAR_BEARING_APEX_PX;
+    const int apex_x = SCOPE_CENTER + (int)lroundf(ca * (float)apex_radius);
+    const int apex_y = SCOPE_CENTER + (int)lroundf(sa * (float)apex_radius);
+
+    // A short tail inward from the apex, in the direction the arrow points,
+    // rather than a line all the way back to home.
+    const int tail_radius = apex_radius - RADAR_BEARING_TAIL_PX;
+    draw_haloed_line(u8,
+                     SCOPE_CENTER + (int)lroundf(ca * (float)tail_radius),
+                     SCOPE_CENTER + (int)lroundf(sa * (float)tail_radius),
+                     apex_x,
+                     apex_y,
+                     nx,
+                     ny);
     for (int side = -1; side <= 1; side += 2) {
         const float arm = bearing_rad + (float)side * 0.20f;  // ~11 deg
         draw_haloed_line(u8,
