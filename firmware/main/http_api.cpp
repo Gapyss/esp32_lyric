@@ -426,9 +426,11 @@ static esp_err_t mode_handler(httpd_req_t *req)
             app_mode_set(APP_MODE_COMIC);
         } else if (strcmp(mode, "apod") == 0) {
             app_mode_set(APP_MODE_APOD);
+        } else if (strcmp(mode, "radar") == 0) {
+            app_mode_set(APP_MODE_RADAR);
         } else {
             free(query);
-            return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "mode must be music, stats, pomodoro, clock, sand, comic, or apod");
+            return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "mode must be music, stats, pomodoro, clock, sand, comic, apod, or radar");
         }
     }
     free(query);

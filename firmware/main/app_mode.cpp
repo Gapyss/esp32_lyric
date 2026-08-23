@@ -29,7 +29,7 @@ void app_mode_set(AppMode mode)
 {
     if (mode != APP_MODE_MUSIC && mode != APP_MODE_STATS && mode != APP_MODE_POMODORO &&
         mode != APP_MODE_CLOCK && mode != APP_MODE_SAND && mode != APP_MODE_COMIC &&
-        mode != APP_MODE_APOD) {
+        mode != APP_MODE_APOD && mode != APP_MODE_RADAR) {
         return;
     }
     if (g_mode_mutex == NULL) {
@@ -65,6 +65,9 @@ AppMode app_mode_toggle(void)
         case APP_MODE_COMIC:
             g_mode = APP_MODE_APOD;
             break;
+        case APP_MODE_APOD:
+            g_mode = APP_MODE_RADAR;
+            break;
         default:
             g_mode = APP_MODE_MUSIC;
             break;
@@ -89,6 +92,8 @@ const char *app_mode_name(AppMode mode)
             return "comic";
         case APP_MODE_APOD:
             return "apod";
+        case APP_MODE_RADAR:
+            return "radar";
         default:
             return "music";
     }

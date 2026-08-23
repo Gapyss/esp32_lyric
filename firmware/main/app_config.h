@@ -12,6 +12,7 @@ typedef enum {
     APP_MODE_SAND = 4,
     APP_MODE_COMIC = 5,
     APP_MODE_APOD = 6,
+    APP_MODE_RADAR = 7,
 } AppMode;
 
 #define APP_DEFAULT_MODE APP_MODE_STATS

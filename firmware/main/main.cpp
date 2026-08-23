@@ -27,6 +27,7 @@
 #include "ota_update.h"
 #include "pomodoro_screen.h"
 #include "provisioning_display.h"
+#include "radar_screen.h"
 #include "sand_screen.h"
 #include "stats_screen.h"
 #include "clock_screen.h"
@@ -50,6 +51,12 @@ static const uint32_t BUTTON_POLL_MS = 20;
 static const uint32_t RENDER_PERIOD_ANIMATED_MS = 70;
 static const uint32_t RENDER_PERIOD_STATIC_MS = 1000;
 static const uint32_t RENDER_PERIOD_PROVISIONING_MS = 200;
+// The radar sweep turns once a minute, so its tip covers 15.5 px/s at the rim.
+// 100 ms keeps the step at ~1.55 px -- the same smoothness the screen already
+// ran at -- for 10 pushes a second rather than the 14.3 of the animated
+// period. See BEAM_PERIOD_SEC in radar_screen.cpp for why the sweep is worth
+// the traffic at all: it is what lights the heavy-rain aura.
+static const uint32_t RENDER_PERIOD_RADAR_MS = 100;
 
 static SemaphoreHandle_t g_button_wake;
 // Lets the button task cut a slow render period short, so pressing a button on
@@ -157,6 +164,7 @@ static void network_services_callback(NetworkServiceAction action,
     if (!g_long_lived_services_started) {
         g_long_lived_services_started = true;
         comic_screen_start();
+        radar_screen_start();
         ESP_ERROR_CHECK_WITHOUT_ABORT(board_client_start());
     }
     time_sync_start_async();
@@ -208,6 +216,9 @@ static void action_button_short_press(AppMode mode)
     } else if (mode == APP_MODE_APOD) {
         apod_refresh();
         ESP_LOGI(TAG, "APOD refresh requested via button");
+    } else if (mode == APP_MODE_RADAR) {
+        radar_refresh();
+        ESP_LOGI(TAG, "radar refresh requested via button");
     }
 }
 
@@ -368,6 +379,8 @@ static uint32_t render_period_ms(AppMode mode)
     case APP_MODE_MUSIC:  // lyrics arrive as pushed frames; latency is visible
     case APP_MODE_SAND:
         return RENDER_PERIOD_ANIMATED_MS;
+    case APP_MODE_RADAR:
+        return RENDER_PERIOD_RADAR_MS;
     default:
         return RENDER_PERIOD_STATIC_MS;
     }
@@ -427,6 +440,8 @@ static void render_task(void *arg)
             comic_render_current(u8);
         } else if (mode == APP_MODE_APOD) {
             apod_render_current(u8);
+        } else if (mode == APP_MODE_RADAR) {
+            radar_render_current(u8);
         } else {
             music_render_current(u8, true);
         }
@@ -497,6 +512,7 @@ extern "C" void app_main(void)
     pomodoro_screen_init();
     sand_screen_init();
     comic_screen_init();
+    radar_screen_init();
     display_start();
     ESP_ERROR_CHECK(board_peripherals_start());
     // Must exist before buttons_init() arms the ISR, which gives it.

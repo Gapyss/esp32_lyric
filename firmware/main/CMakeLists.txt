@@ -10,6 +10,7 @@ idf_component_register(
         "pomodoro_screen.cpp"
         "sand_screen.cpp"
         "comic_screen.cpp"
+        "radar_screen.cpp"
         "http_api.cpp"
         "ota_update.cpp"
         "board_client.cpp"
