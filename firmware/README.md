@@ -27,8 +27,8 @@ idf.py flash monitor
 ```
 
 That migration keeps `nvs` at its original offset and size, so Wi-Fi
-credentials, the pairing token, and pet/hydrate state all survive it. Watch the
-boot log for the line you will need afterwards:
+credentials and the pairing token survive it. Watch the boot log for the line
+you will need afterwards:
 
 ```
 I (…) ota_update: OTA upload token: 7KMQ2XPD4WHN
@@ -63,7 +63,7 @@ which turns any early-boot abort into a silent revert — a worse failure mode
 for a board that has a USB port on the desk.
 
 Note that `/ota` is the only authenticated endpoint. The rest of the HTTP API
-(`/mode`, `/pairing`, `/hydrate/config`, …) is unauthenticated on the LAN, as
+(`/mode`, `/pairing`, `/diag/display`, …) is unauthenticated on the LAN, as
 it was before. OTA is gated because arbitrary code execution is a different
 severity class, not because the API as a whole is locked down.
 
@@ -109,7 +109,7 @@ holding an image costs essentially nothing, and only *changing* it costs power.
   ceiling, so this only ever scales down. `CONFIG_PM_ENABLE=y`; automatic light
   sleep is deliberately off, because the USB-Serial/JTAG console holds a power
   management lock while a host is attached. Boot logs `DFS enabled: 80-160 MHz`.
-- **Per-screen render cadence.** Animated screens (music, pet, sand, swarm)
+- **Per-screen render cadence.** Animated screens (music, sand)
   redraw every 70 ms. Everything else redraws at 1 Hz, which is already the
   resolution of what those screens display. Wi-Fi setup redraws at 200 ms.
 - **Dirty-frame skip.** A drawn frame is compared against a shadow copy of what

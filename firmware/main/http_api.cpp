@@ -13,7 +13,6 @@
 #include "display_config.h"
 #include "music_screen.h"
 #include "ota_update.h"
-#include "water_screen.h"
 
 static const char *TAG = "http_api";
 static httpd_handle_t g_server;
@@ -77,20 +76,6 @@ static int query_int(const char *query, const char *key, int default_value)
         return default_value;
     }
     return atoi(value);
-}
-
-static bool parse_hhmm(const char *value, int *minutes)
-{
-    int hour = -1;
-    int minute = -1;
-    if (value == NULL || sscanf(value, "%d:%d", &hour, &minute) != 2) {
-        return false;
-    }
-    if (hour < 0 || hour > 23 || minute < 0 || minute > 59) {
-        return false;
-    }
-    *minutes = hour * 60 + minute;
-    return true;
 }
 
 static esp_err_t read_query(httpd_req_t *req, char **query_out)
@@ -427,139 +412,28 @@ static esp_err_t mode_handler(httpd_req_t *req)
 
     char mode[16] = {};
     if (query_arg(query, "set", mode, sizeof(mode))) {
-        if (strcmp(mode, "water") == 0) {
-            app_mode_set(APP_MODE_WATER);
-        } else if (strcmp(mode, "music") == 0) {
+        if (strcmp(mode, "music") == 0) {
             app_mode_set(APP_MODE_MUSIC);
         } else if (strcmp(mode, "stats") == 0) {
             app_mode_set(APP_MODE_STATS);
         } else if (strcmp(mode, "clock") == 0) {
             app_mode_set(APP_MODE_CLOCK);
-        } else if (strcmp(mode, "pet") == 0) {
-            app_mode_set(APP_MODE_PET);
         } else if (strcmp(mode, "pomodoro") == 0) {
             app_mode_set(APP_MODE_POMODORO);
         } else if (strcmp(mode, "sand") == 0) {
             app_mode_set(APP_MODE_SAND);
-        } else if (strcmp(mode, "swarm") == 0) {
-            app_mode_set(APP_MODE_SWARM);
         } else if (strcmp(mode, "comic") == 0) {
             app_mode_set(APP_MODE_COMIC);
         } else if (strcmp(mode, "apod") == 0) {
             app_mode_set(APP_MODE_APOD);
         } else {
             free(query);
-            return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "mode must be water, music, stats, pomodoro, clock, pet, sand, swarm, comic, or apod");
+            return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "mode must be music, stats, pomodoro, clock, sand, comic, or apod");
         }
     }
     free(query);
     httpd_resp_set_type(req, "text/plain");
     return httpd_resp_sendstr(req, app_mode_name(app_mode_get()));
-}
-
-static esp_err_t hydrate_now_handler(httpd_req_t *req)
-{
-    app_mode_set(APP_MODE_WATER);
-    water_fire_now();
-    httpd_resp_set_type(req, "text/plain");
-    return httpd_resp_sendstr(req, "ok");
-}
-
-static esp_err_t hydrate_log_handler(httpd_req_t *req)
-{
-    app_mode_set(APP_MODE_WATER);
-    water_log_drink();
-    httpd_resp_set_type(req, "text/plain");
-    return httpd_resp_sendstr(req, "ok");
-}
-
-static esp_err_t hydrate_snooze_handler(httpd_req_t *req)
-{
-    char *query = NULL;
-    esp_err_t err = read_query(req, &query);
-    if (err == ESP_ERR_NO_MEM) {
-        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "out of memory");
-    }
-    if (err != ESP_OK) {
-        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad query");
-    }
-    const int minutes = query_int(query, "min", 10);
-    free(query);
-    if (minutes <= 0) {
-        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "min must be positive");
-    }
-    app_mode_set(APP_MODE_WATER);
-    water_snooze(minutes);
-    httpd_resp_set_type(req, "text/plain");
-    return httpd_resp_sendstr(req, "ok");
-}
-
-static esp_err_t hydrate_config_handler(httpd_req_t *req)
-{
-    char *query = NULL;
-    esp_err_t err = read_query(req, &query);
-    if (err == ESP_ERR_NO_MEM) {
-        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "out of memory");
-    }
-    if (err != ESP_OK) {
-        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad query");
-    }
-
-    WaterSnapshot current;
-    water_get_snapshot(&current);
-    int interval = query_int(query, "interval", current.interval_min);
-    int start = current.active_start_min;
-    int end = current.active_end_min;
-    char value[16] = {};
-    if (query_arg(query, "start", value, sizeof(value)) && !parse_hhmm(value, &start)) {
-        free(query);
-        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "start must be HH:MM");
-    }
-    if (query_arg(query, "end", value, sizeof(value)) && !parse_hhmm(value, &end)) {
-        free(query);
-        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "end must be HH:MM");
-    }
-    free(query);
-
-    err = water_configure(interval, start, end);
-    if (err != ESP_OK) {
-        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad hydration config");
-    }
-    app_mode_set(APP_MODE_WATER);
-    httpd_resp_set_type(req, "text/plain");
-    return httpd_resp_sendstr(req, "ok");
-}
-
-static esp_err_t hydrate_json_handler(httpd_req_t *req)
-{
-    WaterSnapshot snapshot;
-    water_get_snapshot(&snapshot);
-    char clock[8];
-    if (snapshot.clock_valid) {
-        snprintf(clock, sizeof(clock), "%02d:%02d", snapshot.hour, snapshot.minute);
-    } else {
-        snprintf(clock, sizeof(clock), "--:--");
-    }
-    char body[384];
-    snprintf(body,
-             sizeof(body),
-             "{\"mode\":\"water\",\"clock\":\"%s\",\"next_in_min\":%d,\"next_in_sec\":%d,"
-             "\"interval\":%d,\"start\":\"%02d:%02d\",\"end\":\"%02d:%02d\","
-             "\"alerting\":%s,\"audio_available\":%s,\"audio_playing\":%s,\"drinks_today\":%d}",
-             clock,
-             (snapshot.next_in_sec + 59) / 60,
-             snapshot.next_in_sec,
-             snapshot.interval_min,
-             snapshot.active_start_min / 60,
-             snapshot.active_start_min % 60,
-             snapshot.active_end_min / 60,
-             snapshot.active_end_min % 60,
-             snapshot.alerting ? "true" : "false",
-             snapshot.audio_available ? "true" : "false",
-             snapshot.audio_playing ? "true" : "false",
-             snapshot.drinks_today);
-    httpd_resp_set_type(req, "application/json");
-    return httpd_resp_sendstr(req, body);
 }
 
 static esp_err_t diag_display_handler(httpd_req_t *req)
@@ -673,49 +547,6 @@ esp_err_t http_api_start(void)
     httpd_uri_t mode_post = mode_get;
     mode_post.method = HTTP_POST;
 
-    httpd_uri_t hydrate_now_get = {
-        .uri = "/hydrate/now",
-        .method = HTTP_GET,
-        .handler = hydrate_now_handler,
-        .user_ctx = NULL,
-    };
-    httpd_uri_t hydrate_now_post = hydrate_now_get;
-    hydrate_now_post.method = HTTP_POST;
-
-    httpd_uri_t hydrate_log_get = {
-        .uri = "/hydrate/log",
-        .method = HTTP_GET,
-        .handler = hydrate_log_handler,
-        .user_ctx = NULL,
-    };
-    httpd_uri_t hydrate_log_post = hydrate_log_get;
-    hydrate_log_post.method = HTTP_POST;
-
-    httpd_uri_t hydrate_snooze_get = {
-        .uri = "/hydrate/snooze",
-        .method = HTTP_GET,
-        .handler = hydrate_snooze_handler,
-        .user_ctx = NULL,
-    };
-    httpd_uri_t hydrate_snooze_post = hydrate_snooze_get;
-    hydrate_snooze_post.method = HTTP_POST;
-
-    httpd_uri_t hydrate_config_get = {
-        .uri = "/hydrate/config",
-        .method = HTTP_GET,
-        .handler = hydrate_config_handler,
-        .user_ctx = NULL,
-    };
-    httpd_uri_t hydrate_config_post = hydrate_config_get;
-    hydrate_config_post.method = HTTP_POST;
-
-    httpd_uri_t hydrate_json = {
-        .uri = "/hydrate.json",
-        .method = HTTP_GET,
-        .handler = hydrate_json_handler,
-        .user_ctx = NULL,
-    };
-
     httpd_uri_t diag_display = {
         .uri = "/diag/display",
         .method = HTTP_GET,
@@ -736,15 +567,6 @@ esp_err_t http_api_start(void)
     ESP_ERROR_CHECK(httpd_register_uri_handler(g_server, &usage));
     ESP_ERROR_CHECK(httpd_register_uri_handler(g_server, &mode_get));
     ESP_ERROR_CHECK(httpd_register_uri_handler(g_server, &mode_post));
-    ESP_ERROR_CHECK(httpd_register_uri_handler(g_server, &hydrate_now_get));
-    ESP_ERROR_CHECK(httpd_register_uri_handler(g_server, &hydrate_now_post));
-    ESP_ERROR_CHECK(httpd_register_uri_handler(g_server, &hydrate_log_get));
-    ESP_ERROR_CHECK(httpd_register_uri_handler(g_server, &hydrate_log_post));
-    ESP_ERROR_CHECK(httpd_register_uri_handler(g_server, &hydrate_snooze_get));
-    ESP_ERROR_CHECK(httpd_register_uri_handler(g_server, &hydrate_snooze_post));
-    ESP_ERROR_CHECK(httpd_register_uri_handler(g_server, &hydrate_config_get));
-    ESP_ERROR_CHECK(httpd_register_uri_handler(g_server, &hydrate_config_post));
-    ESP_ERROR_CHECK(httpd_register_uri_handler(g_server, &hydrate_json));
     ESP_ERROR_CHECK(httpd_register_uri_handler(g_server, &diag_display));
     ESP_ERROR_CHECK(httpd_register_uri_handler(g_server, &pairing_get));
     ESP_ERROR_CHECK(httpd_register_uri_handler(g_server, &pairing_post));

@@ -7,8 +7,8 @@ extern "C" {
 #endif
 
 // Single fixed-duration countdown screen. Only ever driven from the render
-// task (button polls, tick, and render all happen there), so unlike
-// water_screen it keeps no internal mutex -- same reasoning as stats_screen.
+// task (button polls, tick, and render all happen there), so it keeps no
+// internal mutex -- same reasoning as stats_screen.
 void pomodoro_screen_init(void);
 void pomodoro_tick(void);
 void pomodoro_toggle_start_pause(void);

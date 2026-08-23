@@ -4,9 +4,8 @@
 
 A tiny desk display that shows your **Claude usage limits** (session + weekly
 window) at a glance, plus a set of small companion screens — a clock, a
-pomodoro timer, hydration reminders, now-playing music with synced lyrics, a
-pettable pet, a falling-sand toy, a swarm, and the daily xkcd / NASA APOD
-picture. Everything is drawn in the **Tend** look shared with the ESP32
+pomodoro timer, now-playing music with synced lyrics, a falling-sand toy, and
+the daily xkcd / NASA APOD picture. Everything is drawn in the **Tend** look shared with the ESP32
 firmware in this repo: warm paper, ink, one ember accent.
 
 It runs on the GeekMagic **HelloCubic Lite** / **SmallTV-Ultra** (an ESP8266
@@ -37,11 +36,8 @@ gestures became dashboard controls):
 | `clock` | Time from the daemon push (no RTC/NTP needed once pushed) |
 | `music` | Streamed lyrics screen, rendered **only** by the Mac's `lyrics_display_daemon.py`: a Tend-color 240×240 UI (Core Text Thai shaping + syllable karaoke) with real-color album covers. When no frame is flowing (daemon off, Mac asleep, no track) it shows a simple paper placeholder — there is no on-device now-playing renderer |
 | `pomodoro` | Focus timer — start/pause/reset from the dashboard |
-| `water` | Hydration reminders — log drinks, snooze, configurable window |
 | `stats` | Claude usage + Mac metrics trend |
-| `pet` | A pettable pet; pets counted per-day and all-time |
 | `sand` | Falling-sand toy — pour and clear |
-| `swarm` | A swarm that scatters on demand or roams |
 | `comic` / `apod` | Daily xkcd / NASA APOD, dithered 1-bit via the wsrv.nl proxy |
 
 ## What you need
@@ -90,9 +86,8 @@ reflashing. The portal times out after 3 minutes and retries, so a temporary
 router outage just means it reconnects when the network returns.
 
 **Full reset:** the dashboard's device panel has a **reset settings** button
-(`/factory-reset`). It wipes the saved WiFi and stored settings (brightness,
-hydration schedule) and reboots straight back into the Clawdmeter-setup
-hotspot.
+(`/factory-reset`). It wipes the saved WiFi and stored settings (brightness)
+and reboots straight back into the Clawdmeter-setup hotspot.
 
 ### 3. Open the dashboard
 
@@ -102,7 +97,7 @@ step 4.
 
 - The **screen** row switches the physical LCD between the screens above.
 - The panel under it shows the live screen's controls — start the pomodoro,
-  log a drink, pet the pet, pour sand, scatter the swarm, refresh the comic.
+  pour sand, refresh the comic.
 - The **backlight** slider tunes the TFT backlight; the value is saved on the
   device and survives reboot.
 
@@ -225,8 +220,8 @@ esp8266/
 │   ├── clawdmeter_esp8266.ino   # the sketch: HTTP API + INDEX_HTML dashboard
 │   ├── tend.h                   # shared Tend UI kit + screen interfaces
 │   ├── clock_screen.cpp         # … one .cpp per screen (ported from firmware/main)
-│   ├── pomodoro_screen.cpp, water_screen.cpp, stats_screen.cpp,
-│   ├── pet_screen.cpp, sand_screen.cpp, swarm_screen.cpp, daily_screen.cpp
+│   ├── pomodoro_screen.cpp, stats_screen.cpp, sand_screen.cpp,
+│   ├── daily_screen.cpp
 │   ├── lyrics_stream.cpp        # MUSIC frame stream: WS client for the lyrics daemon
 │   ├── tjpgd.c/.h, tjpgdcnf.h   # vendored TJpgDec (streams comic/APOD JPEGs)
 │   └── index_html_gz.h          # generated — gzipped dashboard served at /
@@ -242,14 +237,9 @@ esp8266/
 | `/usage` | POST | Daemon pushes usage % + Mac metrics + server time |
 | `/usage.json` | GET | Full device state as JSON (dashboard polls this) |
 | `/nowplaying` | GET/POST | Daemon pushes song title/artist/position/lyrics |
-| `/mode` | GET/POST | `?screen=` clock/music/pomodoro/water/stats/pet/sand/swarm/comic/apod |
+| `/mode` | GET/POST | `?screen=` clock/music/pomodoro/stats/sand/comic/apod |
 | `/pomodoro` | GET/POST | `?action=toggle` (default) or `reset` |
-| `/hydrate/log`, `/hydrate/now` | GET/POST | Log a drink / fire the reminder now |
-| `/hydrate/snooze` | GET/POST | `?min=10` snooze the reminder |
-| `/hydrate/config` | GET/POST | `?interval=45&start=09:00&end=18:00` (any subset) |
-| `/pet` | GET/POST | Pet the pet |
 | `/sand` | GET/POST | `?action=pour` (default) or `clear` |
-| `/swarm` | GET/POST | `?action=scatter` (default) or `roam` |
 | `/daily` | GET/POST | Daemon pushes xkcd/APOD image URL + title metadata |
 | `/refresh` | GET/POST | `?screen=comic|apod` — refetch the daily image |
 | `/brightness` | GET/POST | TFT backlight PWM, persisted across reboots |
