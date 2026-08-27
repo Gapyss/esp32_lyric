@@ -14,7 +14,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-from .constants import LRCLIB_MAX_RETRY_AFTER_SECONDS, LRCLIB_RETRYABLE_STATUS, LRCLIB_RETRY_ATTEMPTS, LRCLIB_RETRY_DELAY_SECONDS, LRCLIB_TIMEOUT_SECONDS, LRCLIB_USER_AGENT, NEGATIVE_CACHE_SECONDS
+from .constants import SQLITE_BUSY_TIMEOUT_SECONDS, LRCLIB_MAX_RETRY_AFTER_SECONDS, LRCLIB_RETRYABLE_STATUS, LRCLIB_RETRY_ATTEMPTS, LRCLIB_RETRY_DELAY_SECONDS, LRCLIB_TIMEOUT_SECONDS, LRCLIB_USER_AGENT, NEGATIVE_CACHE_SECONDS
 from .state import Lyrics, TrackInfo
 
 class LyricsStore:
@@ -22,8 +22,16 @@ class LyricsStore:
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
-        self.conn = sqlite3.connect(str(self.path), check_same_thread=False)
+        # The ESP32 and ESP8266 daemons are separate processes sharing this
+        # cache file, and both write it (each resolves lyrics for its own
+        # boards). The rollback journal's default whole-file write lock makes
+        # that "database is locked"; WAL lets a writer and readers overlap, and
+        # busy_timeout absorbs the writer-vs-writer case instead of raising.
+        self.conn = sqlite3.connect(str(self.path), check_same_thread=False,
+                                    timeout=SQLITE_BUSY_TIMEOUT_SECONDS)
         self.conn.row_factory = sqlite3.Row
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute(f"PRAGMA busy_timeout={int(SQLITE_BUSY_TIMEOUT_SECONDS * 1000)}")
         with self.lock:
             self.conn.execute(
                 """

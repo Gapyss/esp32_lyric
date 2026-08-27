@@ -14,6 +14,15 @@ EXTENSION_HOST = "127.0.0.1"
 EXTENSION_PORT = 8765
 BOARD_HOST = "0.0.0.0"
 BOARD_PORT = 8766
+# Default board port per family. The ESP8266 has no mDNS client -- it learns the
+# Mac's IP from an HTTP push and dials a port compiled into its firmware
+# (LYR_PORT in esp8266/clawdmeter_esp8266/lyrics_stream.cpp) -- so its daemon has
+# to keep 8766. The ESP32 discovers the port from the mDNS record, so its daemon
+# moves aside and the two can run at once without either board being reflashed.
+ESP8266_BOARD_PORT = 8766
+ESP32_BOARD_PORT = 8767
+# Shared lyrics cache: see LyricsStore for why two processes need this.
+SQLITE_BUSY_TIMEOUT_SECONDS = 5.0
 NEGATIVE_CACHE_SECONDS = 14 * 24 * 60 * 60
 # lrclib.net regularly takes 6-12s to first byte under load (DNS/TLS are fast,
 # the server is just slow), so the budget must be generous and timeouts are

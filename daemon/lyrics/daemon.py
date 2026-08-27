@@ -19,6 +19,7 @@ from .state import AppState, ColorRect, CoverArt, Lyrics, ScheduledFrame, TrackI
 from .profiles import BOARDS, RenderProfile, cover_placement, hero_cover_size, max_cover_size
 from .imaging import blit_cover, blit_cover_centered, board_wants_rgb565, color_cover_rect, composite_chip, composite_rgb565_chip, cover_url_for, dirty_rect, fetch_cover_bytes, invert_frame, make_color_envelope, make_frame_envelope, profile_from_board_path
 from .store import LyricsStore, ResolveCancelled, _is_timeout_error, fetch_lrclib
+from .relay import RELAY_PATH, RelayHub
 from .wsproto import WebSocketConnection
 from .render import FrameRenderer
 
@@ -42,6 +43,9 @@ class LyricsDisplayDaemon:
         self.media_timeline_offset_sec = 0.0
         # Album art dithered to 1-bit, cached per (cover URL, size) (bounded).
         self.cover_cache: dict[tuple[str, int], CoverArt | None] = {}
+        # Downstream daemons (e.g. the ESP8266 process) mirroring this one's
+        # extension feed. Empty in a process that has no subscribers.
+        self.relay = RelayHub()
 
     def _cancel_inflight_resolve(self) -> None:
         if self._resolve_cancel is not None:
@@ -52,6 +56,9 @@ class LyricsDisplayDaemon:
         conn = WebSocketConnection(reader, writer)
         try:
             path = await conn.handshake()
+            if path == RELAY_PATH:
+                await self.handle_relay_subscriber(conn)
+                return
             if path != "/extension":
                 conn.close()
                 return
@@ -70,6 +77,57 @@ class LyricsDisplayDaemon:
             # can EOF or overrun before a request arrives -- log, don't crash.
             print(f"extension websocket closed: {exc}")
         print("extension disconnected")
+
+    async def handle_relay_subscriber(self, conn: WebSocketConnection) -> None:
+        """Serve a downstream daemon mirroring this one's extension feed."""
+        self.relay.add(conn)
+        print("relay subscriber connected")
+        try:
+            await conn.send_text(await self.relay_snapshot())
+            while await conn.recv() is not None:
+                pass  # downstream is read-only; drain so control frames work
+        finally:
+            self.relay.discard(conn)
+            conn.close()
+            print("relay subscriber disconnected")
+
+    async def relay_snapshot(self) -> dict[str, Any]:
+        """Current playback state, for a downstream that joined mid-song.
+
+        Positions here are already normalised against this daemon's media
+        timeline offset, so the downstream applies them with its own offset
+        cleared rather than through the usual tick path -- normalising twice
+        would shift the lyric timing by the length of every track played so far.
+        """
+        async with self.state_lock:
+            track = self.state.track
+            clock = self.state.clock
+            return {
+                "type": "relay-snapshot",
+                "payload": {
+                    "videoId": track.video_id, "title": track.title,
+                    "artist": track.artist, "album": track.album,
+                    "durationSec": track.duration_sec, "artUrl": track.art_url,
+                    "positionSec": clock.interpolated_position(),
+                    "paused": clock.paused, "playbackRate": clock.playback_rate,
+                    "theme": self.theme,
+                },
+            }
+
+    async def apply_relay_snapshot(self, payload: dict[str, Any]) -> None:
+        """Adopt an upstream snapshot as this daemon's whole playback state."""
+        await self.set_theme(str(payload.get("theme") or ""))
+        await self.set_track(TrackInfo(
+            video_id=str(payload.get("videoId") or ""),
+            title=str(payload.get("title") or ""),
+            artist=str(payload.get("artist") or ""),
+            album=str(payload.get("album") or ""),
+            duration_sec=float(payload.get("durationSec") or 0),
+            art_url=str(payload.get("artUrl") or ""),
+        ))
+        self.media_timeline_offset_sec = 0.0
+        await self.update_clock(payload)
+        await self.render_and_broadcast()
 
     async def handle_extension_message(self, raw: str) -> None:
         try:
@@ -111,6 +169,7 @@ class LyricsDisplayDaemon:
                     self.state.dirty = True
         elif msg_type == "set-theme":
             await self.set_theme(str(payload.get("theme") or ""))
+        await self.relay.broadcast(raw)
         await self.render_and_broadcast()
 
     async def set_track(self, track: TrackInfo) -> None:

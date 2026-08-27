@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import importlib
 import os
 import re
 import signal
 from pathlib import Path
 
-from .constants import BOARD_HOST, BOARD_PORT, EXTENSION_HOST, EXTENSION_PORT
+from .constants import BOARD_HOST, ESP32_BOARD_PORT, ESP8266_BOARD_PORT, EXTENSION_HOST, EXTENSION_PORT
 from .security import DaemonIdentity, default_identity_path, load_or_create_identity
 from .state import Lyrics, TrackInfo
 from .store import LyricsStore, parse_lrc_with_syllables
@@ -18,6 +19,7 @@ from .render import CoreTextFrameRenderer, FallbackFrameRenderer, FrameRenderer
 from .daemon import LyricsDisplayDaemon
 from .discovery import DnsSdAdvertiser
 from .profiles import BOARDS, RenderProfile
+from .relay import RelayClient
 
 # Board families a process can serve. The first name given becomes the registry
 # default -- the profile an unparseable /board query falls back to -- so an
@@ -32,6 +34,16 @@ def select_boards(names: "tuple[str, ...] | list[str]") -> list[RenderProfile]:
         module = importlib.import_module(f".{BOARD_MODULES[name]}", __package__)
         module.register(default=index == 0)
     return BOARDS.all()
+
+
+def board_list(value: str) -> tuple[str, ...]:
+    names = tuple(name.strip() for name in value.split(",") if name.strip())
+    unknown = [name for name in names if name not in BOARD_MODULES]
+    if unknown or not names:
+        raise argparse.ArgumentTypeError(
+            f"unknown board family {', '.join(unknown) or '(empty)'}; "
+            f"choose from {', '.join(BOARD_MODULES)}")
+    return names
 
 
 def build_renderer(font_name: str) -> FrameRenderer:
@@ -94,7 +106,21 @@ def cache_command(args: argparse.Namespace) -> int:
     raise ValueError(f"unknown cache command {args.cache_command}")
 
 
+def resolve_board_port(args: argparse.Namespace) -> int:
+    """Board port for this process, defaulted from the boards it serves.
+
+    The ESP8266 firmware has the port compiled in, so a process serving it must
+    listen on 8766; the ESP32 finds its daemon through mDNS and can sit anywhere.
+    """
+    if args.board_port is not None:
+        return args.board_port
+    return ESP8266_BOARD_PORT if "esp8266" in args.boards else ESP32_BOARD_PORT
+
+
 async def run(args: argparse.Namespace) -> None:
+    profiles = select_boards(args.boards)
+    args.board_port = resolve_board_port(args)
+    print("serving boards: " + ", ".join(f"{p.name} ({n})" for n, p in zip(args.boards, profiles)))
     store = LyricsStore(Path(args.db))
     # --insecure: run with no identity at all. Boards then connect over proto=1
     # with no token and frames go out unwrapped (no SEC2/HMAC). This is what the
@@ -125,11 +151,25 @@ async def run(args: argparse.Namespace) -> None:
         args.mdns_instance + " Legacy", "_lyrics", "_tcp", args.board_port,
         txt={"path": "/board?proto=1", "proto": "1", "auth": "token", "uuid": daemon_uuid},
     ) if (identity and args.allow_legacy_proto1) else None
-    extension_server = await asyncio.start_server(
-        daemon.handle_extension, args.extension_host, args.extension_port
+    # A downstream process does not own the extension port -- only one process
+    # can bind it, and the extension dials exactly one address. It mirrors the
+    # upstream daemon's feed over /relay instead.
+    relay_client = (
+        RelayClient(args.relay_upstream_host, args.relay_upstream_port,
+                    daemon.handle_extension_message, daemon.apply_relay_snapshot)
+        if args.relay_upstream else None
+    )
+    extension_server = (
+        None if relay_client is not None else
+        await asyncio.start_server(daemon.handle_extension, args.extension_host, args.extension_port)
     )
     board_server = await asyncio.start_server(daemon.handle_board, args.board_host, args.board_port)
-    print(f"extension WebSocket: ws://{args.extension_host}:{args.extension_port}/extension")
+    if extension_server is not None:
+        print(f"extension WebSocket: ws://{args.extension_host}:{args.extension_port}/extension")
+        print(f"relay WebSocket: ws://{args.extension_host}:{args.extension_port}/relay")
+    else:
+        print(f"playback state relayed from ws://{args.relay_upstream_host}:"
+              f"{args.relay_upstream_port}/relay")
     print(f"board WebSocket: ws://{args.board_host}:{args.board_port}/board")
     if identity:
         print(f"secure board identity: {identity.daemon_uuid}")
@@ -152,10 +192,14 @@ async def run(args: argparse.Namespace) -> None:
                 sig, lambda: stopping.done() or stopping.set_result(None))
         except (NotImplementedError, RuntimeError):
             pass
+    servers = [s for s in (extension_server, board_server) if s is not None]
     try:
-        async with extension_server, board_server:
-            serving = [asyncio.ensure_future(extension_server.serve_forever()),
-                       asyncio.ensure_future(board_server.serve_forever())]
+        async with contextlib.AsyncExitStack() as stack:
+            for server in servers:
+                await stack.enter_async_context(server)
+            serving = [asyncio.ensure_future(server.serve_forever()) for server in servers]
+            if relay_client is not None:
+                serving.append(asyncio.ensure_future(relay_client.run()))
             try:
                 await asyncio.wait(serving + [stopping], return_when=asyncio.FIRST_COMPLETED)
             finally:
@@ -168,7 +212,7 @@ async def run(args: argparse.Namespace) -> None:
             legacy_advertiser.stop()
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command")
 
@@ -177,7 +221,11 @@ def main() -> int:
         target.add_argument("--extension-host", default=os.environ.get("G4PYS_LYRICS_EXTENSION_HOST", EXTENSION_HOST))
         target.add_argument("--extension-port", type=int, default=int(os.environ.get("G4PYS_LYRICS_EXTENSION_PORT", str(EXTENSION_PORT))))
         target.add_argument("--board-host", default=os.environ.get("G4PYS_LYRICS_BOARD_HOST", BOARD_HOST))
-        target.add_argument("--board-port", type=int, default=int(os.environ.get("G4PYS_LYRICS_BOARD_PORT", str(BOARD_PORT))))
+        target.add_argument("--board-port", type=int,
+                            default=int(os.environ["G4PYS_LYRICS_BOARD_PORT"])
+                            if "G4PYS_LYRICS_BOARD_PORT" in os.environ else None,
+                            help=f"default: {ESP8266_BOARD_PORT} when this process serves the "
+                                 f"esp8266 (its firmware dials that port), else {ESP32_BOARD_PORT}")
         target.add_argument("--db", default=os.environ.get("G4PYS_LYRICS_DB", default_db_path()))
         target.add_argument("--font", default=os.environ.get("G4PYS_LYRICS_FONT", "Sukhumvit Set Semi Bold"))
         target.add_argument("--mdns-instance", default=os.environ.get("G4PYS_LYRICS_MDNS_INSTANCE", "g4pys Lyrics Display"))
@@ -191,6 +239,21 @@ def main() -> int:
                                  "(proto=1, unwrapped frames, no pairing token). Needed for the "
                                  "ESP8266, which lacks the heap for the SEC2 record layer.")
         target.add_argument("--no-mdns", action="store_true", default=os.environ.get("G4PYS_LYRICS_NO_MDNS") == "1")
+        target.add_argument("--boards", default=os.environ.get("G4PYS_LYRICS_BOARDS", "esp32"),
+                            type=board_list,
+                            help="comma-separated board families this process serves: "
+                                 f"{', '.join(BOARD_MODULES)} (default: esp32). The first one "
+                                 "is the fallback geometry for an unrecognised /board query. "
+                                 "Use 'esp32,esp8266' for the old single-process behaviour.")
+        target.add_argument("--relay-upstream", action="store_true",
+                            default=os.environ.get("G4PYS_LYRICS_RELAY_UPSTREAM") == "1",
+                            help="take playback state from another daemon's /relay endpoint "
+                                 "instead of binding the extension port. Set this on every "
+                                 "daemon except the one the browser extension connects to.")
+        target.add_argument("--relay-upstream-host",
+                            default=os.environ.get("G4PYS_LYRICS_RELAY_UPSTREAM_HOST", EXTENSION_HOST))
+        target.add_argument("--relay-upstream-port", type=int,
+                            default=int(os.environ.get("G4PYS_LYRICS_RELAY_UPSTREAM_PORT", str(EXTENSION_PORT))))
 
     import_parser = subparsers.add_parser("import-lrc", help="import one or more .lrc files as manual lyrics")
     import_parser.add_argument("files", nargs="+")
@@ -212,7 +275,7 @@ def main() -> int:
     pairing_parser = subparsers.add_parser("pairing-token", help="print the token to enter on a board")
     pairing_parser.add_argument("--identity", default=os.environ.get("G4PYS_LYRICS_IDENTITY", str(default_identity_path())))
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.command == "import-lrc":
         return import_lrc_command(args)
     if args.command == "cache":
