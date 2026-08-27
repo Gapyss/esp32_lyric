@@ -110,24 +110,47 @@ from .lyrics.state import (
     ColorRect,
 )
 from .lyrics.profiles import (
+    BOARDS,
+    BoardRegistry,
     LyricLayoutSizes,
     LyricLayout,
     DEFAULT_LYRIC_LAYOUT_SIZES,
-    SQUARE_LYRIC_LAYOUT_SIZES,
     RenderProfile,
-    WIDE_PROFILE,
-    SQUARE_PROFILE,
-    DEFAULT_PROFILE,
-    PROFILES_BY_SIZE,
     ProgressGeom,
-    WIDE_PROGRESS_GEOM,
-    SQUARE_PROGRESS_GEOM,
     CoverPlacement,
-    COVER_PLACEMENTS,
+    PauseChipGeom,
     cover_placement,
     max_cover_size,
     hero_cover_size,
 )
+
+# Importing this facade registers both board families, which is what the single
+# combined daemon always served. ``serve --boards`` narrows it per process.
+from .lyrics.board_esp32 import WIDE_PROFILE, WIDE_PROGRESS_GEOM
+from .lyrics.board_esp8266 import (
+    SQUARE_LYRIC_LAYOUT_SIZES,
+    SQUARE_PROFILE,
+    SQUARE_PROGRESS_GEOM,
+)
+from .lyrics.cli import select_boards
+
+select_boards(("esp32", "esp8266"))
+
+
+def _legacy_profile_view(name: str) -> object:
+    """The three profile lookups that used to be module-level constants.
+
+    They are derived from the live registry rather than frozen at import,
+    because ``serve --boards`` narrows it per process: a frozen ``DEFAULT_PROFILE``
+    would still claim 400x300 inside the ESP8266 daemon.
+    """
+    if name == "DEFAULT_PROFILE":
+        return BOARDS.default
+    if name == "PROFILES_BY_SIZE":
+        return {(p.width, p.height): p for p in BOARDS.all()}
+    if name == "COVER_PLACEMENTS":
+        return {p.name: p.cover for p in BOARDS.all() if p.cover is not None}
+    raise AttributeError(name)
 from .lyrics.imaging import (
     blit_cover_centered,
     composite_chip,
@@ -249,6 +272,11 @@ class _Facade(_types.ModuleType):
         for module in _PACKAGE_MODULES:
             if name in vars(module):
                 setattr(module, name, value)
+
+    def __getattr__(self, name: str) -> object:
+        # Only reached for names not bound on the module, i.e. the registry-
+        # derived legacy lookups above.
+        return _legacy_profile_view(name)
 
     def __delattr__(self, name: str) -> None:
         super().__delattr__(name)

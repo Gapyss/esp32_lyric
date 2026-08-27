@@ -16,7 +16,7 @@ from urllib.parse import parse_qs, urlparse
 from .constants import ALBUM_ART_INTRO_SECONDS, AUTH_TIMEOUT_SECONDS, FRAME_KIND_FULL_NOW, FRAME_KIND_FULL_SCHEDULED, FRAME_KIND_RECT_NOW, MIN_SCHEDULE_SWAP_MS
 from .security import DaemonIdentity, _auth_transcript, derive_session_keys, monotonic_ms
 from .state import AppState, ColorRect, CoverArt, Lyrics, ScheduledFrame, TrackInfo
-from .profiles import DEFAULT_PROFILE, RenderProfile, SQUARE_PROFILE, cover_placement, hero_cover_size, max_cover_size
+from .profiles import BOARDS, RenderProfile, cover_placement, hero_cover_size, max_cover_size
 from .imaging import blit_cover, blit_cover_centered, board_wants_rgb565, color_cover_rect, composite_chip, composite_rgb565_chip, cover_url_for, dirty_rect, fetch_cover_bytes, invert_frame, make_color_envelope, make_frame_envelope, profile_from_board_path
 from .store import LyricsStore, ResolveCancelled, _is_timeout_error, fetch_lrclib
 from .wsproto import WebSocketConnection
@@ -281,14 +281,14 @@ class LyricsDisplayDaemon:
     @property
     def last_frame(self) -> bytes | None:
         """Latest default-profile now-frame (kept for tests/back-compat)."""
-        return self.last_frames.get(DEFAULT_PROFILE.name)
+        return self.last_frames.get(BOARDS.default.name)
 
     @last_frame.setter
     def last_frame(self, frame: bytes | None) -> None:
         if frame is None:
-            self.last_frames.pop(DEFAULT_PROFILE.name, None)
+            self.last_frames.pop(BOARDS.default.name, None)
         else:
-            self.last_frames[DEFAULT_PROFILE.name] = frame
+            self.last_frames[BOARDS.default.name] = frame
 
     def _render(self, state: AppState, profile: RenderProfile) -> bytes:
         # During the first five seconds, fill the panel with clean album art.
@@ -329,7 +329,7 @@ class LyricsDisplayDaemon:
         value, chip_mask, chip_w, chip_h = self.renderer.render_pause_chip(profile)
         art_x = max(0, (profile.width - cover.size) // 2)
         art_y = max(0, (profile.height - cover.size) // 2)
-        margin = 12 if profile.name == SQUARE_PROFILE.name else 14
+        margin = profile.pause_chip.margin
         frame = composite_chip(
             frame, value, chip_mask, art_x + margin, art_y + margin, chip_w, chip_h, profile
         )
@@ -338,7 +338,7 @@ class LyricsDisplayDaemon:
     def _active_profiles(self) -> list[RenderProfile]:
         profiles: dict[str, RenderProfile] = {conn.profile.name: conn.profile for conn in self.boards}
         if not profiles:
-            profiles[DEFAULT_PROFILE.name] = DEFAULT_PROFILE
+            profiles[BOARDS.default.name] = BOARDS.default
         return list(profiles.values())
 
     def _has_current_track_locked(self) -> bool:
@@ -614,7 +614,7 @@ class LyricsDisplayDaemon:
             cover = state.hero_cover
             art_x = max(0, (profile.width - cover.size) // 2)
             art_y = max(0, (profile.height - cover.size) // 2)
-            margin = 12 if profile.name == SQUARE_PROFILE.name else 14
+            margin = profile.pause_chip.margin
             return composite_rgb565_chip(
                 rect, value, mask, art_x + margin, art_y + margin, chip_w, chip_h
             )

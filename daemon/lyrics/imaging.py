@@ -10,7 +10,7 @@ from urllib.parse import parse_qs, urlparse
 
 from .constants import COLOR_ENVELOPE_MAGIC, COLOR_ENVELOPE_VERSION, COLOR_KIND_RECT_NOW, DISPLAY_HEIGHT, DISPLAY_WIDTH, FRAME_ENVELOPE_MAGIC, FRAME_ENVELOPE_STRUCT, FRAME_ENVELOPE_VERSION, LRCLIB_USER_AGENT, LyricBreakFn
 from .state import ColorRect, CoverArt, DirtyRect
-from .profiles import DEFAULT_PROFILE, LyricLayout, LyricLayoutSizes, PROFILES_BY_SIZE, RenderProfile, cover_placement
+from .profiles import BOARDS, LyricLayout, LyricLayoutSizes, RenderProfile, cover_placement
 
 def blit_cover_centered(frame: bytes, cover: CoverArt, profile: RenderProfile) -> bytes:
     """Assign a dithered square cover centered on the frame, clipped to bounds.
@@ -276,8 +276,8 @@ def profile_from_board_path(path: str) -> RenderProfile:
         width = int((query.get("w") or ["0"])[0])
         height = int((query.get("h") or ["0"])[0])
     except ValueError:
-        return DEFAULT_PROFILE
-    return PROFILES_BY_SIZE.get((width, height), DEFAULT_PROFILE)
+        return BOARDS.default
+    return BOARDS.profile_for(width, height)
 
 
 def board_wants_rgb565(path: str) -> bool:

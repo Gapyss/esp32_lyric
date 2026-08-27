@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import importlib
 import os
 import re
 import signal
@@ -16,6 +17,22 @@ from .store import LyricsStore, parse_lrc_with_syllables
 from .render import CoreTextFrameRenderer, FallbackFrameRenderer, FrameRenderer
 from .daemon import LyricsDisplayDaemon
 from .discovery import DnsSdAdvertiser
+from .profiles import BOARDS, RenderProfile
+
+# Board families a process can serve. The first name given becomes the registry
+# default -- the profile an unparseable /board query falls back to -- so an
+# ESP8266-only process never falls back to a 400x300 frame.
+BOARD_MODULES = {"esp32": "board_esp32", "esp8266": "board_esp8266"}
+
+
+def select_boards(names: "tuple[str, ...] | list[str]") -> list[RenderProfile]:
+    """Register exactly the board families this process serves."""
+    BOARDS.reset()
+    for index, name in enumerate(names):
+        module = importlib.import_module(f".{BOARD_MODULES[name]}", __package__)
+        module.register(default=index == 0)
+    return BOARDS.all()
+
 
 def build_renderer(font_name: str) -> FrameRenderer:
     try:

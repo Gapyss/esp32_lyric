@@ -8,11 +8,11 @@ from typing import Any
 from .constants import BRAND_FONT_NAMES, DISPLAY_HEIGHT, DISPLAY_WIDTH, KARAOKE_STROKE_PCT, MONO_FONT_NAME, TRACKING_MEGA, TRACKING_WIDE
 from .security import clamp
 from .state import AppState, CoverArt
-from .profiles import DEFAULT_PROFILE, LyricLayout, ProgressGeom, RenderProfile, SQUARE_PROFILE, SQUARE_PROGRESS_GEOM, WIDE_PROGRESS_GEOM, cover_placement
+from .profiles import BOARDS, LyricLayout, ProgressGeom, RenderProfile, cover_placement
 from .imaging import draw_rect, fill_rect, fit_lyric_layout, floyd_steinberg_1bit, format_time, pack_1bpp
 
 class FrameRenderer:
-    def render(self, state: AppState, profile: RenderProfile = DEFAULT_PROFILE) -> bytes:
+    def render(self, state: AppState, profile: RenderProfile | None = None) -> bytes:
         raise NotImplementedError
 
 
@@ -59,7 +59,8 @@ class CoreTextFrameRenderer(FrameRenderer):
     def _role_font(self, role: str) -> str:
         return self.brand_fonts.get(role, self.font_name)
 
-    def render(self, state: AppState, profile: RenderProfile = DEFAULT_PROFILE) -> bytes:
+    def render(self, state: AppState, profile: RenderProfile | None = None) -> bytes:
+        profile = profile or BOARDS.default
         q = self.Quartz
         self._h = profile.height
         ctx = q.CGBitmapContextCreate(
@@ -71,10 +72,7 @@ class CoreTextFrameRenderer(FrameRenderer):
         q.CGContextSetShouldAntialias(ctx, True)
         q.CGContextSetTextMatrix(ctx, q.CGAffineTransformIdentity)
 
-        if profile.name == SQUARE_PROFILE.name:
-            self._draw_square(ctx, state, profile)
-        else:
-            self._draw_wide(ctx, state, profile)
+        profile.paint(self, ctx, state, profile)
 
         image = q.CGBitmapContextCreateImage(ctx)
         pixels = bytes(q.CGDataProviderCopyData(q.CGImageGetDataProvider(image)))
@@ -151,10 +149,8 @@ class CoreTextFrameRenderer(FrameRenderer):
         """
         ct = self.CoreText
         font_name = self._role_font("label")
-        if profile.name == SQUARE_PROFILE.name:
-            size, pad_x, chip_h, rise = 11, 7, 16, 11
-        else:
-            size, pad_x, chip_h, rise = 13, 9, 20, 14
+        chip = profile.pause_chip
+        size, pad_x, chip_h, rise = chip.size, chip.pad_x, chip.chip_h, chip.rise
         text = "PAUSED"
         font = ct.CTFontCreateWithName(font_name, size, None)
         attrs = {
@@ -240,109 +236,6 @@ class CoreTextFrameRenderer(FrameRenderer):
             )
             consumed_chars += len(row)
         return current_layout
-
-    def _draw_wide(self, ctx: Any, state: AppState, profile: RenderProfile) -> None:
-        label_font = self._role_font("label")
-        display_font = self._role_font("display")
-        body_font = self._role_font("body")
-        body_medium_font = self._role_font("body_medium")
-
-        self._draw_text(
-            ctx, "NOW PLAYING", 13, 14, 18, DISPLAY_WIDTH - 28, "left", font_name=label_font, tracking=TRACKING_MEGA
-        )
-        self._draw_rule(ctx, 12, 28, DISPLAY_WIDTH - 24)
-
-        if not state.track.title:
-            # Idle: quiet centered copy in the design system's lowercase voice.
-            self._draw_text(ctx, "nothing playing", 30, 14, 150, DISPLAY_WIDTH - 28, "center", font_name=display_font)
-            self._draw_text(
-                ctx, "waiting for youtube music", 15, 14, 182, DISPLAY_WIDTH - 28, "center", font_name=body_font
-            )
-            self._screen_rect(ctx, 14, 168, DISPLAY_WIDTH - 28, 20)
-            self._draw_text(
-                ctx, "POWERED BY CLAUDE", 13, 260, 292, 126, "right", font_name=MONO_FONT_NAME, tracking=TRACKING_WIDE
-            )
-            return
-
-        place = cover_placement(profile) if state.cover is not None else None
-        header_w = place.title_w if place is not None else DISPLAY_WIDTH - 28
-        self._draw_text(ctx, state.track.title, 28, 14, 60, header_w, "left", font_name=display_font)
-        self._draw_text(ctx, state.track.artist, 18, 14, 88, header_w, "left", font_name=body_medium_font)
-        if place is not None:
-            self._draw_cover_card(ctx, place)
-        self._draw_progress(ctx, state, MONO_FONT_NAME, WIDE_PROGRESS_GEOM)
-        self._draw_rule(ctx, 12, 130, DISPLAY_WIDTH - 24)
-
-        _current, next_line, third = state.current_lines()
-        current_layout = self._draw_lyric_band(ctx, state, profile)
-        self._draw_text(ctx, next_line, 21, 14, 224, DISPLAY_WIDTH - 28, "center", font_name=body_font)
-        if not current_layout.hide_third and third:
-            self._draw_text(ctx, third, 16, 14, 252, DISPLAY_WIDTH - 28, "center", font_name=body_font)
-            self._screen_rect(ctx, 14, 238, DISPLAY_WIDTH - 28, 22)
-        if state.clock.paused:
-            self._draw_state_chip(ctx, "PAUSED", 14, 292, font_name=label_font)
-        else:
-            self._draw_text(
-                ctx, "PLAYING", 13, 14, 292, 120, "left", font_name=label_font, tracking=TRACKING_MEGA
-            )
-        self._draw_text(
-            ctx, "1.0.0", 13, 260, 292, 126, "right", font_name=MONO_FONT_NAME, tracking=TRACKING_WIDE
-        )
-
-    def _draw_square(self, ctx: Any, state: AppState, profile: RenderProfile) -> None:
-        """Compact 240x240 layout for the ESP8266 SmallTV boards.
-
-        Same structure as the wide layout -- eyebrow, title/artist, progress,
-        karaoke lyric band, next line, footer -- just tighter type scale.
-        """
-        width = profile.width
-        label_font = self._role_font("label")
-        display_font = self._role_font("display")
-        body_font = self._role_font("body")
-        body_medium_font = self._role_font("body_medium")
-
-        self._draw_text(
-            ctx, "NOW PLAYING", 11, 12, 14, width - 24, "left", font_name=label_font, tracking=TRACKING_MEGA
-        )
-        self._draw_rule(ctx, 10, 24, width - 20)
-
-        if not state.track.title:
-            self._draw_text(ctx, "nothing playing", 22, 12, 112, width - 24, "center", font_name=display_font)
-            self._draw_text(
-                ctx, "waiting for youtube music", 13, 12, 140, width - 24, "center", font_name=body_font
-            )
-            self._screen_rect(ctx, 12, 126, width - 24, 18)
-            self._draw_text(
-                ctx, "1.0.0", 11, 116, 228, width - 128, "right", font_name=MONO_FONT_NAME, tracking=TRACKING_WIDE
-            )
-            return
-
-        place = cover_placement(profile) if state.cover is not None else None
-        header_w = place.title_w if place is not None else width - 24
-        self._draw_text(ctx, state.track.title, 20, 12, 52, header_w, "left", font_name=display_font)
-        self._draw_text(ctx, state.track.artist, 14, 12, 74, header_w, "left", font_name=body_medium_font)
-        if place is not None:
-            self._draw_cover_card(ctx, place)
-        self._draw_progress(ctx, state, MONO_FONT_NAME, SQUARE_PROGRESS_GEOM)
-        self._draw_rule(ctx, 10, 104, width - 20)
-
-        _current, next_line, third = state.current_lines()
-        current_layout = self._draw_lyric_band(ctx, state, profile)
-        self._draw_text(ctx, next_line, 14, 12, 202, width - 24, "center", font_name=body_font)
-        if not current_layout.hide_third and third:
-            self._draw_text(ctx, third, 12, 12, 222, width - 24, "center", font_name=body_font)
-            self._screen_rect(ctx, 12, 210, width - 24, 16)
-        if state.clock.paused:
-            self._draw_state_chip(
-                ctx, "PAUSED", 12, 234, font_name=label_font, size=11, pad_x=7, chip_h=16, rise=11
-            )
-        else:
-            self._draw_text(
-                ctx, "PLAYING", 11, 12, 234, 110, "left", font_name=label_font, tracking=TRACKING_MEGA
-            )
-        self._draw_text(
-            ctx, "1.0.0", 11, 116, 234, width - 128, "right", font_name=MONO_FONT_NAME, tracking=TRACKING_WIDE
-        )
 
     def _break_text(self, text: str, size: float, width: int) -> list[str]:
         if not text:
@@ -660,12 +553,12 @@ class CoreTextFrameRenderer(FrameRenderer):
 
 
 class FallbackFrameRenderer(FrameRenderer):
-    def render(self, state: AppState, profile: RenderProfile = DEFAULT_PROFILE) -> bytes:
+    def render(self, state: AppState, profile: RenderProfile | None = None) -> bytes:
         width, height = profile.width, profile.height
         frame = bytearray(profile.frame_bytes)
         elapsed = state.clock.interpolated_position()
         duration = max(1.0, state.track.duration_sec or 1.0)
-        geom = SQUARE_PROGRESS_GEOM if profile.name == SQUARE_PROFILE.name else WIDE_PROGRESS_GEOM
+        geom = profile.progress_geom
         fill = int(clamp(elapsed / duration, 0.0, 1.0) * geom.bar_w)
         draw_rect(frame, geom.bar_x, geom.center_y - 5, geom.bar_w, 10, width, height)
         if fill:
