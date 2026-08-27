@@ -505,7 +505,11 @@ Files:
 
 Features:
 
-- `company.g4pys.lyrics-display-daemon` starts `daemon/lyrics_display_daemon.py serve`.
+- `company.g4pys.lyrics-display-daemon` starts `daemon/lyrics_display_daemon.py serve`
+  (ESP32, board port 8767, owns the browser-extension port).
+- `company.g4pys.lyrics-display-esp8266` starts `daemon/lyrics_display_esp8266.py serve`
+  (ESP8266 SmallTV, board port 8766, unauthenticated, takes playback state from
+  the first daemon's `/relay` endpoint). Restartable without disturbing the ESP32.
 - `company.g4pys.lyrics-display-daemon` sets `G4PYS_LYRICS_DB=/Users/g4pys/.g4pys/lyrics-display.sqlite3`.
 - `company.g4pys.claudemeter-daemon` starts `daemon/claudemeter_daemon.py`.
 - `company.g4pys.claudemeter-daemon` forwards to `http://127.0.0.1:8123`.

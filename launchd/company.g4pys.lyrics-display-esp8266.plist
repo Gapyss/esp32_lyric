@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>company.g4pys.lyrics-display-esp8266</string>
+
+  <!-- Companion to company.g4pys.lyrics-display-daemon. That job owns the
+       browser-extension port and serves the 400x300 ESP32 board on :8767;
+       this one serves the 240x240 SmallTV on :8766 (the port its firmware
+       dials) and takes playback state from the other job's /relay endpoint.
+       Restarting this job does not disturb the e-ink board, which is the
+       reason the two are separate. Start the other job first -- if it is
+       down this one simply retries with backoff. -->
+
+  <key>ProgramArguments</key>
+  <array>
+    <!-- Must be an interpreter with pyobjc-framework-CoreText installed.
+         The daemon falls back to geometry-only frames without it, which means
+         the board receives rules/progress pixels but no rendered text. -->
+    <string>/Users/g4pys/esp-32/tools/.venv/bin/python3</string>
+    <string>-m</string>
+    <string>daemon.lyrics_display_esp8266</string>
+    <string>serve</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/g4pys/esp-32</string>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/Users/g4pys/Library/Logs/g4pys-lyrics-display-esp8266.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/g4pys/Library/Logs/g4pys-lyrics-display-esp8266.err.log</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+    <key>G4PYS_LYRICS_DB</key>
+    <string>/Users/g4pys/.g4pys/lyrics-display.sqlite3</string>
+  </dict>
+</dict>
+</plist>

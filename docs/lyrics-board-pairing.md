@@ -16,10 +16,17 @@ python3 daemon/lyrics_display_daemon.py serve
 Keep this process running. A successful startup includes output similar to:
 
 ```text
-board WebSocket: ws://0.0.0.0:8766/board
+serving boards: 400x300 (esp32)
+board WebSocket: ws://0.0.0.0:8767/board
 board WebSocket auth: mutual nonce/HMAC (proto=2)
-mDNS advertisement: g4pys Lyrics Display._lyrics._tcp.local:8766
+mDNS advertisement: g4pys Lyrics Display._lyrics._tcp.local:8767
 ```
+
+This guide covers the ESP32 e-ink board. Since the daemon was split per board
+family it serves the ESP32 on `:8767` and finds it through mDNS, so the port is
+never configured on the board. The 240x240 ESP8266 SmallTV has its own
+unauthenticated process (`daemon/lyrics_display_esp8266.py` on `:8766`) and no
+pairing step at all — see `esp8266/README.md`.
 
 ## 2. Get the pairing token
 
@@ -122,7 +129,7 @@ submit it to the board again. Authentication failure does not erase pairing.
 First confirm the daemon is still running:
 
 ```sh
-lsof -nP -iTCP:8766 -sTCP:LISTEN
+lsof -nP -iTCP:8767 -sTCP:LISTEN
 ```
 
 Then confirm Bonjour is visible:
@@ -154,7 +161,9 @@ A stale advertisement is the usual cause. The daemon registers through a
 child survives, reparented to `init`, and keeps advertising. Every run registers
 the same instance name, so Bonjour lets the oldest registration own the name and
 the board reads the dead daemon's TXT — including `proto=1 auth=none` left behind
-by an old `--insecure` run.
+by an old `--insecure` run. (`--insecure` is no longer needed for the ESP8266 —
+it has its own process now — so a `proto=1 auth=none` record from this daemon
+means a stale registration, not a live one.)
 
 List every registration and check for orphans (`PPID` of `1`):
 

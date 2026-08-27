@@ -8,10 +8,14 @@
 // (ieee80211_parse_beacon, StoreProhibited on a NULL alloc). So on this chip we
 // drop authentication and stream frames straight into ONE framebuffer.
 //
-// Run the daemon with --insecure (no identity): it then speaks proto=1, sends a
-// plaintext hello, and pushes bare LYR1 envelopes (no SEC2 wrapper). We dial the
-// Mac whose IP arrives on /nowplaying (lyricsStreamNoteHost) — the daemon address
-// is never configured here.
+// Our daemon is daemon/lyrics_display_esp8266.py, a separate process from the
+// ESP32's: it runs --insecure (no identity), so it speaks proto=1, sends a
+// plaintext hello, and pushes bare LYR1 envelopes (no SEC2 wrapper). Splitting
+// it out is what keeps the ESP32's proto=2 authentication intact — one shared
+// daemon in --insecure mode used to downgrade both boards. We dial the Mac whose
+// IP arrives on /nowplaying (lyricsStreamNoteHost) — the daemon address is never
+// configured here, but LYR_PORT below is, which is why that process takes :8766
+// and the ESP32 daemon (found over mDNS) moved to :8767.
 //
 // While the MUSIC screen is visible this module keeps a hand-rolled WebSocket to
 // the daemon's board port (:8766). The daemon renders 240x240 1-bpp frames with

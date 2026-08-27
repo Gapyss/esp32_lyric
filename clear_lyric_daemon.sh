@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# The daemon is split per board family: lyrics_display_daemon.py serves the
+# ESP32 and owns the extension port, lyrics_display_esp8266.py serves the
+# SmallTV off the relay. Stop both -- matching only the first would leave the
+# ESP8266 daemon holding port 8766 and reconnecting to a daemon that is gone.
 patterns=(
   "[l]yrics_display_daemon.py"
+  "[l]yrics_display_esp8266.py"
   "[l]yric_daemon"
 )
 
@@ -38,4 +43,4 @@ done
 stop_pattern "$db_pattern" "lyrics sqlite session"
 
 echo "Remaining matching processes:"
-pgrep -af "[l]yric|[l]yrics_display_daemon|[s]qlite3 .*/lyrics-display\\.sqlite3" || echo "None"
+pgrep -af "[l]yric|[l]yrics_display_daemon|[l]yrics_display_esp8266|[s]qlite3 .*/lyrics-display\\.sqlite3" || echo "None"

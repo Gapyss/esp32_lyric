@@ -18,7 +18,7 @@ you get the meter on the desk and in the browser.
 Mac daemon ──poll 60s──> api.anthropic.com   (reads usage headers)
    └── HTTP POST /usage + /nowplaying + /daily ──> ESP8266 ──serves──> dashboard
 
-lyrics daemon (lyrics_display_daemon.py, optional)
+lyrics daemon (lyrics_display_esp8266.py, optional)
    └── WebSocket :8766 ──1-bit UI + RGB565 cover art──> ESP8266 MUSIC screen
 ```
 
@@ -130,22 +130,37 @@ python3 daemon/claudemeter_daemon.py
   now-playing renderer: if the stream drops (Mac asleep, daemon stopped) the
   screen shows a paper placeholder and reconnects on its own within seconds.
 
-  **Run the lyrics daemon with `--insecure` (required for this board).** By
-  default the daemon creates an identity and requires a mutual HMAC-SHA256
-  handshake (secure proto=2) — the scheme the ESP32 board uses. The ESP8266
-  lacks the heap to buffer-and-verify a whole SEC2 record on top of its
-  framebuffer, so it speaks the unauthenticated proto=1 instead. Start the
-  lyrics daemon with `--insecure` and it drops the identity, advertises
-  `proto=1`, and streams unwrapped frames the board can render:
+  **This board has its own daemon process.** By default the lyrics daemon
+  creates an identity and requires a mutual HMAC-SHA256 handshake (secure
+  proto=2) — the scheme the ESP32 board uses. The ESP8266 lacks the heap to
+  buffer-and-verify a whole SEC2 record on top of its framebuffer, so it speaks
+  the unauthenticated proto=1 instead. That used to mean starting the one shared
+  daemon with `--insecure`, which dropped the ESP32's authentication too. The
+  two now run as separate processes:
 
   ```sh
-  python3 daemon/lyrics_display_daemon.py serve --insecure
+  # terminal 1 — owns the browser-extension port, serves the ESP32 on :8767
+  python3 daemon/lyrics_display_daemon.py serve
+
+  # terminal 2 — serves this board on :8766, unauthenticated
+  python3 daemon/lyrics_display_esp8266.py serve
   ```
 
-  (Or set `G4PYS_LYRICS_INSECURE=1`.) There is no pairing step and no token —
-  the trade is LAN-link authentication for ~7 KB of heap, so run it on a
-  trusted home network. Without `--insecure` the board can't complete the
-  handshake and the MUSIC screen just stays on the placeholder.
+  `lyrics_display_esp8266.py` is the same daemon with `--boards esp8266
+  --insecure --relay-upstream --no-mdns` applied; it takes playback state from
+  the first daemon's `/relay` endpoint, because the browser extension connects
+  to one address only. Start order does not matter — if the upstream daemon is
+  down this one retries with backoff, and it recovers the current track from a
+  snapshot when the link comes up, so you can restart it mid-song without
+  touching the e-ink board.
+
+  Neither board needs reflashing: the ESP32 reads the port out of the mDNS
+  record, and this board keeps the `:8766` its firmware dials. There is still no
+  pairing step and no token on the ESP8266 link — the trade is LAN-link
+  authentication for ~7 KB of heap, so run it on a trusted home network. The
+  old single-process behaviour is still available with
+  `serve --boards esp32,esp8266 --insecure`, at the cost of the ESP32's
+  authentication.
 - The daemon also resolves the daily xkcd/APOD metadata and pushes it to
   `/daily` every 6 h (the ESP8266 can't afford the TLS heap to call those
   HTTPS APIs itself). It turns on automatically with usage pushing; set

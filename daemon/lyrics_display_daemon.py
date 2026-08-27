@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Backwards-compatible facade for the split :mod:`daemon.lyrics` package.
 
-The daemon used to be one 3.5k-line module. It is now a package -- constants,
-state, profiles, imaging, store, websocket, renderers, daemon, discovery and
-CLI -- so the per-board layouts can be pulled apart next. This module keeps the
-old flat import surface working for the test suite, ``clear_lyric_daemon.sh``
-and the launchd job, and stays the daemon entry point.
+The daemon used to be one 3.5k-line module. It is now a package -- core,
+renderers and one module per board family -- so the ESP8266 can run as its own
+process. This module keeps the old flat import surface working for the test
+suite, ``clear_lyric_daemon.sh`` and the launchd job, and stays the ESP32
+entry point.
 
 New code should import from :mod:`daemon.lyrics` directly.
 """
