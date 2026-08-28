@@ -1,44 +1,52 @@
-# Clawdmeter — ESP8266 desk cube
+# Clawdmeter — ESP8266 lyrics cube
 
 ## What is this?
 
-A tiny desk display that shows your **Claude usage limits** (session + weekly
-window) at a glance, plus a set of small companion screens — a clock, a
-pomodoro timer, now-playing music with synced lyrics, a falling-sand toy, and
-the daily xkcd / NASA APOD picture. Everything is drawn in the **Tend** look shared with the ESP32
-firmware in this repo: warm paper, ink, one ember accent.
+A tiny desk display that shows **one thing**: the song you're playing, with
+synced lyrics. Nothing else — no clock face, no pomodoro, no toys. It runs the
+**Tend** look shared with the ESP32 firmware in this repo: warm paper, ink, one
+ember accent.
 
 It runs on the GeekMagic **HelloCubic Lite** / **SmallTV-Ultra** (an ESP8266
 with an ST7789 240×240 color TFT), ported from
 [Gapyss/clawdmeter-esp8266](https://github.com/Gapyss/clawdmeter-esp8266).
-The device drives the LCD **and** serves a web dashboard at the same URL, so
-you get the meter on the desk and in the browser.
+The device drives the LCD **and** serves a small web dashboard at the same URL,
+which is where you tend it: it has no buttons.
 
 ```
-Mac daemon ──poll 60s──> api.anthropic.com   (reads usage headers)
-   └── HTTP POST /usage + /nowplaying + /daily ──> ESP8266 ──serves──> dashboard
+lyrics daemon (lyrics_display_esp8266.py)
+   └── WebSocket :8766 ──1-bit UI + RGB565 cover art──> ESP8266 lyrics screen
 
-lyrics daemon (lyrics_display_esp8266.py, optional)
-   └── WebSocket :8766 ──1-bit UI + RGB565 cover art──> ESP8266 MUSIC screen
+claudemeter daemon (claudemeter_daemon.py)
+   └── HTTP POST /usage + /nowplaying ──> ESP8266   (teaches it the Mac's IP)
 ```
 
-Your Anthropic OAuth token never leaves the Mac. The device only receives
-usage percentages, reset times, Mac metrics, now-playing/lyric lines, and
-daily-image metadata.
+### The screen
 
-### The screens
+The lyrics screen is rendered **entirely on the Mac** by
+`daemon/lyrics_display_esp8266.py`: a Tend-color 240×240 UI with Core Text Thai
+shaping, syllable karaoke, and real-color album covers, streamed to the panel
+frame by frame. There is no on-device now-playing renderer.
 
-Switched from the dashboard (the device has no buttons — the ESP32's button
-gestures became dashboard controls):
+When no frame is flowing — daemon off, Mac asleep, nothing playing — the panel
+falls back to the **waiting screen**, which is deliberately useful rather than
+blank:
 
-| Screen | What it shows / does |
-|---|---|
-| `clock` | Time from the daemon push (no RTC/NTP needed once pushed) |
-| `music` | Streamed lyrics screen, rendered **only** by the Mac's `lyrics_display_daemon.py`: a Tend-color 240×240 UI (Core Text Thai shaping + syllable karaoke) with real-color album covers. When no frame is flowing (daemon off, Mac asleep, no track) it shows a simple paper placeholder — there is no on-device now-playing renderer |
-| `pomodoro` | Focus timer — start/pause/reset from the dashboard |
-| `stats` | Claude usage + Mac metrics trend |
-| `sand` | Falling-sand toy — pour and clear |
-| `comic` / `apod` | Daily xkcd / NASA APOD, dithered 1-bit via the wsrv.nl proxy |
+```
+🔥 lyrics                                 20:14:33
+──────────────────────────────────────────────────
+
+              waiting for lyrics
+
+                 192.168.1.42
+                clawdmeter.local
+
+                wifi: my-network
+```
+
+That address is how you reach the dashboard from a phone without a serial cable
+or a hunt through the router's client list. It repaints when the IP or network
+changes, and turns into `wifi lost / reconnecting` in ember if the link drops.
 
 ## What you need
 
@@ -46,8 +54,7 @@ gestures became dashboard controls):
   240×240 board — pins are set at the top of the sketch).
 - A USB data cable for the **first** flash (updates after that are OTA).
 - Arduino IDE or `arduino-cli` on your computer.
-- A Mac on the same WiFi to run `daemon/claudemeter_daemon.py` (it reads the
-  usage headers and pushes them to the device).
+- A Mac on the same WiFi to run the two daemons (see step 4).
 
 ## Setup
 
@@ -70,151 +77,120 @@ arduino-cli compile --fqbn esp8266:esp8266:nodemcuv2:mmu=4816 \
 
 ### 2. Connect it to WiFi (first boot, no code editing)
 
-On first boot the device has no saved network, so it opens its own hotspot:
+On first boot the device has no saved network, so it opens its own hotspot and
+tells you so on the LCD:
 
-1. The LCD shows a setup hint and a hotspot appears: **Clawdmeter-setup**.
-2. Join it from your phone — a captive setup portal pops up automatically.
-3. Pick your WiFi, enter the password. The device saves it and reboots onto
-   your network.
+```
+🔥 wifi setup
 
-The credentials persist across reboots and OTA updates.
+        join this hotspot from a phone
+             Clawdmeter-setup
 
-**Changing WiFi later / recovery:** if the device can't reach its saved
-network (new router, new password, moved house), it reopens the
-**Clawdmeter-setup** hotspot by itself — rejoin and pick the new network. No
-reflashing. The portal times out after 3 minutes and retries, so a temporary
-router outage just means it reconnects when the network returns.
+          a setup page opens by itself
+                if not, browse to
+                  192.168.4.1
 
-**Full reset:** the dashboard's device panel has a **reset settings** button
-(`/factory-reset`). It wipes the saved WiFi and stored settings (brightness)
-and reboots straight back into the Clawdmeter-setup hotspot.
+           waiting 3 min, then retrying
+```
 
-### 3. Open the dashboard
+1. Join **Clawdmeter-setup** from your phone — a captive setup portal pops up.
+2. Pick your WiFi, enter the password. The device saves it and reboots onto
+   your network, then shows its new IP on the waiting screen.
 
-Visit `http://clawdmeter.local/` (or the IP printed on the Serial Monitor at
-115200 baud). You'll see the usage meters showing *waiting for daemon* until
-step 4.
+The credentials persist across reboots and OTA updates. If nobody finishes the
+portal within 3 minutes the device reboots and retries the saved network, so a
+temporary router outage just heals itself.
 
-- The **screen** row switches the physical LCD between the screens above.
-- The panel under it shows the live screen's controls — start the pomodoro,
-  pour sand, refresh the comic.
-- The **backlight** slider tunes the TFT backlight; the value is saved on the
-  device and survives reboot.
+**Automatic recovery:** if the device can't reach its saved network (new router,
+new password, moved house), it reopens the **Clawdmeter-setup** hotspot by
+itself on the next boot. No reflashing.
 
-### 4. Start the Mac daemon
+### 3. Changing WiFi or resetting the network on purpose
 
-The daemon defaults to the ESP32 render wrapper with usage polling off, so
-point it at the board and turn polling on:
+The dashboard's **network** card carries both resets, and the LCD shows you the
+new address as soon as the device is back:
+
+| Button | Endpoint | What it wipes |
+|---|---|---|
+| **change wifi** | `/wifi-reset` | The saved SSID/password only. Brightness and everything else survive. Reboots straight into the **Clawdmeter-setup** hotspot. |
+| **reset settings** | `/factory-reset` | The saved WiFi **and** stored settings (brightness back to default). Also reboots into the hotspot. |
+
+Reach for **change wifi** when you're just moving the box to a different
+network; that's the whole point of it being separate.
+
+Both are also plain `GET`s, so `curl http://clawdmeter.local/wifi-reset` works
+if the dashboard is out of reach. They reset-and-reboot rather than opening the
+portal in place: the portal blocks until someone finishes it, and running it
+from inside a request handler would take the web server down with it.
+
+### 4. Start the Mac daemons
+
+The lyrics screen needs **two** processes on the Mac. Start order doesn't
+matter.
 
 ```sh
+# terminal 1 — owns the browser-extension port, serves the ESP32 on :8767
+python3 daemon/lyrics_display_daemon.py serve
+
+# terminal 2 — serves this board on :8766, unauthenticated
+python3 daemon/lyrics_display_esp8266.py serve
+
+# terminal 3 — teaches the board where the Mac is (see below)
 CLAWDMETER_DEVICE_URL=http://clawdmeter.local \
-CLAWDMETER_USAGE_SOURCE=api \
+CLAWDMETER_DAILY_IMAGES=off \
 python3 daemon/claudemeter_daemon.py
 ```
 
-- `CLAWDMETER_USAGE_SOURCE=api` reads Anthropic response headers (closest
-  match to Claude's real server-side limits; macOS may pop a Keychain prompt
-  for the `Claude Code-credentials` item — click **Always Allow**). Use
-  `local` to scan Claude Code's local JSONL transcripts instead (set
-  `CLAWDMETER_SESSION_TOKEN_LIMIT` / `CLAWDMETER_WEEKLY_TOKEN_LIMIT` to taste).
-- Now-playing/lyrics pushes to `/nowplaying` work with no extra configuration.
-- **Streamed lyrics (required for the MUSIC screen):** the MUSIC screen is
-  rendered entirely by the lyrics daemon (`daemon/lyrics_display_daemon.py` +
-  the browser extension) running on the same Mac — Mac-rendered 240×240 frames
-  with real Thai shaping and syllable-karaoke highlighting over WebSocket
-  (`:8766/board?w=240&h=240&color=rgb565`). Lyrics remain a memory-efficient
-  1-bit semantic mask that the device maps to the Tend palette; cover art is a
-  negotiated RGB565 overlay streamed straight to the TFT one scanline at a
-  time. The device learns the Mac's IP from the
-  `/usage`//`/nowplaying` pushes and dials back. There is no on-device
-  now-playing renderer: if the stream drops (Mac asleep, daemon stopped) the
-  screen shows a paper placeholder and reconnects on its own within seconds.
+**Why the third one?** The board is never told the Mac's address — it *learns*
+it from the source IP of a `/usage` or `/nowplaying` push, then dials back to
+port 8766. `claudemeter_daemon.py` is what makes those pushes, so without it the
+board sits on `waiting for lyrics` forever. Set `CLAWDMETER_DAILY_IMAGES=off`:
+this firmware has no comic/APOD screen and no `/daily` endpoint, so leaving it
+on just logs a failed push every 6 hours. Usage polling stays off by default and
+there's no usage screen here, but the numbers still show on the dashboard if you
+want them (`CLAWDMETER_USAGE_SOURCE=api`).
 
-  **This board has its own daemon process.** By default the lyrics daemon
-  creates an identity and requires a mutual HMAC-SHA256 handshake (secure
-  proto=2) — the scheme the ESP32 board uses. The ESP8266 lacks the heap to
-  buffer-and-verify a whole SEC2 record on top of its framebuffer, so it speaks
-  the unauthenticated proto=1 instead. That used to mean starting the one shared
-  daemon with `--insecure`, which dropped the ESP32's authentication too. The
-  two now run as separate processes:
+**Why two lyrics daemons?** By default the lyrics daemon creates an identity and
+requires a mutual HMAC-SHA256 handshake (secure proto=2) — the scheme the ESP32
+board uses. The ESP8266 lacks the heap to buffer-and-verify a whole SEC2 record
+on top of its framebuffer, so it speaks the unauthenticated proto=1 instead.
+Running one shared daemon with `--insecure` used to drop the ESP32's
+authentication too, so the two now run as separate processes.
 
-  ```sh
-  # terminal 1 — owns the browser-extension port, serves the ESP32 on :8767
-  python3 daemon/lyrics_display_daemon.py serve
+`lyrics_display_esp8266.py` is the same daemon with `--boards esp8266
+--insecure --relay-upstream --no-mdns` applied; it takes playback state from the
+first daemon's `/relay` endpoint, because the browser extension connects to one
+address only. If the upstream daemon is down this one retries with backoff and
+recovers the current track from a snapshot when the link comes up, so you can
+restart it mid-song without touching the e-ink board.
 
-  # terminal 2 — serves this board on :8766, unauthenticated
-  python3 daemon/lyrics_display_esp8266.py serve
-  ```
+Neither board needs reflashing: the ESP32 reads its port out of the mDNS record,
+and this board keeps the `:8766` its firmware dials. There is no pairing step
+and no token on the ESP8266 link — the trade is LAN-link authentication for
+~7 KB of heap, so run it on a trusted home network.
 
-  `lyrics_display_esp8266.py` is the same daemon with `--boards esp8266
-  --insecure --relay-upstream --no-mdns` applied; it takes playback state from
-  the first daemon's `/relay` endpoint, because the browser extension connects
-  to one address only. Start order does not matter — if the upstream daemon is
-  down this one retries with backoff, and it recovers the current track from a
-  snapshot when the link comes up, so you can restart it mid-song without
-  touching the e-ink board.
+> The lyrics daemon has no launchd plist wired up — restart it by hand after
+> editing daemon code.
 
-  Neither board needs reflashing: the ESP32 reads the port out of the mDNS
-  record, and this board keeps the `:8766` its firmware dials. There is still no
-  pairing step and no token on the ESP8266 link — the trade is LAN-link
-  authentication for ~7 KB of heap, so run it on a trusted home network. The
-  old single-process behaviour is still available with
-  `serve --boards esp32,esp8266 --insecure`, at the cost of the ESP32's
-  authentication.
-- The daemon also resolves the daily xkcd/APOD metadata and pushes it to
-  `/daily` every 6 h (the ESP8266 can't afford the TLS heap to call those
-  HTTPS APIs itself). It turns on automatically with usage pushing; set
-  `CLAWDMETER_NASA_API_KEY` (free at https://api.nasa.gov) to avoid the shared
-  `DEMO_KEY` rate limit, or `CLAWDMETER_DAILY_IMAGES=off` to disable.
+### 5. Play something
 
-To run it under launchd instead, edit
-`launchd/company.g4pys.claudemeter-daemon.plist`: set `CLAWDMETER_DEVICE_URL`
-to `http://clawdmeter.local` and `CLAWDMETER_USAGE_SOURCE` to `api`, then:
+Load the browser extension (`browser_extension/` → `chrome://extensions` →
+Developer mode → Load unpacked) and play a track in **YouTube Music**. It feeds
+title/artist/position to the lyrics daemon.
 
-```sh
-launchctl unload ~/Library/LaunchAgents/company.g4pys.claudemeter-daemon.plist
-launchctl load  ~/Library/LaunchAgents/company.g4pys.claudemeter-daemon.plist
-```
+Within a few seconds the panel switches from the waiting screen to the streamed
+frames. **If it stays on the waiting screen**, the screen itself tells you which
+half is missing:
 
-### 5. Connect the lyrics stream (end-to-end)
+| The panel says | What it means | Fix |
+|---|---|---|
+| `waiting for lyrics` | No Mac IP known yet, or the daemon is connected but idle between tracks | Start `claudemeter_daemon.py` (step 4) — that's what teaches the board the Mac's IP |
+| `reaching the lyrics daemon…` | Mac IP known, the socket won't come up | Start `lyrics_display_esp8266.py`; check nothing is blocking `:8766` between Mac and board |
+| Streamed frames never appear, but the socket connects | The daemon is demanding a proto=2 handshake this board can't do | Use `lyrics_display_esp8266.py` (it applies `--insecure`), not a bare `lyrics_display_daemon.py serve` |
 
-The MUSIC screen is rendered only by the Mac-rendered stream (real Thai shaping +
-syllable karaoke); until it connects it shows a placeholder. To light it up,
-connect these pieces — the board is **not** told the Mac's address; it learns it
-from the `/usage`//`/nowplaying` pushes and then dials back to the lyrics
-WebSocket on `:8766`, so both daemons must run:
-
-1. **Run the usage/now-playing daemon** (this is what teaches the board the Mac's
-   IP — step 4 above):
-   ```sh
-   CLAWDMETER_DEVICE_URL=http://clawdmeter.local CLAWDMETER_USAGE_SOURCE=api \
-     python3 daemon/claudemeter_daemon.py
-   ```
-2. **Run the lyrics daemon with `--insecure`** (serves the unauthenticated
-   240×240 proto=1 frame stream on `:8766` — see step 4 for why this board needs
-   `--insecure`):
-   ```sh
-   python3 daemon/lyrics_display_daemon.py serve --insecure
-   ```
-3. **Load the browser extension** (`browser_extension/` → `chrome://extensions`
-   → Developer mode → Load unpacked) and play a track in **YouTube Music**. It
-   feeds title/artist/position to the lyrics daemon.
-4. **Switch the LCD to MUSIC** from the dashboard's screen row.
-
-Within a few seconds the screen switches from the placeholder to the stream.
-There's no pairing or status endpoint on this board — the one thing you observe
-is the MUSIC screen itself. **If it stays on the placeholder** instead of the
-crisp Mac-rendered frames, work down this list:
-
-| Check | Fix |
-|---|---|
-| Lyrics daemon started **without** `--insecure`? | It's demanding a proto=2 handshake this board can't do → restart it with `--insecure`. |
-| Usage daemon (step 1) not running / can't reach the board? | The board never learned the Mac's IP → start it and confirm the dashboard shows live usage. |
-| Lyrics daemon (step 2) not running, or `:8766` blocked? | Start it; make sure a firewall isn't blocking `:8766` between Mac and board. |
-
-If the stream drops (Mac asleep, daemon stopped), the screen returns to the
-paper placeholder within seconds and reconnects on its own when the daemon
-returns.
+If the stream drops (Mac asleep, daemon stopped), the panel returns to the
+waiting screen within seconds and reconnects on its own when the daemon comes
+back.
 
 ### 6. Updating later (OTA, no USB)
 
@@ -232,13 +208,9 @@ there; the device flashes and reboots on its own.
 ```
 esp8266/
 ├── clawdmeter_esp8266/
-│   ├── clawdmeter_esp8266.ino   # the sketch: HTTP API + INDEX_HTML dashboard
-│   ├── tend.h                   # shared Tend UI kit + screen interfaces
-│   ├── clock_screen.cpp         # … one .cpp per screen (ported from firmware/main)
-│   ├── pomodoro_screen.cpp, stats_screen.cpp, sand_screen.cpp,
-│   ├── daily_screen.cpp
-│   ├── lyrics_stream.cpp        # MUSIC frame stream: WS client for the lyrics daemon
-│   ├── tjpgd.c/.h, tjpgdcnf.h   # vendored TJpgDec (streams comic/APOD JPEGs)
+│   ├── clawdmeter_esp8266.ino   # WiFi + HTTP API + dashboard + the waiting screen
+│   ├── tend.h                   # shared Tend palette + the .ino/stream contract
+│   ├── lyrics_stream.cpp        # the lyrics screen: WS client for the lyrics daemon
 │   └── index_html_gz.h          # generated — gzipped dashboard served at /
 └── tools/
     └── gen_index_gz.py          # regenerate index_html_gz.h after editing INDEX_HTML
@@ -249,16 +221,13 @@ esp8266/
 | Endpoint | Methods | Purpose |
 |---|---|---|
 | `/` | GET | Web dashboard (gzipped, from PROGMEM) |
-| `/usage` | POST | Daemon pushes usage % + Mac metrics + server time |
-| `/usage.json` | GET | Full device state as JSON (dashboard polls this) |
-| `/nowplaying` | GET/POST | Daemon pushes song title/artist/position/lyrics |
-| `/mode` | GET/POST | `?screen=` clock/music/pomodoro/stats/sand/comic/apod |
-| `/pomodoro` | GET/POST | `?action=toggle` (default) or `reset` |
-| `/sand` | GET/POST | `?action=pour` (default) or `clear` |
-| `/daily` | GET/POST | Daemon pushes xkcd/APOD image URL + title metadata |
-| `/refresh` | GET/POST | `?screen=comic|apod` — refetch the daily image |
+| `/usage` | GET/POST | Daemon push. Draws nothing here — it is how the board learns the Mac's IP (to dial the lyrics daemon) and the current server time (the waiting screen's clock); the numbers feed the dashboard |
+| `/usage.json` | GET | Full device state as JSON, including `lyr` (0 waiting / 1 dialing / 2 streaming), `wifi`, `ssid`, `ip`, `rssi` |
+| `/nowplaying` | GET/POST | Daemon pushes song title/artist/position/lyrics — also IP-learning; shown on the dashboard, not on the panel |
 | `/brightness` | GET/POST | TFT backlight PWM, persisted across reboots |
-| `/restart`, `/factory-reset` | GET/POST | Maintenance |
+| `/wifi-reset` | GET/POST | Forget the saved WiFi, reboot into the setup hotspot |
+| `/factory-reset` | GET/POST | That, plus stored settings back to defaults |
+| `/restart` | GET/POST | Reboot |
 | `/update` | GET/POST | OTA firmware upload |
 
 ## Editing the dashboard
@@ -267,6 +236,5 @@ esp8266/
   After editing it run `python3 esp8266/tools/gen_index_gz.py` to refresh
   `index_html_gz.h` (the sketch serves the gzipped copy; a 15 KB uncompressed
   send truncates on lossy WiFi, and the generator enforces a 5 KB gzip cap).
-- MUSIC-screen text (title/artist/lyrics, including Thai) is rendered on the Mac
-  by `lyrics_display_daemon.py`, not on-device — there are no bundled fonts to
-  regenerate here anymore.
+- Lyrics text (including Thai) is rendered on the Mac by the lyrics daemon, not
+  on-device — there are no bundled fonts to regenerate here.

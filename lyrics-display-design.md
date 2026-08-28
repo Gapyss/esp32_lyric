@@ -218,23 +218,27 @@ files writes `manual` rows.
 ## ESP8266 client (`esp8266/clawdmeter_esp8266/lyrics_stream.cpp`)
 
 The GeekMagic SmallTV port shares the protocol but not the constraints — it is an
-Arduino sketch on a much smaller chip, so the client is shaped differently:
+Arduino sketch on a much smaller chip, and the board is single-purpose (lyrics is
+its only screen), so the client is shaped differently:
 
 - Hand-rolled non-blocking WebSocket client over `WiFiClient`, pumped from `loop()`
   (byte-wise state machine; a 7.2 KB frame arriving across TCP segments never blocks
-  the web server or the other screens). No extra library, no task, no timer ISR.
+  the web server). No extra library, no task, no timer ISR.
 - **No mDNS query and no configuration**: the Mac already POSTs `/usage` and
   `/nowplaying` to the device, so the sketch remembers the source IP of those pushes
-  and dials back to `:8766/board?w=240&h=240&color=rgb565`. Connects only while the MUSIC screen is
-  visible; a stale host (no push in 10 min) is never dialed.
+  and dials back to `:8766/board?w=240&h=240&color=rgb565`. Connected for as long as
+  the board is up — there is no other screen to switch away to; a stale host (no push
+  in 10 min) is never dialed.
 - Frames blit as Tend-palette RGB565 rows: stable bands in the compact layout
   colorize the 1-bit UI mask. The daemon follows an overwritten cover region with an
   `ART1` big-endian RGB565 rectangle, streamed one scanline at a time so even a
-  full-screen cover needs no 115 KB color framebuffer. One 7.2 KB mono framebuffer is
-  malloc'd while streaming, and the on-device marquee canvases (~17 KB) are freed while
-  the stream owns the panel, so the two render paths never hold heap at once.
-- The on-device Thai/Latin text renderer remains the fallback: stream drops, daemon
-  `clear`, or the Mac going away all hand the panel back within seconds.
+  full-screen cover needs no 115 KB color framebuffer. Exactly one 7.2 KB mono
+  framebuffer is malloc'd while streaming and freed on stop, which is the whole
+  render-path heap budget — there is no second on-device renderer to hold buffers.
+- There is no on-device song renderer at all. Stream drops, daemon `clear`, or the
+  Mac going away hand the panel back to the sketch's waiting screen within seconds:
+  Tend chrome, a status line, and the device's own IP / mDNS name / SSID, so the
+  dashboard stays reachable when the stream isn't.
 - Sends no board token — leave `G4PYS_LYRICS_BOARD_TOKEN` unset when ESP8266 boards
   should connect.
 

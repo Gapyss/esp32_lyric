@@ -17,8 +17,8 @@
 // configured here, but LYR_PORT below is, which is why that process takes :8766
 // and the ESP32 daemon (found over mDNS) moved to :8767.
 //
-// While the MUSIC screen is visible this module keeps a hand-rolled WebSocket to
-// the daemon's board port (:8766). The daemon renders 240x240 1-bpp frames with
+// This module keeps a hand-rolled WebSocket to the daemon's board port (:8766)
+// for as long as the board is up -- there is no other screen to switch away to. The daemon renders 240x240 1-bpp frames with
 // Core Text (real Thai shaping, karaoke) — full frames and dirty-rect deltas.
 // Set bits are Tend paper; clear bits are colorized by semantic screen region
 // (ember label/progress, soft metadata, moss playback state, primary lyric).
@@ -140,8 +140,12 @@ static uint16_t lyrInkColorAt(int x, int y) {
 
 // 1-bpp (LSB-first, row-major) -> Tend RGB565 rows on the panel. One shared
 // 240-px scanline, row by row; periodic yields keep the WiFi stack fed.
+// The panel is unconditionally ours: this board has one screen. The only other
+// painter is the OTA status page, and handleFirmwareUpload() calls
+// lyricsStreamStop() (freeing lyrFrame) before it draws, which this null check
+// is what enforces.
 static void lyrBlit(int x, int y, int w, int h) {
-  if (lcdScreen != SCREEN_MUSIC || lyrFrame == nullptr) return;
+  if (lyrFrame == nullptr) return;
   for (int row = 0; row < h; row++) {
     const uint8_t *src = lyrFrame + (unsigned)(y + row) * LYR_ROW_BYTES;
     for (int col = 0; col < w; col++) {
@@ -330,9 +334,7 @@ static inline void lyrEnvBody(uint8_t b) {
         lyrLine[rowByte >> 1] = ((uint16_t)lyrColorHigh << 8) | b;
         if (rowByte + 1 == lyrEnvRowB) {
           const uint16_t row = lyrEnvBodyGot / lyrEnvRowB;
-          if (lcdScreen == SCREEN_MUSIC) {
-            gfx->draw16bitRGBBitmap(lyrEnvX, lyrEnvY + row, lyrLine, lyrEnvRw, 1);
-          }
+          gfx->draw16bitRGBBitmap(lyrEnvX, lyrEnvY + row, lyrLine, lyrEnvRw, 1);
           if ((row & 15) == 15) yield();
         }
       }
