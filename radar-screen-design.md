@@ -944,3 +944,129 @@ see it.
 Known limit: distance is **centroid to centre**, so a large cell whose leading
 edge is already closer trips the alert late. The ETA is what reports approach;
 this only reports arrival in the neighbourhood.
+
+### Revision 2h — first hardware run, two UI fixes
+
+Flashed and running. **The correlation works on real weather over this tile** —
+the panel showed `>2H`, which only prints when `motion.valid` is true, so all
+three gates passed on live frames. That was the load-bearing unknown the whole
+"Tell" branch rested on, and decision #27 chose to test it this way rather than
+with an offline probe.
+
+Two things the photo showed that no amount of design could have:
+
+**1. The bearing line was far too long.** Running the full 148 px from centre to
+rim, it read as a slash across the entire scope — more ink than the rain it
+pointed at, crossing every range ring on the way. Cut to a 30 px tail inward
+from the chevron apex, roughly 80% less ink.
+
+Shortened from the *inside*, not the outside, deliberately: the chevron has to
+stay at the rim among the echoes it describes, because that colocation is what
+removes the from/toward ambiguity without a legend. The tail only has to say
+"this is a direction, not a bearing tick". `RADAR_BEARING_APEX_PX` was a bare
+14 in the draw code and is now named alongside `RADAR_BEARING_TAIL_PX`.
+
+**2. Landmark labels were hiding the approach.** `draw_landmarks` placed every
+label to the *right* of its dot, flipping only when it would run off the scope.
+For a westerly landmark that puts the label — and its knockout, which blanks
+the field to black — directly in the strip a cell crosses on its way to home.
+Rain vanished behind "LAN SAK" exactly as it began to matter.
+
+The rule is now **place the label on the side away from home**, flipping back
+only when the outward side does not fit. Verified against all five:
+
+| label | x | was | now |
+|---|---|---|---|
+| NAKHON SAWAN | 203 | right 208..268 | unchanged |
+| UTHAI THANI | 183 | right 188..243 | unchanged |
+| SING BURI | 252 | left 202..247 | unchanged (outward does not fit) |
+| DAN CHANG | 123 | right 128..173 | **left 73..118** |
+| LAN SAK | 101 | right 106..141 | **left 61..96** |
+
+`tools/radar_preview.py` mirrors the new rule, so the one property
+FEATURE_INDEX still credits it with — landmark label fit — stays true.
+
+### Revision 2i — zoom becomes the single source of truth
+
+Prompted by finding `tools/radar_landmarks.py` at `ZOOM = 5` (and then `8`)
+while the firmware and the shipped landmark table were both at 7 — a 4x scale
+error waiting to be pasted in.
+
+**Ground scale is now derived.** `g_km_per_px` and `g_range_km` are computed in
+`radar_screen_init()` from `RADAR_ZOOM` and the home latitude. They were
+`0.59f` and `88` pasted in. Both feed things the screen reports as fact — the
+range footer, and the storm speed the whole ETA is built on — so a zoom change
+used to leave every label quietly lying about the imagery.
+
+The footer now reads **87 KM, not 88.** 148 px x 0.5896 km/px is 87.26; the old
+88 was a hand-rounding. Several places in this document still say 88.
+
+**Landmarks are coordinates now, not pixels.** The split that matters:
+
+| | needs | lives in |
+|---|---|---|
+| which towns | geocoding API, quadrant rule | the script |
+| where they land | `RADAR_ZOOM` | the board |
+
+`radar_project()` already ran at init to place home, so the landmarks project
+through the same maths against the same crop origin. Verified before changing
+it: 4 of the 5 reproduce the baked table exactly, `DAN CHANG` differs by 1 px
+in y from rounding.
+
+`draw_landmarks` now skips any landmark outside `SCOPE_RADIUS` — a tighter zoom
+pushes towns past the rim, and a label hanging in the corner would be a lie.
+
+The generator emits coordinates instead of pixels, so **the table can no longer
+drift out of step with the zoom it was generated at.** `tools/radar_preview.py`
+mirrors all of it.
+
+Worth knowing before changing zoom: at 8 the scope covers 44 km and only 2 of
+the current 5 landmarks are still on it — `NAKHON SAWAN`, `SING BURI` and
+`DAN CHANG` all fall off. Projection follows automatically, but the quadrant
+coverage the selection was built for does not, so a zoom change still wants the
+script re-run to pick closer towns. That is now the script's only job.
+
+### Revision 2j — the board picks its own landmarks
+
+The zoom work in 2i left one manual step: change `RADAR_ZOOM`, re-run the
+script, paste its output back. That step is why the script had drifted to
+`ZOOM = 5` and then `8` while the shipped table was 7.
+
+**The pick moved onto the board.** `RADAR_LANDMARKS` is now the 20-town
+candidate pool rather than a chosen five, and `select_landmarks()` runs at init.
+
+The split that makes this work:
+
+| | depends on | when |
+|---|---|---|
+| coordinates, population | nothing — towns do not move | baked, static |
+| which five to draw | `RADAR_ZOOM` | init, on the board |
+
+The selection needed a geocoding API only to turn *names* into *coordinates*.
+Once those are baked, everything left is arithmetic the board already does:
+project, reject inside 10 km and outside the rim, best town per bearing
+quadrant, then top up to five with the largest remaining that is not within
+60 px of one already chosen.
+
+**Verified against both references** before trusting it. At zoom 7 the on-board
+selector picks exactly the five that were previously baked, at the same pixels:
+NAKHON SAWAN, UTHAI THANI, DAN CHANG, LAN SAK, SING BURI. At zoom 8 it picks
+UTHAI THANI, CHAI NAT and LAN SAK — the same three a live run of the script
+produced.
+
+Changing zoom is now a one-constant edit. Nothing to re-run, nothing to paste,
+and nothing left that can fall out of sync with `RADAR_ZOOM`.
+
+Two consequences worth recording:
+
+- **The script's job shrank to maintaining the pool.** It no longer picks, and
+  it now emits *every* candidate that geocodes rather than only those inside
+  the scope — filtering by the current zoom would starve a wider one of the
+  towns it needs, and the board discards out-of-range entries itself. Its
+  `ZOOM` only affects the km/bearing figures it prints for reading.
+- **Zoom 8 still only yields three landmarks**, both of the east. The pool has
+  no town within 44 km to the north or south, so the quadrant rule cannot do
+  its job there. Projection and selection now follow the zoom automatically;
+  the *pool* is what a much tighter zoom would need widening.
+
+`tools/radar_preview.py` mirrors the pool and the selection.

@@ -29,7 +29,10 @@ ZOOM, TILE_PX = 7, 512
 SCOPE, CENTER, RADIUS = 300, 150, 148
 ROW_BYTES = (SCOPE + 7) // 8
 PANEL_X, PANEL_W = 300, 100
-RANGE_KM = 88
+# Derived from ZOOM, mirroring radar_screen_init(). A 512 px tile covers the
+# same ground as a 256 px one at the same zoom, so its pixels are half the size.
+KM_PER_PX = 156543.03392 * math.cos(math.radians(HOME_LAT)) / (1 << ZOOM) / (TILE_PX / 256) / 1000.0
+RANGE_KM = round(RADIUS * KM_PER_PX)
 
 BAYER = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]]
 TIER_DENSITY = [2, 4, 8, 16]
@@ -38,13 +41,68 @@ TIER_FLOOR = 0  # light and above; tier 0 is stippled at 2/16
 BEAM_RAYS, BEAM_STEP_DEG, BEAM_MAX_DENSITY = 100, 0.4, 7
 STALE_AGE_SEC = 25 * 60
 
-LANDMARKS = [
-    (203, 91, "NAKHON SAWAN"),
-    (183, 152, "UTHAI THANI"),
-    (252, 245, "SING BURI"),
-    (123, 253, "DAN CHANG"),
-    (101, 138, "LAN SAK"),
+# The candidate pool, mirroring RADAR_LANDMARKS. The five drawn are SELECTED
+# at render time by the same rules the firmware applies at init, so this
+# follows ZOOM exactly as the board does.
+LANDMARK_POOL = [
+    (15.7047, 100.1372, 82305, "NAKHON SAWAN"),
+    (15.3794, 100.0245, 22219, "UTHAI THANI"),
+    (15.1864, 100.1235, 15469, "CHAI NAT"),
+    (16.4834, 99.5215, 58787, "KAMPHAENG PHET"),
+    (14.4742, 100.1222, 53399, "SUPHAN BURI"),
+    (14.7981, 100.6540, 57761, "LOP BURI"),
+    (16.4418, 100.3488, 35760, "PHICHIT"),
+    (14.8879, 100.4046, 20046, "SING BURI"),
+    (14.5884, 100.4528, 13738, "ANG THONG"),
+    (16.8697, 99.1290, 24149, "TAK"),
+    (15.2634, 100.3438, 0, "TAKHLI"),
+    (15.0842, 99.5211, 0, "BAN RAI"),
+    (15.4529, 99.5761, 13905, "LAN SAK"),
+    (15.4552, 100.1353, 12271, "PHAYUHA KHIRI"),
+    (16.0617, 99.8606, 21889, "KHANU WORALAKSABURI"),
+    (14.8418, 99.6976, 0, "DAN CHANG"),
+    (15.3915, 99.8415, 0, "NONG CHANG"),
+    (17.3160, 99.8319, 19805, "SAWANKHALOK"),
+    (16.8248, 100.2586, 62584, "PHITSANULOK"),
+    (14.5333, 100.9167, 67763, "SARABURI"),
 ]
+LANDMARK_MAX, LANDMARK_MIN_KM, LANDMARK_RIM_PAD = 5, 10.0, 8
+LANDMARK_MIN_SEP, LANDMARK_MAX_CHARS = 60, 13
+
+
+def select_landmarks(origin_x, origin_y):
+    """Mirrors select_landmarks() in radar_screen.cpp."""
+    usable = []
+    for lat, lon, pop, label in LANDMARK_POOL:
+        if len(label) > LANDMARK_MAX_CHARS:
+            continue
+        mx, my = project(lat, lon)
+        x, y = round(mx - origin_x), round(my - origin_y)
+        dx, dy = x - CENTER, y - CENTER
+        dist = math.hypot(dx, dy)
+        if dist > RADIUS - LANDMARK_RIM_PAD or dist * KM_PER_PX < LANDMARK_MIN_KM:
+            continue
+        bearing = math.degrees(math.atan2(dx, -dy)) % 360.0
+        usable.append([x, y, int(((bearing + 45.0) % 360.0) // 90.0), pop, label])
+
+    chosen = []
+    for q in range(4):
+        in_q = [u for u in usable if u[2] == q and u not in chosen]
+        if in_q and len(chosen) < LANDMARK_MAX:
+            chosen.append(max(in_q, key=lambda u: u[3]))
+    while len(chosen) < LANDMARK_MAX:
+        best = None
+        for u in usable:
+            if u in chosen:
+                continue
+            if any(math.hypot(u[0] - c[0], u[1] - c[1]) < LANDMARK_MIN_SEP for c in chosen):
+                continue
+            if best is None or u[3] > best[3]:
+                best = u
+        if best is None:
+            break
+        chosen.append(best)
+    return [(u[0], u[1], u[4]) for u in chosen]
 
 # Real u8g2 advances, read out of the font headers (max_char_width).
 U8G2_ADVANCE = {"5x7": 5, "6x12": 6, "logisoso28": 16, "helvB10": 8, "helvB14": 10}
@@ -174,15 +232,20 @@ def main():
     # --- landmarks ---------------------------------------------------------
     small = font(7)
     problems = []
-    for lx, ly, label in LANDMARKS:
+    selected = select_landmarks(tile_x * TILE_PX + crop_x, tile_y * TILE_PX + crop_y)
+    print(f"  {len(selected)} landmarks selected at zoom {ZOOM}")
+    for lx, ly, label in selected:
         width = u8g2_width(label, "5x7")
-        label_x = lx + 5
+        # Mirrors draw_landmarks(): the label goes on the side AWAY from home,
+        # so its knockout never blanks the corridor rain crosses on approach.
+        outward_left = lx < CENTER
+        label_x = lx - 5 - width if outward_left else lx + 5
         flipped = False
-        if label_x + width > SCOPE - 2:
-            label_x = lx - 5 - width
+        if label_x < 2 or label_x + width > SCOPE - 2:
+            label_x = lx + 5 if outward_left else lx - 5 - width
             flipped = True
-        if label_x < 2:
-            problems.append(f"{label}: runs off the left edge at x={label_x}")
+        if label_x < 2 or label_x + width > SCOPE - 2:
+            problems.append(f"{label}: does not fit on either side at x={label_x}")
         draw.rectangle([label_x - 1, ly - 4, label_x + width, ly + 4], fill=0)
         draw.rectangle([lx - 2, ly - 2, lx + 2, ly + 2], fill=0)
         draw.rectangle([lx - 1, ly - 1, lx + 1, ly + 1], outline=1)
