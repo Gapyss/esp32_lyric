@@ -1316,6 +1316,50 @@ class BoardAnnouncerTest(unittest.TestCase):
         announcer._announce_once()
         self.assertIs(announcer.reachable, False)
 
+    def test_malformed_response_does_not_kill_the_thread(self):
+        # A heap-starved board can answer with garbage rather than refusing the
+        # connection. That raises http.client.HTTPException, which is NOT an
+        # OSError -- if it escaped _serve the announce thread would die silently
+        # and the panel would go back to the waiting screen after 10 minutes.
+        import socket as _socket
+
+        listener = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+        listener.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(8)
+        self.addCleanup(listener.close)
+        port = listener.getsockname()[1]
+
+        def babble() -> None:
+            while True:
+                try:
+                    conn, _ = listener.accept()
+                except OSError:
+                    return
+                with conn:
+                    try:
+                        conn.recv(1024)
+                        conn.sendall(b"not-an-http-response\r\n\r\n")
+                    except OSError:
+                        pass
+
+        threading.Thread(target=babble, daemon=True).start()
+
+        announcer = lyrics_display_daemon.BoardAnnouncer(
+            f"http://127.0.0.1:{port}", interval=0.05
+        )
+        announcer.start()
+        deadline = time.monotonic() + 5.0
+        while announcer.reachable is None and time.monotonic() < deadline:
+            time.sleep(0.02)
+        # The thread must still be looping, not dead.
+        time.sleep(0.2)
+        still_alive = announcer.thread is not None and announcer.thread.is_alive()
+        announcer.stop()
+
+        self.assertIs(announcer.reachable, False)
+        self.assertTrue(still_alive, "announce thread died on a malformed response")
+
     def test_stop_is_idempotent_and_joins(self):
         announcer = lyrics_display_daemon.BoardAnnouncer("http://127.0.0.1:9", interval=60.0)
         announcer.start()

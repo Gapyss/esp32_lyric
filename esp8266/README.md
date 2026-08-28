@@ -151,6 +151,11 @@ python3 esp8266/daemon/lyrics_display_daemon.py serve --insecure \
 `--no-announce` turns the knock off, for when something else is already pushing
 to the board's `/usage`.
 
+> There is no launchd plist pointing at `esp8266/daemon/` — restart the daemon
+> by hand after editing it. The repo's `clear_lyric_daemon.sh` stops it, but its
+> `lyrics_display_daemon.py` pattern matches the ESP32 daemon too, so it stops
+> both; it also lives outside `esp8266/` and so does not come along in a split.
+
 > **This used to need `claudemeter_daemon.py` too.** That daemon polls Claude
 > usage and has nothing to do with lyrics; it was only ever here because its
 > HTTP pushes happened to teach the board the Mac's IP. The daemon now does its
@@ -175,16 +180,27 @@ authentication for ~7 KB of heap, so run it on a trusted home network.
 > defaults to `--no-mdns` so it won't contest the `_lyrics._tcp` instance the
 > e-ink board browses for — Bonjour gives a contested name to the oldest holder,
 > which would otherwise feed the e-ink board this fork's `proto=1` record and
-> break its handshake. To run both at once, also move this one off the shared
-> ports and point its copy of the extension at the new one:
+> break its handshake.
+>
+> To run both at once, move the **ESP32** daemon, not this one. This board dials
+> a hardcoded port (`#define LYR_PORT 8766` in `lyrics_stream.cpp`) and there is
+> no way to tell it otherwise — it only ever learns an *address*, never a port.
+> The e-ink board reads its port out of the mDNS SRV record instead
+> (`r->port ? r->port : LYRICS_DAEMON_PORT`, `firmware/main/board_client.cpp`),
+> so it is the one that can move:
 >
 > ```sh
-> python3 esp8266/daemon/lyrics_display_daemon.py serve --insecure \
->   --extension-port 8775 --board-port 8776
+> # this board — unchanged, on the ports it insists on
+> python3 esp8266/daemon/lyrics_display_daemon.py serve --insecure
+>
+> # the ESP32 e-ink daemon — moved out of the way
+> python3 daemon/lyrics_display_daemon.py serve --extension-port 8775 --board-port 8767
 > ```
 >
-> then change `WS_URL` in `esp8266/browser_extension/content_script.js` to
-> `ws://127.0.0.1:8775/extension`. Otherwise, run one or the other.
+> Then point the *root* `browser_extension/content_script.js` at the moved
+> daemon (`WS_URL` → `ws://127.0.0.1:8775/extension`) and load it as a second
+> unpacked extension; `esp8266/browser_extension/` stays on 8765 for this board.
+> Otherwise, run one or the other.
 
 ### 5. Play something
 

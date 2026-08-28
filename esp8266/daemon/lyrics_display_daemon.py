@@ -3344,11 +3344,17 @@ class BoardAnnouncer:
             request = urllib.request.Request(target, method="GET")
             with urllib.request.urlopen(request, timeout=BOARD_ANNOUNCE_TIMEOUT_SECONDS):
                 pass
-        except (urllib.error.URLError, OSError) as exc:
-            # Expected whenever the board is unplugged or the Mac just woke, so
-            # log the transition rather than every failed attempt.
+        except Exception as exc:
+            # Deliberately broad. The obvious cases are URLError/OSError from an
+            # unplugged board or a just-woken Mac, but a heap-starved ESP8266 can
+            # also answer with a truncated or malformed response, which surfaces
+            # as http.client.HTTPException -- not an OSError. Letting that escape
+            # would kill the announce thread outright: the board would forget
+            # this Mac after LYR_HOST_FRESH_MS and the panel would drop back to
+            # the waiting screen with nothing in the log to explain why. A daemon
+            # meant to run unattended has to treat a bad answer like no answer.
             if self.reachable is not False:
-                print(f"board announce failed ({self.url}): {exc}")
+                print(f"board announce failed ({self.url}): {exc!r}")
             self.reachable = False
             return
         if self.reachable is not True:
