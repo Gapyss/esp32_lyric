@@ -1,26 +1,10 @@
-"""Board render profiles -- one per display geometry the daemon serves.
-
-This module is deliberately board-agnostic: it defines the *shape* of a profile
-and the registry a process serves, but names no board. Each board family lives
-in its own ``board_*`` module and registers itself, which is what lets the
-ESP8266 run as a process that never imports the ESP32 layout (and vice versa).
-"""
+"""Board render profiles -- one per display geometry the daemon serves."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable
 
-from .constants import (
-    LYRIC_BAND_TOP_Y,
-    LYRIC_BASE_SIZE,
-    LYRIC_HIGHLIGHT_GAP_Y,
-    LYRIC_MIN_SIZE,
-    LYRIC_SINGLE_BASELINE_Y,
-    LYRIC_SINGLE_HIGHLIGHT_Y,
-    LYRIC_WRAP_SIZE,
-)
-
+from .constants import DISPLAY_HEIGHT, DISPLAY_WIDTH, LYRIC_BAND_BOTTOM_Y, LYRIC_BAND_TOP_Y, LYRIC_BASE_SIZE, LYRIC_BOX_WIDTH, LYRIC_BOX_X, LYRIC_HIGHLIGHT_GAP_Y, LYRIC_MIN_SIZE, LYRIC_SINGLE_BASELINE_Y, LYRIC_SINGLE_HIGHLIGHT_Y, LYRIC_WRAP_SIZE
 
 @dataclass(frozen=True)
 class LyricLayoutSizes:
@@ -45,6 +29,69 @@ class LyricLayout:
 
 DEFAULT_LYRIC_LAYOUT_SIZES = LyricLayoutSizes()
 
+# Compact 240x240 lyric band (ESP8266 GeekMagic SmallTV boards). Same fitting
+# algorithm as the 400x300 band, just smaller sizes and a tighter box.
+SQUARE_LYRIC_LAYOUT_SIZES = LyricLayoutSizes(
+    base_size=22,
+    wrap_size=18,
+    min_size=12,
+    band_top_y=104,
+    single_baseline_y=146,
+    single_highlight_y=162,
+    highlight_gap_y=16,
+)
+
+
+@dataclass(frozen=True)
+class RenderProfile:
+    """One board display geometry the daemon can render frames for.
+
+    Boards opt into a profile with /board?w=&h= at handshake time; the default
+    (no query) stays the original 400x300 e-ink layout so existing ESP32
+    firmware needs no change.
+    """
+
+    name: str
+    width: int
+    height: int
+    lyric_sizes: LyricLayoutSizes
+    lyric_box_x: int
+    lyric_box_width: int
+    lyric_band_bottom_y: int
+
+    @property
+    def row_bytes(self) -> int:
+        return self.width // 8
+
+    @property
+    def frame_bytes(self) -> int:
+        return self.width * self.height // 8
+
+
+WIDE_PROFILE = RenderProfile(
+    name="400x300",
+    width=DISPLAY_WIDTH,
+    height=DISPLAY_HEIGHT,
+    lyric_sizes=DEFAULT_LYRIC_LAYOUT_SIZES,
+    lyric_box_x=LYRIC_BOX_X,
+    lyric_box_width=LYRIC_BOX_WIDTH,
+    lyric_band_bottom_y=LYRIC_BAND_BOTTOM_Y,
+)
+SQUARE_PROFILE = RenderProfile(
+    name="240x240",
+    width=240,
+    height=240,
+    lyric_sizes=SQUARE_LYRIC_LAYOUT_SIZES,
+    lyric_box_x=12,
+    lyric_box_width=240 - 24,
+    lyric_band_bottom_y=184,
+)
+DEFAULT_PROFILE = WIDE_PROFILE
+PROFILES_BY_SIZE = {
+    (WIDE_PROFILE.width, WIDE_PROFILE.height): WIDE_PROFILE,
+    (SQUARE_PROFILE.width, SQUARE_PROFILE.height): SQUARE_PROFILE,
+}
+
 
 @dataclass(frozen=True)
 class ProgressGeom:
@@ -62,10 +109,20 @@ class ProgressGeom:
     dot_r: float
 
 
+WIDE_PROGRESS_GEOM = ProgressGeom(
+    time_size=13, left_x=14, left_w=54, right_x=328, right_w=58,
+    baseline_y=116, bar_x=76, bar_w=238, center_y=109, dot_r=4.5,
+)
+SQUARE_PROGRESS_GEOM = ProgressGeom(
+    time_size=11, left_x=12, left_w=48, right_x=180, right_w=48,
+    baseline_y=95, bar_x=66, bar_w=108, center_y=91, dot_r=3.5,
+)
+
 # Album-art cover: a dithered square in the header's top-right, above the
 # progress row, wrapped in a Tend hairline "card" frame. Title/artist reflow
 # into the left column when a cover is present; the karaoke lyric band below is
-# untouched. One placement per board profile.
+# untouched. One placement per board profile (the ESP32 e-ink is 400x300; the
+# ESP8266 SmallTV is 240x240).
 @dataclass(frozen=True)
 class CoverPlacement:
     x: int          # art top-left (top-origin), the reserved blit rect
@@ -75,98 +132,14 @@ class CoverPlacement:
     frame_pad: int  # gap between art edge and the hairline card frame
 
 
-@dataclass(frozen=True)
-class PauseChipGeom:
-    """Type metrics for the PAUSED pill composited over full-screen album art."""
-
-    size: int
-    pad_x: int
-    chip_h: int
-    rise: int
-    # Inset of the pill from the art's top-left corner when it is composited.
-    margin: int
-
-
-@dataclass(frozen=True)
-class RenderProfile:
-    """One board display geometry the daemon can render frames for.
-
-    Boards opt into a profile with /board?w=&h= at handshake time. Everything
-    that used to be selected by comparing ``profile.name`` against a board
-    constant now hangs off the profile itself -- the progress row geometry, the
-    cover slot, the pause chip metrics, and ``paint``, the function that draws a
-    full frame for this geometry. ``paint`` is called as
-    ``profile.paint(renderer, ctx, state, profile)``.
-    """
-
-    name: str
-    width: int
-    height: int
-    lyric_sizes: LyricLayoutSizes
-    lyric_box_x: int
-    lyric_box_width: int
-    lyric_band_bottom_y: int
-    progress_geom: ProgressGeom
-    pause_chip: PauseChipGeom
-    paint: Callable[[Any, Any, Any, "RenderProfile"], None]
-    cover: CoverPlacement | None = None
-
-    @property
-    def row_bytes(self) -> int:
-        return self.width // 8
-
-    @property
-    def frame_bytes(self) -> int:
-        return self.width * self.height // 8
-
-
-class BoardRegistry:
-    """The set of board geometries one daemon process serves.
-
-    Split out per process: the ESP32 daemon registers only the 400x300 profile
-    and the ESP8266 daemon only the 240x240 one, so an unparseable /board query
-    falls back to a geometry that actually fits the screen on the other end. A
-    single shared registry would fall back to the ESP32's 400x300 and paint an
-    oversized frame at a 240x240 panel.
-    """
-
-    def __init__(self) -> None:
-        self._by_size: dict[tuple[int, int], RenderProfile] = {}
-        self._default: RenderProfile | None = None
-
-    def register(self, profile: RenderProfile, *, default: bool = False) -> RenderProfile:
-        self._by_size[(profile.width, profile.height)] = profile
-        if default or self._default is None:
-            self._default = profile
-        return profile
-
-    def reset(self) -> None:
-        self._by_size.clear()
-        self._default = None
-
-    @property
-    def default(self) -> RenderProfile:
-        if self._default is None:
-            raise RuntimeError(
-                "no board profile registered: import a daemon.lyrics.board_* module "
-                "(or call BOARDS.register) before rendering"
-            )
-        return self._default
-
-    def profile_for(self, width: int, height: int) -> RenderProfile:
-        return self._by_size.get((width, height), self.default)
-
-    def all(self) -> list[RenderProfile]:
-        return list(self._by_size.values())
-
-
-# Process-wide registry. Board modules append to it at import time; the CLI
-# decides which board modules a given process imports.
-BOARDS = BoardRegistry()
+COVER_PLACEMENTS = {
+    "400x300": CoverPlacement(x=324, y=32, size=60, title_w=324 - 14 - 8, frame_pad=2),
+    "240x240": CoverPlacement(x=174, y=30, size=52, title_w=174 - 12 - 8, frame_pad=2),
+}
 
 
 def cover_placement(profile: "RenderProfile") -> CoverPlacement | None:
-    return profile.cover
+    return COVER_PLACEMENTS.get(profile.name)
 
 
 def max_cover_size(profiles: "list[RenderProfile]") -> int:

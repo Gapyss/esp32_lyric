@@ -12,7 +12,7 @@ from typing import Any, Callable
 
 from .constants import BOARD_QUEUE_DEPTH, HEARTBEAT_INTERVAL_SECONDS, HEARTBEAT_TIMEOUT_SECONDS, SEC2_BINARY, SEC2_HEADER_STRUCT, SEC2_MAGIC, SEC2_TAG_BYTES, SEC2_TEXT, SEC2_VERSION
 from .security import monotonic_ms
-from .profiles import BOARDS, RenderProfile
+from .profiles import DEFAULT_PROFILE, RenderProfile
 
 class WebSocketConnection:
     def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
@@ -21,7 +21,7 @@ class WebSocketConnection:
         self.write_lock = asyncio.Lock()
         self.board_frame_base: bytes | None = None
         self.board_color_key: tuple[int, int, int, int, bytes] | None = None
-        self.profile: RenderProfile = BOARDS.default
+        self.profile: RenderProfile = DEFAULT_PROFILE
         self.supports_rgb565 = False
         self.tx_key: bytes | None = None
         self.rx_key: bytes | None = None
