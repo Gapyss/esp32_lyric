@@ -95,6 +95,11 @@ static void applyBrightness(uint8_t brightness, bool persist) {
   if (persist) saveBrightness(lcdBrightness);
 }
 
+// WiFi provisioning. With no saved network — first boot, or after /wifi-reset —
+// the box opens this hotspot and runs a captive setup portal on it; see setup().
+#define WIFI_SETUP_AP "Clawdmeter-setup"
+#define WIFI_PORTAL_TIMEOUT_S 180   // give up, reboot, and retry the saved network
+
 // Latest usage, pushed by the daemon. -1 = no data yet.
 int sessionPct = -1;            // 5-hour utilization %
 int weeklyPct  = -1;            // 7-day utilization %
@@ -111,7 +116,6 @@ int macCpuPct = -1;             // macOS CPU use, pushed by daemon
 int macMemPct = -1;             // macOS memory use
 int macDiskPct = -1;            // macOS home volume disk use
 int macBatteryPct = -1;         // Mac battery level, -1 if unavailable
-uint8_t lcdScreen = SCREEN_CLOCK;   // screen ids live in tend.h
 String npTitle = "";             // YouTube Music now-playing title (UTF-8, may be Thai)
 String npArtist = "";            // now-playing artist (UTF-8)
 int npPos = -1;                  // current playback position, seconds
@@ -122,7 +126,7 @@ String npLyric = "";             // current lyric line (UTF-8, daemon-pushed fro
 String npLyric2 = "";            // upcoming lyric line (kept for the dashboard's /usage.json)
 int npLyricAt = -1;              // reserved lyric timing field (no longer rendered on-device)
 // Interpolated playback position, surfaced in /usage.json for the dashboard's
-// Now Playing panel. Defined with the MUSIC screen below; declared here because
+// Now Playing panel. Defined with the lyrics screen below; declared here because
 // handleUsageJson() (above that block) reads it.
 static int musicDisplayPos();
 bool otaInProgress = false;     // true while /update is writing firmware
@@ -147,7 +151,7 @@ unsigned long nowEpoch() {
 const char INDEX_HTML[] PROGMEM = R"HTML(
 <!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>clawdmeter</title>
+<title>clawdmeter &middot; lyrics</title>
 <style>
   :root{color-scheme:light;--paper:#F8F3E1;--soft:#FDFBF2;--ink:#1F1D11;--mut:rgba(31,29,17,.55);--line:rgba(31,29,17,.16);--ember:#E85D3C}
   *{box-sizing:border-box}
@@ -172,27 +176,44 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
   .chip{font-size:11px;letter-spacing:.12em;text-transform:uppercase;background:var(--ink);color:var(--paper);border-radius:999px;padding:2px 8px}
   .stats{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}
   .stat{background:var(--soft);border:1px solid var(--line);border-radius:16px;padding:12px 14px}
-  .v{font-size:18px;font-weight:600;margin-top:5px;white-space:nowrap}
+  .v{font-size:18px;font-weight:600;margin-top:5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .acts{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
   .btn{font:inherit;font-size:13px;color:var(--ink);background:transparent;border:1px solid var(--line);border-radius:10px;padding:8px 12px;cursor:pointer;text-decoration:none}
   .btn:hover{border-color:var(--ink)}
-  .btn.on{background:var(--ink);color:var(--paper);border-color:var(--ink)}
   .btn.warn{color:var(--ember)}
   .btn.warn:hover{border-color:var(--ember)}
-  .ctx{display:none}
-  .big{font-size:30px;font-weight:700;line-height:1.1}
-  .cfg{display:grid;grid-template-columns:1fr 1fr 1fr auto;gap:8px;margin-top:10px}
+  .big{font-size:24px;font-weight:700;line-height:1.2;overflow-wrap:anywhere}
+  .cfg{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px}
   input[type=text],input[type=number]{font:inherit;font-size:13px;width:100%;color:var(--ink);background:var(--paper);border:1px solid var(--line);border-radius:10px;padding:8px 10px}
   input[type=range]{width:100%;accent-color:var(--ember)}
   .ctl{display:grid;grid-template-columns:auto 1fr auto;align-items:center;gap:12px;margin-top:12px}
+  .note{color:var(--mut);font-size:12px;line-height:1.5;margin-top:10px}
   .stale main{opacity:.6}
-  @media(max-width:720px){main{padding:14px}.grid{grid-template-columns:1fr}.stats{grid-template-columns:1fr 1fr}.cfg{grid-template-columns:1fr 1fr}}
+  @media(max-width:720px){main{padding:14px}.grid{grid-template-columns:1fr}.stats{grid-template-columns:1fr 1fr}.cfg{grid-template-columns:1fr}}
 </style></head><body>
 <main>
 <header>
-  <div><div class="eb">tend &middot; desk cube</div><h1>clawdmeter</h1></div>
+  <div><div class="eb">tend &middot; lyrics display</div><h1>clawdmeter</h1></div>
   <div class="status"><span class="dot" id="dot"></span><span class="mut" id="status">connecting</span></div>
 </header>
+<section class="card">
+  <div class="label"><span class="eb">on the lcd</span><span class="mut" id="lyrS">--</span></div>
+  <div class="big" id="npTi">&mdash;</div>
+  <div class="mut" id="npAr"></div>
+  <div class="track" style="margin-top:12px"><div class="fill" id="npF"></div></div>
+  <div class="row"><span class="mono" id="npEl">0:00</span><span class="mono" id="npDu">0:00</span></div>
+  <div class="note" id="npL"></div>
+</section>
+<section class="card">
+  <div class="label"><span class="eb">network</span><span class="mut mono">clawdmeter.local</span></div>
+  <div class="stats" style="grid-template-columns:1fr 1fr 1fr">
+    <div class="stat"><div class="eb">wifi</div><div class="v" id="wS">--</div></div>
+    <div class="stat"><div class="eb">ip</div><div class="v mono" id="wI">--</div></div>
+    <div class="stat"><div class="eb">signal</div><div class="v mono" id="wR">--</div></div>
+  </div>
+  <div class="acts"><a class="btn warn" href="/wifi-reset" id="wBtn">change wifi</a><a class="btn warn" href="/factory-reset" id="fBtn">reset settings</a></div>
+  <div class="note"><b>change wifi</b> forgets the saved network and reboots into the <b>Clawdmeter-setup</b> hotspot &mdash; join it from a phone and pick the new network. <b>reset settings</b> does that and also restores the default backlight. Either way the lcd tells you the new address once it is back.</div>
+</section>
 <section class="grid">
   <div class="card">
     <div class="label"><span><span class="eb">session window</span> <span class="chip" id="sB" hidden>binding</span></span><span class="pct mono" id="sp">--</span></div>
@@ -212,46 +233,8 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
   <div class="stat"><div class="eb">weekly tokens</div><div class="v mono" id="wtok">--</div></div>
 </section>
 <section class="card">
-  <div class="label"><span class="eb">screen</span><span class="mut" id="scrName">--</span></div>
-  <div class="acts">
-    <button class="btn" data-scr="clock" data-get="/mode?screen=clock">clock</button>
-    <button class="btn" data-scr="music" data-get="/mode?screen=music">lyrics</button>
-    <button class="btn" data-scr="pomodoro" data-get="/mode?screen=pomodoro">pomodoro</button>
-    <button class="btn" data-scr="stats" data-get="/mode?screen=stats">stats</button>
-    <button class="btn" data-scr="sand" data-get="/mode?screen=sand">sand</button>
-    <button class="btn" data-scr="comic" data-get="/mode?screen=comic">comic</button>
-    <button class="btn" data-scr="apod" data-get="/mode?screen=apod">apod</button>
-  </div>
-  <div class="ctx" id="cx-clock"><div class="mut" style="margin-top:12px">time flows from the daemon &middot; nothing to tend here</div></div>
-  <div class="ctx" id="cx-music"><div class="mut" style="margin-top:12px">now showing on the lcd &middot; streamed lyrics from the mac daemon (:8766)</div></div>
-  <div class="ctx" id="cx-pomodoro">
-    <div class="label" style="margin-top:12px"><span class="big mono" id="pR">25:00</span><span class="mut" id="pS">idle</span></div>
-    <div class="acts"><button class="btn" id="pBtn" data-get="/pomodoro">start</button><button class="btn" data-get="/pomodoro?action=reset">reset</button></div>
-  </div>
-  <div class="ctx" id="cx-stats">
-    <div class="stats" style="margin-top:12px">
-      <div class="stat"><div class="eb">mac cpu</div><div class="v mono" id="xC">--</div></div>
-      <div class="stat"><div class="eb">memory</div><div class="v mono" id="xM">--</div></div>
-      <div class="stat"><div class="eb">disk</div><div class="v mono" id="xD">--</div></div>
-      <div class="stat"><div class="eb">battery</div><div class="v mono" id="xB">--</div></div>
-    </div>
-  </div>
-  <div class="ctx" id="cx-sand">
-    <div class="acts" style="margin-top:12px"><button class="btn" data-get="/sand?action=pour">pour sand</button><button class="btn" data-get="/sand?action=clear">clear</button></div>
-  </div>
-  <div class="ctx" id="cx-comic">
-    <div class="label" style="margin-top:12px"><span class="big" id="cT">--</span><span class="mut" id="cS">--</span></div>
-    <div class="acts"><button class="btn" data-get="/refresh?screen=comic">refresh comic</button></div>
-  </div>
-  <div class="ctx" id="cx-apod">
-    <div class="label" style="margin-top:12px"><span class="big" id="aT">--</span><span class="mut" id="aS">--</span></div>
-    <div class="mut" id="aX"></div>
-    <div class="acts"><button class="btn" data-get="/refresh?screen=apod">refresh apod</button></div>
-  </div>
-</section>
-<section class="card">
-  <div class="label"><span class="eb">now playing</span><span class="mut">push to /nowplaying</span></div>
-  <div class="cfg" style="grid-template-columns:1fr 1fr">
+  <div class="label"><span class="eb">test push</span><span class="mut">fake a track on /nowplaying</span></div>
+  <div class="cfg">
     <input id="npT" type="text" placeholder="title">
     <input id="npA" type="text" placeholder="artist">
     <input id="npP" type="number" min="0" placeholder="pos (s)">
@@ -261,7 +244,7 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
 </section>
 <section class="card">
   <div class="label"><span class="eb">device</span><span class="mut"><span class="mono" id="heap">--</span> heap &middot; up <span class="mono" id="up">--</span> &middot; boot <span id="rst">--</span></span></div>
-  <div class="acts"><a class="btn" href="/usage.json">usage json</a><a class="btn" href="/update">ota update</a><a class="btn" href="/restart" id="rBtn">restart</a><a class="btn warn" href="/factory-reset" id="fBtn">reset settings</a></div>
+  <div class="acts"><a class="btn" href="/usage.json">usage json</a><a class="btn" href="/update">ota update</a><a class="btn" href="/restart" id="rBtn">restart</a></div>
   <div class="ctl"><span class="eb">backlight</span><input id="bl" type="range" min="0" max="120" value="90"><span class="v mono" id="blV">90</span></div>
 </section>
 </main>
@@ -277,12 +260,11 @@ function cd(s){if(s<=0)return 't-0m';var h=Math.floor(s/3600),m=Math.floor(s%360
 function mmss(s){s=s>0?Math.floor(s):0;return Math.floor(s/60)+':'+pad2(s%60)}
 function commas(n){return n>0?String(n).replace(/\B(?=(\d{3})+(?!\d))/g,','):'--'}
 function ageText(a){return a<0?'--':a<60?a+'s':Math.floor(a/60)+'m '+pad2(a%60)+'s'}
-function pct(v){return v>=0?v+'%':'--'}
 function upText(s){var h=Math.floor(s/3600),m=Math.floor(s%3600/60);return h>0?h+'h'+pad2(m)+'m':m+'m'}
 function meter(pId,fId,v){$(pId).textContent=v>=0?v+'%':'--';$(fId).style.width=(v>=0?Math.min(v,100):0)+'%'}
-var gs=document.querySelectorAll('[data-get]');
-for(var gi=0;gi<gs.length;gi++)gs[gi].onclick=function(e){e.preventDefault();fetch(this.getAttribute('data-get'),{cache:'no-store'}).then(tick).catch(function(_){})};
-$('fBtn').onclick=function(e){if(!confirm('reset wifi and settings, then reboot?'))e.preventDefault()};
+var LYR=['waiting for the lyrics daemon','reaching the lyrics daemon','streaming'];
+$('fBtn').onclick=function(e){if(!confirm('forget wifi AND reset settings, then reboot into Clawdmeter-setup?'))e.preventDefault()};
+$('wBtn').onclick=function(e){if(!confirm('forget the saved wifi and reboot into Clawdmeter-setup?'))e.preventDefault()};
 $('rBtn').onclick=function(e){if(!confirm('restart clawdmeter?'))e.preventDefault()};
 $('npBtn').onclick=function(e){e.preventDefault();
   var q=[];function add(k,v){q.push(k+'='+encodeURIComponent(v))}
@@ -302,10 +284,20 @@ async function tick(){
   try{
     var d=await (await fetch('/usage.json',{cache:'no-store'})).json();
     var now=d.now||0,live=d.age>=0&&d.age<=120;
-    var hot=(d.stat&&d.stat!='allowed')||d.s>=90||d.walert==1;
+    var hot=(d.stat&&d.stat!='allowed')||d.s>=90;
     document.body.className=live?'':'stale';
-    dot.className='dot'+(hot?' hot':live?' live':'');
-    st.textContent=d.s<0?'waiting for daemon':(d.stat||'local')+' · updated '+ageText(d.age)+' ago';
+    dot.className='dot'+(d.lyr==2?' live':hot?' hot':'');
+    st.textContent=LYR[d.lyr]||'--';
+    $('lyrS').textContent=d.age<0?'no daemon push yet':'daemon seen '+ageText(d.age)+' ago';
+    $('npTi').textContent=d.title||'—';
+    $('npAr').textContent=d.artist||'';
+    $('npEl').textContent=mmss(d.pos);
+    $('npDu').textContent=d.dur>0?mmss(d.dur):'--:--';
+    $('npF').style.width=(d.dur>0&&d.pos>=0?Math.min(100,d.pos*100/d.dur):0)+'%';
+    $('npL').textContent=d.lyric||'';
+    $('wS').textContent=d.wifi?(d.ssid||'connected'):'offline';
+    $('wI').textContent=d.ip||'--';
+    $('wR').textContent=d.wifi?d.rssi+' dBm':'--';
     meter('sp','sf',d.s);meter('wp','wf',d.w);
     $('sB').hidden=d.bind!=1;$('wB').hidden=d.bind!=2;
     $('st').textContent=d.sr?'reset '+hm(d.sr):'reset --';
@@ -315,18 +307,6 @@ async function tick(){
     $('age').textContent=ageText(d.age);
     $('stok').textContent=commas(d.st);
     $('wtok').textContent=commas(d.wt);
-    var bs=document.querySelectorAll('[data-scr]');
-    for(var i=0;i<bs.length;i++)bs[i].className='btn'+(bs[i].getAttribute('data-scr')==d.screen?' on':'');
-    $('scrName').textContent='on the lcd · '+d.screen;
-    var cs=document.querySelectorAll('.ctx');
-    for(var ci=0;ci<cs.length;ci++)cs[ci].style.display=cs[ci].id=='cx-'+d.screen?'block':'none';
-    $('pR').textContent=mmss(d.pomor);
-    $('pS').textContent=d.pomo;
-    $('pBtn').textContent=d.pomo=='running'?'pause':'start';
-    $('xC').textContent=pct(d.cpu);$('xM').textContent=pct(d.mem);
-    $('xD').textContent=pct(d.disk);$('xB').textContent=pct(d.bat);
-    $('cT').textContent=d.ctitle||'--';$('cS').textContent=d.cstate;
-    $('aT').textContent=d.atitle||'--';$('aS').textContent=d.astate;$('aX').textContent=d.ax||'';
     $('heap').textContent=Math.round(d.heap/1024)+'k';
     $('up').textContent=upText(d.up);
     $('rst').textContent=d.rst||'--';
@@ -395,9 +375,15 @@ void handleRoot() {
 
 // Daemon pushes the numbers here:
 // POST /usage?s=&w=&st=&wt=&sr=&wr=&stat=&bind=&t=&cpu=&mem=&disk=&bat=
+//
+// This board draws no usage screen, but the endpoint is load-bearing anyway and
+// must not be deleted as dead code: it is how the box learns (1) the Mac's IP,
+// the only way it can find the lyrics daemon to dial, and (2) server time, which
+// drives the clock on the waiting screen. The numbers themselves feed the
+// browser dashboard's meters via /usage.json.
 void handleUsage() {
   // The pusher is the Mac that also runs the lyrics daemon — remember its IP
-  // so the MUSIC screen can dial back for the frame stream (no config needed).
+  // so the frame stream can dial back (no config needed).
   lyricsStreamNoteHost(server.client().remoteIP());
   if (server.hasArg("s")) sessionPct = server.arg("s").toInt();
   if (server.hasArg("w")) weeklyPct  = server.arg("w").toInt();
@@ -416,22 +402,8 @@ void handleUsage() {
     if (t > 0) { timeBaseEpoch = t; timeBaseMillis = millis(); }
   }
   lastUpdateMs = millis();
-  statsOnUsagePush();   // fold the fresh Mac metrics into the stats trend
   server.sendHeader("Connection", "close");
   server.send(200, "text/plain", "ok");
-}
-
-// Screen id <-> name, mirroring the ESP32 app_mode names (plus music).
-static const char *const SCREEN_NAMES[] = {
-  "music", "clock", "pomodoro", "stats", "sand",
-  "comic", "apod",
-};
-static const uint8_t SCREEN_NAME_COUNT = sizeof(SCREEN_NAMES) / sizeof(SCREEN_NAMES[0]);
-
-// The dashboard page polls this.
-static String screenName() {
-  if (lcdScreen < SCREEN_NAME_COUNT) return SCREEN_NAMES[lcdScreen];
-  return "clock";
 }
 
 // Escape a UTF-8 string for embedding in the hand-built /usage.json. Song titles
@@ -448,6 +420,12 @@ static String jsonEscape(const String &s) {
   return o;
 }
 
+// One blocking send, no gzip and no size guard — unlike handleRoot(), which
+// needs both. This body's worst case is ~1.3 KB (long title + two lyric lines +
+// a crash-dump rinfo + a 32-char SSID), comfortably inside one ip=hb2f
+// send-buffer fill (~5840 B), so it never hits the truncation failure mode in
+// docs/postmortems/dashboard-truncated-send.md. Keep it that way: this is polled
+// every 3 s, so a field that can grow unbounded belongs on its own endpoint.
 void handleUsageJson() {
   long age = (sessionPct < 0) ? -1 : (long)((millis() - lastUpdateMs) / 1000);
   String j = "{\"s\":" + String(sessionPct) +
@@ -462,7 +440,6 @@ void handleUsageJson() {
              ",\"mem\":" + String(macMemPct) +
              ",\"disk\":" + String(macDiskPct) +
              ",\"bat\":" + String(macBatteryPct) +
-             ",\"screen\":\"" + screenName() + "\"" +
              ",\"title\":\"" + jsonEscape(npTitle) + "\"" +
              ",\"artist\":\"" + jsonEscape(npArtist) + "\"" +
              ",\"lyric\":\"" + jsonEscape(npLyric) + "\"" +
@@ -470,14 +447,11 @@ void handleUsageJson() {
              ",\"pos\":" + String(musicDisplayPos()) +
              ",\"dur\":" + String(npDur) +
              ",\"paused\":" + String(npPaused) +
-             ",\"pomo\":\"" + String(pomodoroStateName()) + "\"" +
-             ",\"pomor\":" + String(pomodoroRemainingSec()) +
-             ",\"cstate\":\"" + String(dailyStateName(false)) + "\"" +
-             ",\"astate\":\"" + String(dailyStateName(true)) + "\"" +
-             ",\"ctitle\":\"" + jsonEscape(dailyTitle(false)) + "\"" +
-             ",\"atitle\":\"" + jsonEscape(dailyTitle(true)) + "\"" +
-             ",\"cx\":\"" + jsonEscape(dailyExtra(false)) + "\"" +
-             ",\"ax\":\"" + jsonEscape(dailyExtra(true)) + "\"" +
+             ",\"lyr\":" + String(lyricsStreamActive() ? 2 : (lyricsStreamConnecting() ? 1 : 0)) +
+             ",\"ssid\":\"" + jsonEscape(WiFi.SSID()) + "\"" +
+             ",\"ip\":\"" + WiFi.localIP().toString() + "\"" +
+             ",\"rssi\":" + String(WiFi.isConnected() ? WiFi.RSSI() : 0) +
+             ",\"wifi\":" + String(WiFi.isConnected() ? 1 : 0) +
              ",\"bl\":" + String(lcdBrightness) +
              ",\"heap\":" + String(ESP.getFreeHeap()) +
              ",\"now\":" + String(nowEpoch()) +
@@ -506,21 +480,6 @@ void handleBrightness() {
   String j = "{\"brightness\":" + String(lcdBrightness) + "}";
   server.sendHeader("Connection", "close");
   server.send(200, "application/json", j);
-}
-
-void handleMode() {
-  if (server.hasArg("screen")) {
-    String screen = server.arg("screen");
-    screen.toLowerCase();
-    for (uint8_t i = 0; i < SCREEN_NAME_COUNT; i++) {
-      if (screen == SCREEN_NAMES[i]) {
-        if (i != lcdScreen) tendShowScreen(i);
-        break;
-      }
-    }
-  }
-  server.sendHeader("Connection", "close");
-  server.send(200, "text/plain", screenName());
 }
 
 // Daemon pushes the current YouTube Music song here:
@@ -564,52 +523,6 @@ void handleNowPlaying() {
   server.send(200, "text/plain", "ok");
 }
 
-// Per-screen action endpoints (this box has no physical buttons; the ESP32's
-// BOOT/action button gestures become dashboard buttons). Every action jumps to
-// its screen so the effect is visible immediately.
-void handlePomodoro() {
-  String action = server.hasArg("action") ? server.arg("action") : String("toggle");
-  if (action == "reset") pomodoroReset();
-  else pomodoroToggleStartPause();
-  tendShowScreen(SCREEN_POMODORO);
-  server.sendHeader("Connection", "close");
-  server.send(200, "text/plain", pomodoroStateName());
-}
-
-void handleSand() {
-  String action = server.hasArg("action") ? server.arg("action") : String("pour");
-  if (action == "clear") sandClear();
-  else sandPour();
-  if (lcdScreen != SCREEN_SAND) tendShowScreen(SCREEN_SAND);
-  server.sendHeader("Connection", "close");
-  server.send(200, "text/plain", "ok");
-}
-
-// Daily-image metadata push from the Mac daemon (this chip cannot afford the
-// BearSSL heap to talk to the HTTPS xkcd/NASA APIs itself):
-// POST /daily?comicimg=&comictitle=&comicnum=&apodimg=&apodtitle=&apoddate=
-void handleDaily() {
-  if (server.hasArg("comicimg")) {
-    dailySetMeta(false, server.arg("comicimg"), server.arg("comictitle"),
-                 server.arg("comicnum"));
-  }
-  if (server.hasArg("apodimg")) {
-    dailySetMeta(true, server.arg("apodimg"), server.arg("apodtitle"),
-                 server.arg("apoddate"));
-  }
-  server.sendHeader("Connection", "close");
-  server.send(200, "text/plain", "ok");
-}
-
-// Manual comic/APOD refetch from the dashboard.
-void handleRefresh() {
-  bool apod = server.hasArg("screen") && server.arg("screen") == "apod";
-  dailyRefresh(apod);
-  tendShowScreen(apod ? SCREEN_APOD : SCREEN_COMIC);
-  server.sendHeader("Connection", "close");
-  server.send(200, "text/plain", "ok");
-}
-
 static void setOtaError() {
   StreamString message;
   Update.printError(message);
@@ -630,16 +543,48 @@ void handleRestart() {
   ESP.restart();
 }
 
+// Forget the saved WiFi and reboot straight into the setup hotspot — the way you
+// move the box to a new router or a new password without a USB cable. Brightness
+// and the rest of the EEPROM survive; /factory-reset below is the wider wipe.
+//
+// Deliberately reset-and-reboot rather than wm.startConfigPortal(): the portal
+// blocks until someone finishes it, and calling it from inside a request handler
+// would stall loop() and take the web server down with it for up to 3 minutes.
+// Rebooting hands the portal to setup(), which is built to block.
+void handleWifiReset() {
+  server.sendHeader("Connection", "close");
+  server.send(200, "text/plain",
+              "WiFi forgotten. Rebooting to the Clawdmeter-setup hotspot...");
+  server.client().flush();   // drain the reply before we tear the link down
+  delay(500);
+
+  // resetSettings() erases the SDK's config sector. A backlight PWM timer ISR
+  // firing during a flash erase resets the chip mid-write (see
+  // backlightStopForFlash), which could leave the credentials half-wiped — park
+  // the waveform first and never restore it, since we reboot from here anyway.
+  backlightStopForFlash();
+  WiFiManager wm;
+  wm.resetSettings();
+  ESP.restart();   // no delay: resetSettings() has already dropped the STA link
+}
+
+// The wider wipe: WiFi credentials *and* stored settings (brightness) back to
+// defaults. Use /wifi-reset when all you want is a different network.
 void handleFactoryReset() {
+  server.sendHeader("Connection", "close");
+  server.send(200, "text/plain",
+              "Factory reset OK. Rebooting to Clawdmeter-setup...");
+  server.client().flush();
+  delay(500);
+
+  // Same flash guard as /wifi-reset, and it covers both writes below. Note the
+  // bare EEPROM.commit(): tendEepromCommit() would re-arm the PWM waveform right
+  // after, which is the one thing we must not do on the way to ESP.restart().
+  backlightStopForFlash();
   WiFiManager wm;
   wm.resetSettings();
   EEPROM.write(EE_MARKER_ADDR, 0x00);   // invalid marker -> defaults on reboot
   EEPROM.commit();
-
-  server.sendHeader("Connection", "close");
-  server.send(200, "text/plain",
-              "Factory reset OK. Rebooting to Clawdmeter-setup...");
-  delay(500);
   ESP.restart();
 }
 
@@ -656,10 +601,6 @@ void printCentered(int y, uint8_t size, const String &s,
   gfx->setTextColor(fg, bg);
   gfx->setCursor((240 - textWidth(s, size)) / 2, y);
   gfx->print(s);
-}
-
-String pctText(int pct) {
-  return (pct < 0) ? String("--") : String(pct) + "%";
 }
 
 static void drawOtaStatus(const String &line) {
@@ -687,14 +628,10 @@ String pad2(int v) {
   return (v < 10) ? "0" + String(v) : String(v);
 }
 
-// All times are UTC epochs; the caller adds TZ_OFFSET before formatting.
+// The epoch is UTC; the caller adds TZ_OFFSET before formatting.
 String hhmmss(unsigned long e) {
   unsigned long s = e % 86400UL;
   return pad2(s / 3600) + ":" + pad2((s % 3600) / 60) + ":" + pad2(s % 60);
-}
-String hhmm(unsigned long e) {
-  unsigned long s = e % 86400UL;
-  return pad2(s / 3600) + ":" + pad2((s % 3600) / 60);
 }
 
 // Right-align text ending at rightX (opaque, so it overprints cleanly).
@@ -734,20 +671,24 @@ void tendHeaderClock() {
   printRight(226, 8, 1, t, C_TND_MUTE, C_TND_PAPER);
 }
 
-// ---- MUSIC screen: daemon-streamed lyrics only -----------------------------
-// The MUSIC screen is rendered entirely by lyrics_display_daemon.py: it streams
-// 240x240 1-bpp frames (Core Text — real Thai shaping + syllable karaoke, plus
-// the full-screen album-art hero frames) over the WebSocket in lyrics_stream.cpp.
-// The old on-device now-playing renderer (marquees, lyric bands, bundled Thai
-// font) is gone. Whenever no daemon frame owns the panel we paint a simple Tend
-// paper placeholder (eyebrow + status line + clock) and wait for the stream.
+// ---- The lyrics screen (the only screen) -----------------------------------
+// Song content is rendered entirely by lyrics_display_daemon.py on the Mac: it
+// streams 240x240 1-bpp frames (Core Text — real Thai shaping and syllable
+// karaoke, plus full-screen album-art hero frames) over the WebSocket in
+// lyrics_stream.cpp. There is no on-device now-playing renderer.
+//
+// Whenever no daemon frame owns the panel we paint the *waiting screen*: Tend
+// chrome, a status line saying what the box is doing, and — the reason it earns
+// its space — the device's own address, so you can reach the dashboard from a
+// phone without a serial cable or a router-admin hunt.
 // Run the daemon with --insecure so it speaks the proto=1 path this chip's client
 // uses (see lyrics_stream.cpp for why the secure proto=2 heap won't fit here).
 
 static bool musicStreamWas = false;        // last lyricsStreamActive() seen by musicTick
 static bool musicConnWas = false;          // last lyricsStreamConnecting() (drives the eyebrow)
 static uint8_t musicConnDots = 0;          // 0-3 dot pulse for the "connecting" status line
-static unsigned long musicTickLastMs = 0;  // 1 Hz cadence for the placeholder clock/dots
+static unsigned long musicTickLastMs = 0;  // 1 Hz cadence for the waiting clock/dots
+static String musicNetSig = "";            // last address block painted (repaint only on change)
 
 // Interpolated playback position, surfaced in /usage.json for the dashboard's Now
 // Playing panel (never drawn on-device). Forward-declared up by the np* globals so
@@ -767,7 +708,7 @@ static int musicDisplayPos() {
 // frame while the socket stays open). Clears only its own band so it can't flash
 // the rest of the paper.
 #define MUSIC_STATUS_Y 108
-static void musicDrawPlaceholderStatus() {
+static void musicDrawWaitingStatus() {
   gfx->fillRect(0, MUSIC_STATUS_Y - 2, 240, 16, C_TND_PAPER);
   String msg = lyricsStreamConnecting() ? String("reaching the lyrics daemon")
                                         : String("waiting for lyrics");
@@ -776,69 +717,83 @@ static void musicDrawPlaceholderStatus() {
   printCentered(MUSIC_STATUS_Y, 1, msg, C_TND_MUTE, C_TND_PAPER);
 }
 
-// Full placeholder paint: Tend chrome (paper + hearth mark + eyebrow + hairline),
-// the status line, and the header clock. Shown on switch-in and whenever the
-// stream hands the panel back to us.
-static void musicDrawPlaceholder() {
+// The address block: where to find this box. The IP goes at size 2 so it reads
+// from across the desk while you type it into a phone; under it the mDNS name,
+// which is the address worth memorising; at the foot, the network it joined.
+//
+// Repainted only when the text actually changes (musicNetSig), not on every 1 Hz
+// tick — clearing and redrawing a 50 px band once a second is a visible blink.
+// RSSI is deliberately absent for the same reason: it jitters every second and
+// would defeat the signature. The dashboard shows it instead.
+#define MUSIC_ADDR_Y 148
+#define MUSIC_HOST_Y 176
+#define MUSIC_FOOT_Y 224
+static void musicDrawWaitingNet(bool force) {
+  const bool up = WiFi.isConnected();
+  const String addr = up ? WiFi.localIP().toString() : String("wifi lost");
+  const String host = up ? String("clawdmeter.local") : String("reconnecting");
+  const String foot = up ? "wifi: " + WiFi.SSID() : String("no network");
+
+  const String sig = addr + "|" + host + "|" + foot;
+  if (!force && sig == musicNetSig) return;
+  musicNetSig = sig;
+
+  gfx->fillRect(0, MUSIC_ADDR_Y - 4, 240, (MUSIC_HOST_Y + 12) - (MUSIC_ADDR_Y - 4), C_TND_PAPER);
+  gfx->fillRect(0, MUSIC_FOOT_Y - 3, 240, 14, C_TND_PAPER);
+  printCentered(MUSIC_ADDR_Y, 2, addr, up ? C_TND_INK : C_TND_EMBER, C_TND_PAPER);
+  printCentered(MUSIC_HOST_Y, 1, host, C_TND_MUTE, C_TND_PAPER);
+  printCentered(MUSIC_FOOT_Y, 1, foot, C_TND_FAINT, C_TND_PAPER);
+}
+
+// Full waiting-screen paint: Tend chrome (paper + hearth mark + eyebrow +
+// hairline), the status line, the address block, and the header clock. Shown at
+// boot and whenever the stream hands the panel back.
+static void musicDrawWaiting() {
   musicConnWas = lyricsStreamConnecting();
-  tendHeader(musicConnWas ? "connecting" : "now playing");
-  musicDrawPlaceholderStatus();
+  // "now playing" would be a lie here — this screen only shows when nothing is.
+  tendHeader(musicConnWas ? "connecting" : "lyrics");
+  musicDrawWaitingStatus();
+  musicDrawWaitingNet(true);
   tendHeaderClock();
+}
+
+// Repaint the screen from scratch. Called at boot and after a failed OTA; the
+// stream re-claims the panel on its own from musicTick().
+static void musicScreenBegin() {
+  musicStreamWas = false;
+  musicTickLastMs = 0;
+  musicDrawWaiting();
 }
 
 // Per-loop tick. Pump the socket; the stream blits its own frames straight to the
 // panel while it owns it (musicTick paints nothing then). On the transition back
-// to no-stream, repaint the placeholder once. While idle: repaint the whole
-// placeholder if the connecting-state (and thus the eyebrow) flipped, otherwise
-// keep the clock fresh and pulse the "connecting..." dots at 1 Hz.
+// to no-stream, repaint the waiting screen once. While waiting: repaint in full
+// if the connecting-state (and thus the eyebrow) flipped, otherwise keep the
+// clock fresh, pulse the "connecting..." dots at 1 Hz, and refresh the address
+// block if the IP or network changed under us (DHCP renewal, reconnect).
 static void musicTick() {
   lyricsStreamTick();
   bool streaming = lyricsStreamActive();
   if (streaming != musicStreamWas) {
     musicStreamWas = streaming;
-    if (!streaming) musicDrawPlaceholder();   // stream dropped -> back to placeholder
+    if (!streaming) musicDrawWaiting();   // stream dropped -> back to the waiting screen
   }
   if (streaming) return;                        // frames own the panel
 
   unsigned long now = millis();
   bool conn = lyricsStreamConnecting();
   if (conn != musicConnWas) {                   // eyebrow text changed -> full repaint
-    musicDrawPlaceholder();
+    musicDrawWaiting();
     musicTickLastMs = now;
     return;
   }
   if (now - musicTickLastMs >= 1000UL) {
     musicTickLastMs = now;
     if (conn) musicConnDots++;
-    musicDrawPlaceholderStatus();               // pulse dots / keep the line fresh
+    musicDrawWaitingStatus();                   // pulse dots / keep the line fresh
+    musicDrawWaitingNet(false);                 // no-op unless the address changed
     tendHeaderClock();                          // cheap: clears only the clock rect
   }
-}
-
-// Full repaint of the current screen (chrome + content). Used on mode switch,
-// after OTA failure, and by dashboard actions that want the effect visible.
-void drawMeter() {
-  switch (lcdScreen) {
-    case SCREEN_MUSIC:
-      musicStreamWas = false;   // stream re-claims the panel via musicTick
-      musicTickLastMs = 0;
-      musicDrawPlaceholder();
-      break;
-    case SCREEN_POMODORO: pomodoroScreenBegin(); break;
-    case SCREEN_STATS:    statsScreenBegin(); break;
-    case SCREEN_SAND:     sandScreenBegin(); break;
-    case SCREEN_COMIC:
-    case SCREEN_APOD:     dailyScreenBegin(); break;
-    default:              clockScreenBegin(); break;
-  }
-}
-
-void tendShowScreen(uint8_t screen) {
-  // Leaving MUSIC drops the lyrics frame stream and frees its buffers; the
-  // daemon keeps rendering for its other boards and we resync on return.
-  if (lcdScreen == SCREEN_MUSIC && screen != SCREEN_MUSIC) lyricsStreamStop();
-  lcdScreen = screen;
-  drawMeter();
 }
 
 void handleUpdateDone() {
@@ -849,7 +804,7 @@ void handleUpdateDone() {
     otaInProgress = false;
     otaUpdateOk = false;
     WiFi.setSleepMode(WIFI_MODEM_SLEEP);
-    drawMeter();
+    musicScreenBegin();
     return;
   }
 
@@ -925,26 +880,30 @@ void setup() {
   // Start the bus ourselves and tell gfx->begin() not to reconfigure it.
   bus->begin(40000000, SPI_MODE3);
   gfx->begin(GFX_SKIP_DATABUS_BEGIN);  // hardware reset (RST) + ST7789 init
-  gfx->fillScreen(0x0000);
-  gfx->setTextColor(0xFFFF, 0x0000);
-  gfx->setTextSize(2);
-  gfx->setCursor(12, 100);
-  gfx->print("starting...");
+  tendHeader("starting");
+  printCentered(112, 1, "joining wifi", C_TND_MUTE, C_TND_PAPER);
 
-  // Tries the saved network; if it can't connect it opens a "Clawdmeter-setup"
-  // hotspot — join it from your phone to pick a new WiFi. No re-flashing needed.
+  // Tries the saved network; if it can't connect — first boot, new router, new
+  // password — it opens the "Clawdmeter-setup" hotspot instead: join it from a
+  // phone, pick a network, done. No re-flashing, and /wifi-reset gets you back
+  // here on demand. autoConnect() blocks for the whole portal session, which is
+  // exactly why the reset endpoints reboot into it rather than opening it from a
+  // request handler (that would stall loop() and the web server with it).
   WiFiManager wm;
-  wm.setConfigPortalTimeout(180);          // give up after 3 min and reboot/retry
-  wm.setAPCallback([](WiFiManager *m) {    // show setup hint on the screen
-    gfx->fillScreen(0x0000);
-    gfx->setTextColor(0xFFFF, 0x0000);
-    gfx->setTextSize(2);
-    gfx->setCursor(12, 70);  gfx->print("Setup WiFi:");
-    gfx->setCursor(12, 100); gfx->print("join hotspot");
-    gfx->setTextColor(0xFD20, 0x0000);
-    gfx->setCursor(12, 130); gfx->print("Clawdmeter-setup");
+  wm.setConfigPortalTimeout(WIFI_PORTAL_TIMEOUT_S);
+  wm.setAPCallback([](WiFiManager *) {    // the portal is up — say so on the panel
+    tendHeader("wifi setup");
+    printCentered(52, 1, "join this hotspot from a phone", C_TND_MUTE, C_TND_PAPER);
+    printCentered(74, 2, WIFI_SETUP_AP, C_TND_EMBER, C_TND_PAPER);
+    printCentered(116, 1, "a setup page opens by itself", C_TND_MUTE, C_TND_PAPER);
+    printCentered(132, 1, "if not, browse to", C_TND_MUTE, C_TND_PAPER);
+    printCentered(152, 2, WiFi.softAPIP().toString(), C_TND_INK, C_TND_PAPER);
+    printCentered(224, 1, "waiting 3 min, then retrying", C_TND_FAINT, C_TND_PAPER);
   });
-  if (!wm.autoConnect("Clawdmeter-setup")) {
+  if (!wm.autoConnect(WIFI_SETUP_AP)) {
+    // Nobody finished the portal in time. Reboot rather than sit here: the saved
+    // network may simply have come back (router reboot), and if it hasn't, the
+    // next pass reopens the portal.
     Serial.println("WiFi setup timed out, restarting...");
     ESP.restart();
   }
@@ -966,7 +925,7 @@ void setup() {
     Serial.println("Also at: http://clawdmeter.local/");
   }
 
-  drawMeter();   // shows "waiting for daemon..." + the device IP until data arrives
+  musicScreenBegin();   // waiting screen: status + this box's address, until frames flow
 
   server.on("/", handleRoot);
   server.on("/usage", HTTP_POST, handleUsage);
@@ -974,16 +933,12 @@ void setup() {
   server.on("/usage.json", handleUsageJson);
   server.on("/brightness", HTTP_GET, handleBrightness);
   server.on("/brightness", HTTP_POST, handleBrightness);
-  server.on("/mode", HTTP_GET, handleMode);
-  server.on("/mode", HTTP_POST, handleMode);
-  server.on("/pomodoro", handlePomodoro);
-  server.on("/sand", handleSand);
-  server.on("/daily", handleDaily);
-  server.on("/refresh", handleRefresh);
   server.on("/nowplaying", HTTP_GET, handleNowPlaying);
   server.on("/nowplaying", HTTP_POST, handleNowPlaying);
   server.on("/restart", HTTP_GET, handleRestart);
   server.on("/restart", HTTP_POST, handleRestart);
+  server.on("/wifi-reset", HTTP_GET, handleWifiReset);
+  server.on("/wifi-reset", HTTP_POST, handleWifiReset);
   server.on("/factory-reset", HTTP_GET, handleFactoryReset);
   server.on("/factory-reset", HTTP_POST, handleFactoryReset);
   server.on("/update", HTTP_GET, handleUpdatePage);
@@ -1002,22 +957,9 @@ void loop() {
     return;
   }
 
-  // Background countdowns advance regardless of the visible screen (the ESP32
-  // ran pomodoro_tick unconditionally too). With no chime on this box, a
-  // firing alert pulls its own screen forward via tendShowScreen.
-  pomodoroTick();
-
-  // Every screen is millis()-polled from here (never a timer ISR, so nothing
+  // The one screen, millis()-polled from here (never a timer ISR, so nothing
   // fights the WiFi/TCP stack and no IRAM is spent).
-  switch (lcdScreen) {
-    case SCREEN_MUSIC:    musicTick(); break;
-    case SCREEN_POMODORO: pomodoroScreenTick(); break;
-    case SCREEN_STATS:    statsScreenTick(); break;
-    case SCREEN_SAND:     sandScreenTick(); break;
-    case SCREEN_COMIC:
-    case SCREEN_APOD:     dailyScreenTick(); break;
-    default:              clockScreenTick(); break;
-  }
+  musicTick();
 
   // Yield to the SDK so WIFI_MODEM_SLEEP can actually engage between beacons.
   // 2 ms is invisible to a 1 s clock tick and a page polled once per second.
