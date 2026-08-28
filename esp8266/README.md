@@ -14,17 +14,17 @@ The device drives the LCD **and** serves a small web dashboard at the same URL,
 which is where you tend it: it has no buttons.
 
 ```
-lyrics daemon (lyrics_display_daemon.py --insecure)
-   └── WebSocket :8766 ──1-bit UI + RGB565 cover art──> ESP8266 lyrics screen
-
-claudemeter daemon (claudemeter_daemon.py)
-   └── HTTP POST /usage + /nowplaying ──> ESP8266   (teaches it the Mac's IP)
+lyrics daemon (esp8266/daemon/lyrics_display_daemon.py --insecure)
+   ├── WebSocket :8766 ──1-bit UI + RGB565 cover art──> ESP8266 lyrics screen
+   └── HTTP GET /usage every 60s ─────────────────────> ESP8266
+                                        (teaches it the Mac's IP; the board
+                                         dials :8766 back on its own)
 ```
 
 ### The screen
 
 The lyrics screen is rendered **entirely on the Mac** by
-`daemon/lyrics_display_daemon.py`: a Tend-color 240×240 UI with Core Text Thai
+`esp8266/daemon/lyrics_display_daemon.py`: a Tend-color 240×240 UI with Core Text Thai
 shaping, syllable karaoke, and real-color album covers, streamed to the panel
 frame by frame. There is no on-device now-playing renderer.
 
@@ -123,55 +123,73 @@ if the dashboard is out of reach. They reset-and-reboot rather than opening the
 portal in place: the portal blocks until someone finishes it, and running it
 from inside a request handler would take the web server down with it.
 
-### 4. Start the Mac daemons
+### 4. Start the Mac daemon
 
-The lyrics screen needs **two** processes on the Mac. Start order doesn't
-matter.
+One process, from this directory:
 
 ```sh
-# terminal 1 — renders the frames and serves this board on :8766
-python3 daemon/lyrics_display_daemon.py serve --insecure
-
-# terminal 2 — teaches the board where the Mac is (see below)
-CLAWDMETER_DEVICE_URL=http://clawdmeter.local \
-CLAWDMETER_DAILY_IMAGES=off \
-python3 daemon/claudemeter_daemon.py
+python3 esp8266/daemon/lyrics_display_daemon.py serve --insecure
 ```
 
-**Why the third one?** The board is never told the Mac's address — it *learns*
-it from the source IP of a `/usage` or `/nowplaying` push, then dials back to
-port 8766. `claudemeter_daemon.py` is what makes those pushes, so without it the
-board sits on `waiting for lyrics` forever. Set `CLAWDMETER_DAILY_IMAGES=off`:
-this firmware has no comic/APOD screen and no `/daily` endpoint, so leaving it
-on just logs a failed push every 6 hours. Usage polling stays off by default and
-there's no usage screen here, but the numbers still show on the dashboard if you
-want them (`CLAWDMETER_USAGE_SOURCE=api`).
+That is the whole Mac side. It renders the frames, serves the board on `:8766`,
+and knocks on the board's `/usage` every 60s so it learns where the Mac is.
 
-**Why `--insecure`?** By default the lyrics daemon creates an identity and
-requires a mutual HMAC-SHA256 handshake (secure proto=2) — the scheme the ESP32
-e-ink board uses. The ESP8266 lacks the heap to buffer-and-verify a whole SEC2
-record on top of its framebuffer, so it speaks the unauthenticated proto=1
-instead. `--insecure` drops the identity, advertises `proto=1`, and streams
-unwrapped frames this board can render. (Or set `G4PYS_LYRICS_INSECURE=1`.)
-Without it the board can't complete the handshake and the panel just stays on
-the waiting screen.
+**Why the knock?** The board is never told the Mac's address — it *learns* it
+from the source IP of a request to `/usage`, then dials that IP back on port
+8766. It also forgets a Mac it hasn't heard from in 10 minutes
+(`LYR_HOST_FRESH_MS` in `lyrics_stream.cpp`), which is why the knock repeats
+instead of firing once at startup. The `t=` parameter it carries is what drives
+the clock on the waiting screen.
+
+If your board answers to something other than `clawdmeter.local`:
+
+```sh
+python3 esp8266/daemon/lyrics_display_daemon.py serve --insecure \
+  --announce-url http://192.168.1.35
+```
+
+`--no-announce` turns the knock off, for when something else is already pushing
+to the board's `/usage`.
+
+> **This used to need `claudemeter_daemon.py` too.** That daemon polls Claude
+> usage and has nothing to do with lyrics; it was only ever here because its
+> HTTP pushes happened to teach the board the Mac's IP. The daemon now does its
+> own knock, so this board no longer depends on it. Nothing on this board draws
+> a usage screen — if you still want the dashboard's meters populated, running
+> `claudemeter_daemon.py` alongside remains optional and harmless.
+
+**Why `--insecure`?** By default the daemon creates an identity and requires a
+mutual HMAC-SHA256 handshake (secure proto=2) — the scheme the ESP32 e-ink
+board uses. The ESP8266 lacks the heap to buffer-and-verify a whole SEC2 record
+on top of its framebuffer, so it speaks the unauthenticated proto=1 instead.
+`--insecure` drops the identity, advertises `proto=1`, and streams unwrapped
+frames this board can render. (Or set `G4PYS_LYRICS_INSECURE=1`.) Without it the
+board can't complete the handshake and the panel stays on the waiting screen.
 
 There is no pairing step and no token on this link — the trade is LAN-link
 authentication for ~7 KB of heap, so run it on a trusted home network.
 
-> If you also run the ESP32 e-ink board, note that `--insecure` is process-wide
-> and there is one daemon: the e-ink board finds it over mDNS and dials the same
-> process, so turning the flag on for this box drops that board's authentication
-> too. Splitting them is not currently an escape — a second daemon has no way to
-> learn playback state, since the browser extension connects to one address.
-
-> The lyrics daemon has no launchd plist wired up — restart it by hand after
-> editing daemon code.
+> **Running this alongside the ESP32 e-ink board.** They are separate daemons
+> now (`daemon/` serves the e-ink board, `esp8266/daemon/` serves this one), but
+> they still default to the same ports and the same mDNS name. This fork
+> defaults to `--no-mdns` so it won't contest the `_lyrics._tcp` instance the
+> e-ink board browses for — Bonjour gives a contested name to the oldest holder,
+> which would otherwise feed the e-ink board this fork's `proto=1` record and
+> break its handshake. To run both at once, also move this one off the shared
+> ports and point its copy of the extension at the new one:
+>
+> ```sh
+> python3 esp8266/daemon/lyrics_display_daemon.py serve --insecure \
+>   --extension-port 8775 --board-port 8776
+> ```
+>
+> then change `WS_URL` in `esp8266/browser_extension/content_script.js` to
+> `ws://127.0.0.1:8775/extension`. Otherwise, run one or the other.
 
 ### 5. Play something
 
-Load the browser extension (`browser_extension/` → `chrome://extensions` →
-Developer mode → Load unpacked) and play a track in **YouTube Music**. It feeds
+Load the browser extension (`esp8266/browser_extension/` → `chrome://extensions`
+→ Developer mode → Load unpacked) and play a track in **YouTube Music**. It feeds
 title/artist/position to the lyrics daemon.
 
 Within a few seconds the panel switches from the waiting screen to the streamed
@@ -180,7 +198,7 @@ half is missing:
 
 | The panel says | What it means | Fix |
 |---|---|---|
-| `waiting for lyrics` | No Mac IP known yet, or the daemon is connected but idle between tracks | Start `claudemeter_daemon.py` (step 4) — that's what teaches the board the Mac's IP |
+| `waiting for lyrics` | No Mac IP known yet, or the daemon is connected but idle between tracks | Check the daemon logged `board announce reached …`. If it logged a failure, the board isn't resolving — pass `--announce-url http://<board-ip>` |
 | `reaching the lyrics daemon…` | Mac IP known, the socket won't come up | Start `lyrics_display_daemon.py serve --insecure`; check nothing is blocking `:8766` between Mac and board |
 | Streamed frames never appear, but the socket connects | The daemon is demanding a proto=2 handshake this board can't do | Restart it with `--insecure` — a bare `lyrics_display_daemon.py serve` won't talk to this board |
 
@@ -201,6 +219,9 @@ there; the device flashes and reboots on its own.
 
 ## Source layout
 
+Everything this board needs lives under `esp8266/`. Nothing outside it is
+required at runtime.
+
 ```
 esp8266/
 ├── clawdmeter_esp8266/
@@ -208,9 +229,56 @@ esp8266/
 │   ├── tend.h                   # shared Tend palette + the .ino/stream contract
 │   ├── lyrics_stream.cpp        # the lyrics screen: WS client for the lyrics daemon
 │   └── index_html_gz.h          # generated — gzipped dashboard served at /
+├── daemon/
+│   └── lyrics_display_daemon.py # renders the screen; knocks on /usage. The Mac side.
+├── browser_extension/           # feeds YouTube Music playback to the daemon
+├── tests/
+│   └── test_lyrics_display_daemon.py
 └── tools/
     └── gen_index_gz.py          # regenerate index_html_gz.h after editing INDEX_HTML
 ```
+
+Run the tests from the repo root:
+
+```sh
+python3 -m unittest discover -s esp8266/tests -t .
+```
+
+### This daemon is a fork, not a shared module
+
+`esp8266/daemon/lyrics_display_daemon.py` is a copy of
+`daemon/lyrics_display_daemon.py`, not an import of it. The ESP32 e-ink board
+still dials that other copy with the SEC2 handshake
+(`firmware/main/board_client.cpp`), and this tree has to stand alone so it can
+be split into its own repository. **A fix that matters to both boards has to be
+applied twice** — that is the accepted cost of the split.
+
+The two copies have already diverged in three ways, all in this one:
+
+| | `daemon/` (ESP32 e-ink) | `esp8266/daemon/` (here) |
+|---|---|---|
+| Board learns the daemon's address by | browsing `_lyrics._tcp` over mDNS | the `/usage` knock (`BoardAnnouncer`) |
+| mDNS advertising | on | **off** by default (`--mdns` opts in) |
+| Needs `claudemeter_daemon.py` | no | no (it used to) |
+
+### Splitting this into its own repo
+
+`esp8266/` is a clean subtree boundary, so history comes with it:
+
+```sh
+git subtree split -P esp8266 -b esp8266-only
+```
+
+Two things to fix in the new repo afterwards, neither of which blocks the split:
+
+- paths lose their `esp8266/` prefix (`esp8266/daemon/…` → `daemon/…`), so the
+  commands in this README and the `-s esp8266/tests` in the test invocation
+  shorten;
+- the 400×300 ESP32 e-ink render path (`WIDE_PROFILE`, `_draw_wide`,
+  `WIDE_PROGRESS_GEOM`, its cover placement) and the whole SEC2/identity/pairing
+  layer become dead code there, since this board uses neither. They are still
+  present and still work; deleting them is a separate cleanup, and doing it
+  *after* the split keeps this repo's e-ink board unaffected.
 
 ## Device HTTP API
 
