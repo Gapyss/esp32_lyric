@@ -1,8 +1,8 @@
-// Shared declarations for the Clawdmeter ESP8266 firmware. The .ino keeps the
-// infrastructure (WiFiManager, web server, OTA, EEPROM, music screen) and each
-// ported ESP32 screen lives in its own .cpp next to it; this header is the
-// contract between them: the Tend paper palette, the screen registry, the time
-// source, and the small text helpers the .ino defines.
+// Shared declarations for the Clawdmeter ESP8266 firmware. This box runs one
+// screen — the lyrics display — so the header is a small contract between the
+// .ino (WiFiManager, web server, OTA, EEPROM, the waiting screen) and
+// lyrics_stream.cpp: the Tend paper palette, the time source, and the text /
+// chrome helpers the .ino defines.
 #pragma once
 
 #include <Arduino.h>
@@ -54,23 +54,13 @@
 
 extern Arduino_GFX *gfx;
 
-// ---- Screen registry -------------------------------------------------------
-// Mirrors the ESP32 app_mode list; MUSIC is the lyrics screen, rendered solely
-// by the Mac's lyrics_display_daemon.py frame stream (see lyrics_stream.cpp).
-static const uint8_t SCREEN_MUSIC = 0;
-static const uint8_t SCREEN_CLOCK = 1;
-static const uint8_t SCREEN_POMODORO = 2;
-static const uint8_t SCREEN_STATS = 3;
-static const uint8_t SCREEN_SAND = 4;
-static const uint8_t SCREEN_COMIC = 5;
-static const uint8_t SCREEN_APOD = 6;
-
-extern uint8_t lcdScreen;
-
-// Switch to a screen and repaint it from scratch (chrome + content). Safe to
-// call from screen modules (pomodoro alerts pull their screen forward, since
-// there is no chime on this box -- alerts are screen-only).
-void tendShowScreen(uint8_t screen);
+// ---- The one screen ------------------------------------------------------
+// This board shows lyrics and nothing else, so there is no screen registry and
+// no mode switch. While the Mac's daemon is streaming frames they own the panel
+// outright (see lyrics_stream.cpp); the rest of the time the .ino paints its own
+// waiting screen -- Tend chrome, a status line, and the device's address, so you
+// can reach the dashboard without a serial cable. That screen is private to the
+// .ino; nothing here needs to declare it.
 
 // ---- Time ------------------------------------------------------------------
 // Current UTC epoch: daemon-pushed server time when available, NTP before
@@ -82,9 +72,7 @@ int textWidth(const String &s, uint8_t size);
 void printCentered(int y, uint8_t size, const String &s, uint16_t fg, uint16_t bg);
 void printRight(int rightX, int y, uint8_t size, const String &s, uint16_t fg, uint16_t bg);
 String pad2(int v);
-String hhmm(unsigned long e);
 String hhmmss(unsigned long e);
-String pctText(int pct);
 
 // Tend chrome: ember hearth mark + eyebrow + hairline rule (the shared screen
 // header). The per-second clock at top right is each screen's tick job.
@@ -98,65 +86,21 @@ void tendHeaderClock(void);
 void tendEepromCommit(void);
 
 // EEPROM layout v2 (v1 was marker+brightness only; loadBrightness migrates).
-// Bytes 2..15 held water config and pet counters until those screens were
-// removed; the region stays reserved so EE_SIZE and the addresses above are
-// unchanged and already-flashed boards still read their stored brightness.
+// Bytes 2..15 held config for screens this board no longer has; the region stays
+// reserved so EE_SIZE and the addresses above are unchanged and already-flashed
+// boards still read their stored brightness across an OTA to this firmware.
 static const int EE_MARKER_ADDR = 0;       // 0xC2
 static const int EE_BRIGHTNESS_ADDR = 1;   // u8
 static const int EE_SIZE = 16;
 
-// ---- Mac metrics (fed by the daemon's /usage push, read by stats) ---------
-extern int macCpuPct;
-extern int macMemPct;
-extern int macDiskPct;
-extern int macBatteryPct;
-
-// ---- Screen modules --------------------------------------------------------
-// Each Begin paints the full screen; each Tick animates in place. The global
-// pomodoroTick() runs every loop() pass regardless of the visible screen
-// (countdowns keep advancing in the background).
-
-void clockScreenBegin(void);
-void clockScreenTick(void);
-
-void pomodoroScreenBegin(void);
-void pomodoroScreenTick(void);
-void pomodoroTick(void);
-void pomodoroToggleStartPause(void);
-void pomodoroReset(void);
-const char *pomodoroStateName(void);
-int pomodoroRemainingSec(void);
-
-void statsScreenBegin(void);
-void statsScreenTick(void);
-void statsOnUsagePush(void);
-
-void sandScreenBegin(void);
-void sandScreenTick(void);
-void sandPour(void);
-void sandClear(void);
-
-// Lyrics frame stream (lyrics_stream.cpp). While the MUSIC screen is visible
-// the box dials back to the Mac that pushes /usage & /nowplaying and speaks
-// the lyrics_display_daemon.py LYR1 WebSocket protocol (:8766) at 240x240:
-// Core Text-rendered frames with real Thai shaping and syllable karaoke. This
-// is the sole MUSIC renderer; when no frame flows the screen shows a simple
-// paper placeholder (see musicDrawPlaceholder in the .ino), not a fallback card.
+// ---- Lyrics frame stream (lyrics_stream.cpp) -------------------------------
+// The box dials back to the Mac that pushes /usage & /nowplaying and speaks the
+// lyrics_display_daemon.py LYR1 WebSocket protocol (:8766) at 240x240:
+// Core Text-rendered frames with real Thai shaping and syllable karaoke. This is
+// the only renderer that draws song content; when no frame flows the .ino paints
+// the waiting screen (see musicDrawWaiting there), not a fallback now-playing card.
 void lyricsStreamNoteHost(const IPAddress &host);  // Mac's IP, from daemon pushes
-void lyricsStreamTick(void);   // pump the socket; call each loop while MUSIC shows
-void lyricsStreamStop(void);   // close + free buffers (leaving MUSIC, OTA start)
+void lyricsStreamTick(void);   // pump the socket; call once per loop()
+void lyricsStreamStop(void);   // close + free the framebuffer (OTA start)
 bool lyricsStreamActive(void); // a streamed frame currently owns the panel
 bool lyricsStreamConnecting(void); // Mac IP known but frames not flowing yet (dialing)
-
-// Comic (xkcd) + APOD daily images. Metadata (image URL + title) is pushed by
-// the daemon over /daily -- this chip cannot afford BearSSL heap for the HTTPS
-// APIs -- and the image itself is fetched over plain HTTP through the wsrv.nl
-// resize proxy, stream-decoded into a shared 1-bit dithered frame.
-void dailyScreenBegin(void);   // uses lcdScreen to pick comic vs apod
-void dailyScreenTick(void);
-void dailySetMeta(bool apod, const String &imgUrl, const String &title,
-                  const String &extra);  // extra: comic number / apod date
-void dailyRefresh(bool apod);
-const char *dailyStateName(bool apod);
-String dailyTitle(bool apod);
-String dailyExtra(bool apod);
