@@ -11,6 +11,12 @@ This is the first implementation slice for lyrics-display-design.md:
   binary framebuffer envelopes;
 - advertises the board endpoint as _lyrics._tcp through a stdlib mDNS responder
   with dns-sd fallback.
+
+This copy serves the ESP32 e-ink board (firmware/main/board_client.cpp, SEC2
+handshake). The ESP8266 has a forked copy at esp8266/daemon/, split off so that
+tree can become its own repository; it adds a /usage knock so its board learns
+this Mac's IP without claudemeter_daemon.py, and defaults mDNS off. The two do
+not share code -- a fix that matters to both boards has to be applied twice.
 """
 
 from __future__ import annotations

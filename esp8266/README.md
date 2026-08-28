@@ -219,8 +219,11 @@ there; the device flashes and reboots on its own.
 
 ## Source layout
 
-Everything this board needs lives under `esp8266/`. Nothing outside it is
-required at runtime.
+Everything this board needs lives under `esp8266/`. The one piece of state that
+sits outside it is the lyrics cache at `~/.g4pys/lyrics-display.sqlite3`
+(`--db` overrides it) — deliberately, so both boards share one cache and neither
+re-fetches from lrclib after the other already has. It is created on demand, so
+a fresh clone needs nothing seeded.
 
 ```
 esp8266/
