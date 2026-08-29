@@ -144,11 +144,24 @@
     return `${Math.round(seconds / 60)}m ago`;
   }
 
-  function describeBoard(d) {
-    const lyr = { 0: "idle, no Mac address known", 1: "connecting to the daemon", 2: "streaming lyrics" };
+  // knockLanded says a recent knock reached the board, which means it certainly
+  // knows this Mac's address. That is what disambiguates lyr=0: on its own it
+  // conflates "nobody has ever told me where the Mac is" (broken) with
+  // "connected, but the daemon has nothing to show between tracks" (fine). The
+  // board reports both as 0 because lyricsStreamActive() is
+  // (LYR_OPEN && lyrFrameValid) -- an open socket with no current frame looks
+  // exactly like a board that has never heard from anyone.
+  function describeBoard(d, knockLanded) {
     const up = Number(d.up) || 0;
+    let state;
+    if (d.lyr === 0) {
+      state = knockLanded ? "connected, idle (nothing playing)"
+                          : "not connected - no Mac address known";
+    } else {
+      state = { 1: "connecting to the daemon", 2: "streaming lyrics" }[d.lyr] || "unknown state";
+    }
     const parts = [
-      lyr[d.lyr] || "unknown state",
+      state,
       `wifi ${d.ssid || "?"} (${d.rssi} dBm)`,
       `heap ${Math.round((Number(d.heap) || 0) / 1024)}k`,
       `up ${Math.floor(up / 3600)}h${String(Math.floor((up % 3600) / 60)).padStart(2, "0")}m`,
@@ -188,6 +201,10 @@
 
     // 2. This extension's backup knock.
     const knock = store.lastKnock;
+    // A knock that landed within the board's own 10-minute host-expiry window
+    // is proof it knows where we are.
+    const knockLanded = Boolean(knock && knock.state === "ok"
+                                && Date.now() - knock.at < 10 * 60 * 1000);
     if (!knock) {
       healthRow("warn", "Knock", "not run yet");
     } else {
@@ -222,8 +239,9 @@
                                    { cache: "no-store", signal: controller.signal });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const body = await response.json();
-      const parts = describeBoard(body);
-      healthRow(body.lyr === 2 ? "ok" : (body.lyr === 1 ? "warn" : "bad"), "Board", parts[0]);
+      const parts = describeBoard(body, knockLanded);
+      const healthy = body.lyr === 2 || (body.lyr === 0 && knockLanded);
+      healthRow(healthy ? "ok" : (body.lyr === 1 ? "warn" : "bad"), "Board", parts[0]);
       healthDetail(parts.slice(1).join(" - "));
     } catch (err) {
       healthRow("bad", "Board",

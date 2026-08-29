@@ -320,7 +320,7 @@ half is missing:
 
 | The panel says | What it means | Fix |
 |---|---|---|
-| `waiting for lyrics` | No Mac IP known yet, or the daemon is connected but idle between tracks | `tools/lyrics.sh status`. If it logged a knock failure, the board isn't resolving — pass `--announce-url http://<board-ip>` |
+| `waiting for lyrics` | No Mac IP known yet, **or** the daemon is connected but idle between tracks — the panel genuinely cannot tell these apart | `tools/lyrics.sh status` separates them: it checks for an established socket on `:8766` from the board and reports `connected, idle (nothing playing)` or `NOT connected (no Mac address known)` |
 | `reaching the lyrics daemon…` | Mac IP known, the socket won't come up | `tools/lyrics.sh start`; check nothing is blocking `:8766` between Mac and board |
 | Streamed frames never appear, but the socket connects | The daemon is demanding a proto=2 handshake this board can't do | `tools/lyrics.sh status` flags a daemon running without `--insecure`; restart it with the script |
 | `wifi lost` / `reconnecting` in place of the IP | The board dropped its association | Wait. The watchdog calls `WiFi.reconnect()` after 30s and keeps retrying; if the network is still gone after 10 minutes it reboots into `setup()`, which retries the saved network and only opens the setup hotspot if that fails too |

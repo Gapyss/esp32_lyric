@@ -65,24 +65,47 @@ except OSError: sys.exit(1)" "$BOARD_NAME" 2>/dev/null
 # Print the board's own view of itself. Sets BOARD_LYR as a side effect so the
 # caller can decide whether the chain is actually up.
 BOARD_LYR=""
+# Is the board holding an open stream socket to us right now? This is the fact
+# that disambiguates lyr=0, which on its own conflates two opposite states:
+# "nothing has ever told me where the Mac is" (broken) and "connected, but the
+# daemon has nothing to show between tracks" (fine). The board cannot tell them
+# apart either -- lyricsStreamActive() is (LYR_OPEN && lyrFrameValid), so an
+# open socket with no current frame reports 0 exactly like a board that has
+# never heard from anyone. From this side the established TCP connection settles
+# it; not asking was how the "waiting for lyrics" ambiguity this tool exists to
+# remove got reproduced inside the tool itself.
+board_linked() {
+  lsof -nP -iTCP:"$BOARD_PORT" -sTCP:ESTABLISHED 2>/dev/null | grep -q -- "->$1:" && echo 1 || echo 0
+}
+
 board_report() {
-  local ip="$1" json
+  local ip="$1" json linked
+  linked="$(board_linked "$ip")"
   json="$(curl -s --max-time 4 "http://$ip/usage.json" 2>/dev/null)"
   if [ -z "$json" ]; then
     bad "board at $ip did not answer /usage.json"
     note "powered off, on another network, or wedged -- power-cycle it"
     BOARD_LYR=""
+    BOARD_OK=0
     return 1
   fi
   local line
-  line="$("$PY" - "$json" <<'PYEOF'
+  line="$("$PY" - "$json" "$linked" <<'PYEOF'
 import json, sys
 try:
     d = json.loads(sys.argv[1])
 except Exception:
     print("?|unparseable /usage.json")
     raise SystemExit
-lyr = {0: "idle (no Mac IP known)", 1: "connecting", 2: "streaming"}.get(d.get("lyr"), "?")
+# argv[2] is 1 when the board holds an open stream socket to this Mac. Without
+# it, lyr=0 is ambiguous: an idle-but-connected board and a board that has never
+# learned our address report it identically.
+linked = len(sys.argv) > 2 and sys.argv[2] == "1"
+if d.get("lyr") == 0:
+    state = "connected, idle (nothing playing)" if linked else "NOT connected (no Mac address known)"
+else:
+    state = {1: "connecting", 2: "streaming"}.get(d.get("lyr"), "?")
+lyr = state
 up = int(d.get("up") or 0)
 line = "wifi %s (%s dBm) - %s - heap %dk - up %dh%02dm - boot %s" % (
     d.get("ssid", "?"), d.get("rssi", "?"), lyr,
@@ -98,15 +121,19 @@ if drops:
     line += " - %d wifi drop%s since boot" % (drops, "" if drops == 1 else "s")
 if d.get("mdnsok") == 0:
     line += " - mDNS refresh FAILED (.local may be dark; use --announce-url http://<ip>)"
-print("%s|%s" % (d.get("lyr", "?"), line))
+# Healthy means the link is up, which is streaming OR idle-while-connected --
+# not streaming alone: starting the daemon with no music playing is normal.
+ok = 1 if (d.get("lyr") == 2 or (d.get("lyr") == 0 and linked)) else 0
+print("%s|%s|%s" % (ok, d.get("lyr", "?"), line))
 PYEOF
 )"
-  BOARD_LYR="${line%%|*}"
-  case "$BOARD_LYR" in
-    2) good "board ${line#*|}" ;;
-    1) warn "board ${line#*|}" ;;
-    *) bad  "board ${line#*|}" ;;
-  esac
+  BOARD_OK="${line%%|*}"
+  local rest="${line#*|}"
+  BOARD_LYR="${rest%%|*}"
+  local text="${rest#*|}"
+  if [ "$BOARD_OK" = "1" ]; then good "board $text"
+  elif [ "$BOARD_LYR" = "1" ]; then warn "board $text"
+  else bad "board $text"; fi
 }
 
 cmd_status() {
@@ -139,7 +166,7 @@ cmd_status() {
   fi
   good "$BOARD_NAME resolves to $ip"
   board_report "$ip" || return 1
-  [ "$BOARD_LYR" = "2" ]
+  [ "$BOARD_OK" = "1" ]
 }
 
 cmd_stop() {
@@ -254,16 +281,20 @@ cmd_start() {
   for _ in $(seq 1 12); do
     sleep 2
     board_report "$ip" >/dev/null 2>&1
-    if [ "$BOARD_LYR" = "2" ]; then
+    # Success is the LINK being up, not frames being on screen: start the daemon
+    # with nothing playing and the board sits connected-and-idle forever, which
+    # is correct behaviour and must not be reported as a failure.
+    if [ "$BOARD_OK" = "1" ]; then
       board_report "$ip"
       say ""
-      say "  ${OK}${B}lyrics are on the panel.${R}"
+      if [ "$BOARD_LYR" = "2" ]; then say "  ${OK}${B}lyrics are on the panel.${R}"
+      else say "  ${OK}${B}board is connected.${R} Play something and the panel follows."; fi
       return 0
     fi
   done
   board_report "$ip"
   say ""
-  warn "board has not reached streaming after ~24s"
+  warn "board has not connected after ~24s"
   note "check $LOG for 'board announce reached' and 'board connected'"
   return 1
 }
