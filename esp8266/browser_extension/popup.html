@@ -77,10 +77,44 @@
         opacity: 0.6;
         min-height: 14px;
       }
+      .hrow {
+        display: flex;
+        gap: 7px;
+        align-items: baseline;
+        margin: 5px 0;
+        font-size: 12px;
+        line-height: 1.35;
+      }
+      .dot {
+        flex: none;
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        background: #555;
+        transform: translateY(-1px);
+      }
+      .dot.ok { background: #57c98a; }
+      .dot.warn { background: #e0b341; }
+      .dot.bad { background: #e8603c; }
+      .hrow b {
+        font-weight: 600;
+        opacity: 0.75;
+      }
+      .hdetail {
+        margin: -2px 0 6px 14px;
+        font-size: 11px;
+        opacity: 0.5;
+        line-height: 1.35;
+      }
     </style>
   </head>
   <body>
     <main>
+      <section>
+        <h1>Status</h1>
+        <div id="health"></div>
+        <button id="refresh" class="secondary" type="button">Refresh</button>
+      </section>
       <section>
         <h1>Display Theme</h1>
         <div class="row">

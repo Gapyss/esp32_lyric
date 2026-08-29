@@ -3329,17 +3329,62 @@ class BoardAnnouncer:
         self.stop_event = threading.Event()
         self.thread: threading.Thread | None = None
         self.reachable: bool | None = None  # None = nothing tried yet
+        parsed = urlparse(self.url)
+        self.scheme = parsed.scheme or "http"
+        self.host = parsed.hostname or ""
+        self.port = parsed.port
+        self.address: str | None = None  # numeric IP, resolved once and reused
 
     def start(self) -> None:
         self.thread = threading.Thread(target=self._serve, name="lyrics-announce", daemon=True)
         self.thread.start()
         print(f"board announce: {self.url}/usage every {self.interval:g}s")
 
+    def _resolve(self) -> str | None:
+        """Turn the board's host into a numeric IPv4 address.
+
+        gethostbyname deliberately, rather than leaving it to the getaddrinfo
+        that urlopen would do for us. The board publishes an A record and no
+        AAAA, so a getaddrinfo for ``clawdmeter.local`` sits out the full mDNS
+        IPv6 timeout before handing back the address it already had: measured at
+        5.01s per call against 0.00s for gethostbyname, which is IPv4-only and
+        never asks for AAAA. Knocking the name directly therefore parked this
+        thread for five seconds every cycle -- and because urlopen's ``timeout``
+        covers socket operations but *not* name resolution,
+        BOARD_ANNOUNCE_TIMEOUT_SECONDS never bounded that wait. Resolving here
+        and dialing the numeric address is what makes the timeout mean what it
+        says. A literal IP in --announce-url passes through unchanged.
+        """
+        if not self.host:
+            return None
+        try:
+            return socket.gethostbyname(self.host)
+        except OSError:
+            return None
+
+    def _target(self, address: str) -> str:
+        netloc = f"{address}:{self.port}" if self.port else address
+        return f"{self.scheme}://{netloc}/usage?t={int(time.time())}"
+
+    def _fail(self, detail: str) -> None:
+        # Drop the cached address as well as flagging the failure: the board may
+        # have taken a new DHCP lease, in which case re-resolving next cycle is
+        # exactly what recovers us. Costs one name lookup per failed cycle and
+        # nothing at all while the knock is landing.
+        self.address = None
+        if self.reachable is not False:
+            print(f"board announce failed ({self.url}): {detail}")
+        self.reachable = False
+
     def _announce_once(self) -> None:
         # The board reads our source IP off this connection, so the request only
-        # has to arrive -- the response body is irrelevant. .local names resolve
-        # through mDNSResponder on macOS, so no mDNS client code is needed here.
-        target = f"{self.url}/usage?t={int(time.time())}"
+        # has to arrive -- the response body is irrelevant.
+        if self.address is None:
+            self.address = self._resolve()
+            if self.address is None:
+                self._fail(f"cannot resolve {self.host!r}")
+                return
+        target = self._target(self.address)
         try:
             request = urllib.request.Request(target, method="GET")
             with urllib.request.urlopen(request, timeout=BOARD_ANNOUNCE_TIMEOUT_SECONDS):
@@ -3353,12 +3398,11 @@ class BoardAnnouncer:
             # this Mac after LYR_HOST_FRESH_MS and the panel would drop back to
             # the waiting screen with nothing in the log to explain why. A daemon
             # meant to run unattended has to treat a bad answer like no answer.
-            if self.reachable is not False:
-                print(f"board announce failed ({self.url}): {exc!r}")
-            self.reachable = False
+            self._fail(repr(exc))
             return
         if self.reachable is not True:
-            print(f"board announce reached {self.url} (it now knows this Mac's address)")
+            print(f"board announce reached {self.url} at {self.address} "
+                  "(it now knows this Mac's address)")
         self.reachable = True
 
     def _serve(self) -> None:

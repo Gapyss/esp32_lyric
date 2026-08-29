@@ -8,6 +8,8 @@
   const saveFirmwareButton = document.getElementById("saveFirmware");
   const testFirmwareButton = document.getElementById("testFirmware");
   const status = document.getElementById("status");
+  const health = document.getElementById("health");
+  const refreshButton = document.getElementById("refresh");
 
   function render(theme) {
     darkButton.classList.toggle("active", theme === "dark");
@@ -108,6 +110,130 @@
     }
   }
 
+  // ---- Status panel --------------------------------------------------------
+  // The board's own waiting screen cannot tell you which link in the chain is
+  // broken: "waiting for lyrics" is shown both when nothing has ever pushed and
+  // when a connected daemon is simply between tracks. This answers it from the
+  // one place that can see every link at once.
+
+  function healthRow(state, label, text) {
+    const row = document.createElement("div");
+    row.className = "hrow";
+    const dot = document.createElement("span");
+    dot.className = `dot ${state}`;
+    const body = document.createElement("span");
+    const strong = document.createElement("b");
+    strong.textContent = `${label} `;
+    body.appendChild(strong);
+    body.appendChild(document.createTextNode(text));
+    row.appendChild(dot);
+    row.appendChild(body);
+    health.appendChild(row);
+  }
+
+  function healthDetail(text) {
+    const div = document.createElement("div");
+    div.className = "hdetail";
+    div.textContent = text;
+    health.appendChild(div);
+  }
+
+  function agoText(ms) {
+    const seconds = Math.round(ms / 1000);
+    if (seconds < 90) return `${seconds}s ago`;
+    return `${Math.round(seconds / 60)}m ago`;
+  }
+
+  function describeBoard(d) {
+    const lyr = { 0: "idle, no Mac address known", 1: "connecting to the daemon", 2: "streaming lyrics" };
+    const up = Number(d.up) || 0;
+    const parts = [
+      lyr[d.lyr] || "unknown state",
+      `wifi ${d.ssid || "?"} (${d.rssi} dBm)`,
+      `heap ${Math.round((Number(d.heap) || 0) / 1024)}k`,
+      `up ${Math.floor(up / 3600)}h${String(Math.floor((up % 3600) / 60)).padStart(2, "0")}m`,
+      `boot ${d.rst || "?"}`
+    ];
+    // Watchdog fields; absent on firmware older than the WiFi watchdog.
+    const down = Number(d.wifidown) || 0;
+    const drops = Number(d.wifidrops) || 0;
+    if (down) parts.push(`WIFI DOWN ${down}s`);
+    if (drops) parts.push(`${drops} wifi drop${drops === 1 ? "" : "s"}`);
+    if (d.mdnsok === 0) parts.push("mDNS refresh failed");
+    return parts;
+  }
+
+  async function renderHealth() {
+    health.textContent = "";
+    const [store, beats] = await Promise.all([
+      chrome.storage.local.get(["firmwareIp", "lastKnock"]),
+      chrome.storage.session.get(["daemonHeartbeat"])
+    ]);
+
+    // 1. The daemon. Inferred from the content script's heartbeat rather than by
+    // opening a socket of our own: a second connection on :8765 would show up as
+    // another extension client to the daemon, and this panel should observe the
+    // chain, not join it.
+    const beat = Number(beats.daemonHeartbeat) || 0;
+    const beatAge = Date.now() - beat;
+    if (!beat) {
+      healthRow("warn", "Daemon", "unknown - no YouTube Music tab has connected yet");
+      healthDetail("Open music.youtube.com; this panel reads the tab's socket to the daemon.");
+    } else if (beatAge < 90000) {
+      healthRow("ok", "Daemon", `connected (seen ${agoText(beatAge)})`);
+    } else {
+      healthRow("bad", "Daemon", `not connected - last seen ${agoText(beatAge)}`);
+      healthDetail("Start it with esp8266/tools/lyrics.sh");
+    }
+
+    // 2. This extension's backup knock.
+    const knock = store.lastKnock;
+    if (!knock) {
+      healthRow("warn", "Knock", "not run yet");
+    } else {
+      const when = agoText(Date.now() - knock.at);
+      const state = knock.state === "ok" ? "ok" : (knock.state === "failed" ? "bad" : "warn");
+      healthRow(state, "Knock", knock.state === "ok" ? `delivered ${when}` : `${knock.state} ${when}`);
+      if (knock.detail) healthDetail(knock.detail);
+    }
+
+    // 3. The board.
+    if (!store.firmwareIp) {
+      healthRow("warn", "Board", "no address saved - fill in the field below");
+      return;
+    }
+    let baseUrl;
+    try {
+      baseUrl = firmwareBaseUrl(store.firmwareIp);
+    } catch (err) {
+      healthRow("bad", "Board", err.message);
+      return;
+    }
+    const origins = [firmwareOrigin(baseUrl)];
+    if (!(await chrome.permissions.contains({ origins }))) {
+      healthRow("warn", "Board", "no permission for this address");
+      healthDetail("Click Connect below to grant it. Until then the backup knock cannot run.");
+      return;
+    }
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => controller.abort(), 3500);
+    try {
+      const response = await fetch(new URL("/usage.json", baseUrl).href,
+                                   { cache: "no-store", signal: controller.signal });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const body = await response.json();
+      const parts = describeBoard(body);
+      healthRow(body.lyr === 2 ? "ok" : (body.lyr === 1 ? "warn" : "bad"), "Board", parts[0]);
+      healthDetail(parts.slice(1).join(" - "));
+    } catch (err) {
+      healthRow("bad", "Board",
+        err && err.name === "AbortError" ? "did not answer in 3.5s" : "unreachable");
+      healthDetail("Powered off, on another network, or wedged.");
+    } finally {
+      window.clearTimeout(timer);
+    }
+  }
+
   async function setTheme(theme) {
     await chrome.storage.local.set({ theme });
     render(theme);
@@ -138,9 +264,32 @@
     testFirmware();
   });
 
+  refreshButton.addEventListener("click", async () => {
+    refreshButton.disabled = true;
+    setStatus("Knocking...");
+    try {
+      // Force a knock rather than waiting out the alarm, so Refresh is also the
+      // "make it work now" button.
+      await chrome.runtime.sendMessage({ type: "g4pys-knock-now" });
+    } catch (_err) {
+      // Worker asleep or reloading; the render below still shows the last state.
+    }
+    await renderHealth();
+    setStatus("");
+    refreshButton.disabled = false;
+  });
+
   chrome.storage.local.get(["theme", "firmwareIp", "firmwareMac"], (result) => {
     render(result.theme || "light");
     firmwareIpInput.value = result.firmwareIp || "";
     firmwareMacInput.value = result.firmwareMac || "";
+  });
+
+  renderHealth().catch((err) => {
+    // A rejection here would otherwise leave the panel simply blank, which is
+    // the one thing this panel exists to stop happening.
+    health.textContent = "";
+    healthRow("bad", "Status", "could not be read");
+    healthDetail(String((err && err.message) || err));
   });
 })();

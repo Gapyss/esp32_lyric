@@ -101,6 +101,59 @@ The credentials persist across reboots and OTA updates. If nobody finishes the
 portal within 3 minutes the device reboots and retries the saved network, so a
 temporary router outage just heals itself.
 
+**The WiFi watchdog.** `wm.autoConnect()` runs exactly once, in `setup()`, so
+until recently nothing re-read `WiFi.status()` afterwards: an association lost
+*after* boot parked the panel on `wifi lost` until someone power-cycled the box.
+`wifiWatchdogTick()` in `loop()` now closes that. Two stages, deliberately far
+apart (`WIFI_WATCHDOG_*` at the top of the sketch):
+
+| Down for | What happens |
+|---|---|
+| 30s | `WiFi.reconnect()`, repeated every 30s. Cheap and non-destructive — it does not clear credentials |
+| 10 min | `ESP.restart()`, which lands back in `setup()` and retries the saved network first |
+
+The 10-minute gap is the load-bearing number. A reboot lands in
+`wm.autoConnect()`, which *blocks* in the captive portal for
+`WIFI_PORTAL_TIMEOUT_S` (3 min) and then reboots again — so restarting eagerly
+would turn a fifteen-minute router outage into a hotspot loop that also puts
+`/update` out of reach. A screen reading `wifi lost` while the router comes back
+is the better failure.
+
+Two details that are easy to get wrong if you touch this:
+
+- The tick sits **below** the `if (otaInProgress) return;` line in `loop()`. A
+  WiFi hiccup mid-upload must never fire `reconnect()` — let alone
+  `ESP.restart()` — while `Update.write()` has the flash open. That is the same
+  reset-mid-flash hazard `backlightStopForFlash()` exists to prevent, on the one
+  operation that cannot be retried. Both OTA exit paths re-arm `wifiOkMs`, which
+  is otherwise as stale as the transfer was long.
+- Regaining the association calls `MDNS.notifyAPChange()`. Without it
+  `clawdmeter.local` stays dark for the rest of the session even though the box
+  answers on its IP — and that name is what the daemon's announce knock
+  resolves, so a silent SDK reconnect would still cost you the stream.
+
+**Reading the watchdog from the Mac.** None of its `Serial.println()` output is
+reachable — this board is updated over the air with no USB attached — and
+`ESP.getResetReason()` reports `Software/System restarted` for a watchdog reboot,
+`/restart` and `/wifi-reset` alike. So `/usage.json` carries three fields, and
+`tools/lyrics.sh status` prints them:
+
+| Field | Meaning |
+|---|---|
+| `wifidrops` | Associations lost since boot. Climbing steadily = a flapping link |
+| `wifidown` | Seconds since the association dropped; `0` while connected |
+| `mdnsok` | `0` if the last `notifyAPChange()` failed — `.local` may be dark, fall back to `--announce-url http://<ip>` |
+
+A `rst` of `Software/System restarted` with a low `up` **and** a non-zero
+`wifidrops` is the signature of a watchdog reboot rather than someone hitting
+`/restart`.
+
+One deliberate hole: any connected tick resets the clock, so a link that
+associates for a moment every 25 seconds keeps resetting it and never reaches
+the restart stage — `reconnect()` just fires forever. That is the intended
+trade (a flapping link is still a link, and rebooting into a 3-minute blocking
+portal would make it worse), and `wifidrops` is what makes it visible.
+
 **Automatic recovery:** if the device can't reach its saved network (new router,
 new password, moved house), it reopens the **Clawdmeter-setup** hotspot by
 itself on the next boot. No reflashing.
@@ -125,14 +178,52 @@ from inside a request handler would take the web server down with it.
 
 ### 4. Start the Mac daemon
 
-One process, from this directory:
+```sh
+esp8266/tools/lyrics.sh
+```
+
+That is the whole Mac side. It renders the frames, serves the board on `:8766`,
+and knocks on the board's `/usage` every 60s so it learns where the Mac is.
+
+The script is a wrapper around one `python3` invocation, and it exists because
+three mistakes are always one keystroke away and all three produce the *same*
+useless symptom — a panel stuck on `waiting for lyrics` with nothing to say why.
+It refuses to start a second daemon on top of a running one, always passes
+`--insecure`, and reports what the board itself thinks before and after:
+
+```
+pre-flight
+  + clawdmeter.local resolves to 192.168.1.35
+  + board wifi GE v2 (-46 dBm) - streaming - heap 26k - up 0h33m - boot External System
+
+starting
+  + daemon up (pid 51114), logging to ~/Library/Logs/g4pys-lyrics-display.log
+
+waiting for the board
+  lyrics are on the panel.
+```
+
+It reports `lyrics are on the panel` in about 8 seconds, or tells you which link
+in the chain is broken. Two other verbs:
+
+```sh
+esp8266/tools/lyrics.sh status   # daemon up? extension attached? board streaming?
+esp8266/tools/lyrics.sh stop
+esp8266/tools/lyrics.sh start -f # foreground, if you want the output live
+```
+
+Everything after `start` is passed through to the daemon, so
+`esp8266/tools/lyrics.sh start --announce-url http://192.168.1.35` works. The
+underlying command is unchanged and still fine to run directly:
 
 ```sh
 python3 esp8266/daemon/lyrics_display_daemon.py serve --insecure
 ```
 
-That is the whole Mac side. It renders the frames, serves the board on `:8766`,
-and knocks on the board's `/usage` every 60s so it learns where the Mac is.
+> Run it that way and stdout is block-buffered into whatever you redirect to,
+> so `board announce reached …` and `board connected` will not appear in a log
+> file until the buffer fills. The script sets `PYTHONUNBUFFERED=1` for exactly
+> this reason — the log is the only record of why a run failed.
 
 **Why the knock?** The board is never told the Mac's address — it *learns* it
 from the source IP of a request to `/usage`, then dials that IP back on port
@@ -140,6 +231,16 @@ from the source IP of a request to `/usage`, then dials that IP back on port
 (`LYR_HOST_FRESH_MS` in `lyrics_stream.cpp`), which is why the knock repeats
 instead of firing once at startup. The `t=` parameter it carries is what drives
 the clock on the waiting screen.
+
+The announcer resolves `clawdmeter.local` **once**, with `gethostbyname`, and
+knocks the numeric address from then on. That is not premature tidying: the
+board publishes an A record and no AAAA, so the `getaddrinfo` that `urlopen`
+would otherwise do sits out the full mDNS IPv6 timeout before handing back the
+address it already had — measured at 5.01s per knock against 0.00s for
+`gethostbyname`. Worse, `urlopen`'s `timeout` covers socket operations but *not*
+name resolution, so `BOARD_ANNOUNCE_TIMEOUT_SECONDS` never bounded that wait.
+A failed knock drops the cached address, so a board that takes a new DHCP lease
+is picked up on the next cycle.
 
 If your board answers to something other than `clawdmeter.local`:
 
@@ -151,10 +252,15 @@ python3 esp8266/daemon/lyrics_display_daemon.py serve --insecure \
 `--no-announce` turns the knock off, for when something else is already pushing
 to the board's `/usage`.
 
-> There is no launchd plist pointing at `esp8266/daemon/` — restart the daemon
-> by hand after editing it. The repo's `clear_lyric_daemon.sh` stops it, but its
-> `lyrics_display_daemon.py` pattern matches the ESP32 daemon too, so it stops
-> both; it also lives outside `esp8266/` and so does not come along in a split.
+> There is no launchd plist pointing at `esp8266/daemon/`, by choice — the
+> daemon runs when you start it. After editing it, `tools/lyrics.sh stop` then
+> `tools/lyrics.sh` restarts it; `stop` keys off whatever holds `:8766` and
+> refuses to kill a process that isn't a lyrics daemon.
+>
+> The repo's older `clear_lyric_daemon.sh` still works but is the blunt version:
+> its `lyrics_display_daemon.py` pattern matches the ESP32 daemon too, so it
+> stops both, and it lives outside `esp8266/` so it does not come along in a
+> split. Prefer `tools/lyrics.sh stop`.
 
 > **This used to need `claudemeter_daemon.py` too.** That daemon polls Claude
 > usage and has nothing to do with lyrics; it was only ever here because its
@@ -214,9 +320,14 @@ half is missing:
 
 | The panel says | What it means | Fix |
 |---|---|---|
-| `waiting for lyrics` | No Mac IP known yet, or the daemon is connected but idle between tracks | Check the daemon logged `board announce reached …`. If it logged a failure, the board isn't resolving — pass `--announce-url http://<board-ip>` |
-| `reaching the lyrics daemon…` | Mac IP known, the socket won't come up | Start `lyrics_display_daemon.py serve --insecure`; check nothing is blocking `:8766` between Mac and board |
-| Streamed frames never appear, but the socket connects | The daemon is demanding a proto=2 handshake this board can't do | Restart it with `--insecure` — a bare `lyrics_display_daemon.py serve` won't talk to this board |
+| `waiting for lyrics` | No Mac IP known yet, or the daemon is connected but idle between tracks | `tools/lyrics.sh status`. If it logged a knock failure, the board isn't resolving — pass `--announce-url http://<board-ip>` |
+| `reaching the lyrics daemon…` | Mac IP known, the socket won't come up | `tools/lyrics.sh start`; check nothing is blocking `:8766` between Mac and board |
+| Streamed frames never appear, but the socket connects | The daemon is demanding a proto=2 handshake this board can't do | `tools/lyrics.sh status` flags a daemon running without `--insecure`; restart it with the script |
+| `wifi lost` / `reconnecting` in place of the IP | The board dropped its association | Wait. The watchdog calls `WiFi.reconnect()` after 30s and keeps retrying; if the network is still gone after 10 minutes it reboots into `setup()`, which retries the saved network and only opens the setup hotspot if that fails too |
+
+`tools/lyrics.sh status` answers the same question from the Mac side, and covers
+the one case the panel cannot show you — that the daemon is up but running in
+the wrong mode.
 
 If the stream drops (Mac asleep, daemon stopped), the panel returns to the
 waiting screen within seconds and reconnects on its own when the daemon comes

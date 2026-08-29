@@ -5,11 +5,18 @@
   const TICK_MS = 500;
   const TRACK_SCAN_MS = 1000;
   const RECONNECT_MS = 1500;
+  // Proof-of-life for background.js, which will not knock on the board unless a
+  // daemon socket is genuinely open on this machine. Written on a timer rather
+  // than only on open/close: this socket stays up for hours, so an edge-only
+  // signal would leave the last timestamp hours stale and the worker's
+  // freshness test would never pass -- the knock would silently never fire.
+  const HEARTBEAT_MS = 30 * 1000;
 
   let ws = null;
   let reconnectTimer = 0;
   let tickTimer = 0;
   let trackTimer = 0;
+  let heartbeatTimer = 0;
   let domObserver = null;
   let lastTrackKey = "";
   let lastPaused = null;
@@ -208,9 +215,27 @@
     }
   }
 
+  // Straight into storage rather than chrome.runtime.sendMessage: the worker is
+  // torn down after ~30s idle, so a message would wake it every half minute
+  // purely to write a timestamp it can read for itself when its alarm fires.
+  function sendHeartbeat() {
+    if (!extensionAlive()) {
+      teardown();
+      return;
+    }
+    try {
+      // session, not local: this is liveness, not settings, and a disk write
+      // every 30s in every open tab is not what it is worth.
+      chrome.storage.session.set({ daemonHeartbeat: Date.now() });
+    } catch (_err) {
+      // Context invalidated between the check and the call; ignore.
+    }
+  }
+
   function teardown() {
     window.clearInterval(tickTimer);
     window.clearInterval(trackTimer);
+    window.clearInterval(heartbeatTimer);
     window.clearTimeout(reconnectTimer);
     if (domObserver) {
       domObserver.disconnect();
@@ -229,6 +254,12 @@
   function startLoops() {
     window.clearInterval(tickTimer);
     window.clearInterval(trackTimer);
+    window.clearInterval(heartbeatTimer);
+    // Stamp immediately: the socket is open as of now, and waiting a full
+    // HEARTBEAT_MS would leave a just-restarted daemon looking dead to the
+    // worker for the first half minute.
+    sendHeartbeat();
+    heartbeatTimer = window.setInterval(sendHeartbeat, HEARTBEAT_MS);
     trackTimer = window.setInterval(() => {
       if (!extensionAlive()) {
         teardown();
@@ -281,6 +312,10 @@
     ws.addEventListener("close", () => {
       window.clearInterval(tickTimer);
       window.clearInterval(trackTimer);
+      // Stop refreshing, but leave the last value alone: it ages out of the
+      // worker's 90s window on its own. Clearing it here would make the
+      // 1.5s reconnect cycle flap the worker's view of the daemon.
+      window.clearInterval(heartbeatTimer);
       if (domObserver) {
         domObserver.disconnect();
         domObserver = null;

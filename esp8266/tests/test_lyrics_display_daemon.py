@@ -1366,3 +1366,73 @@ class BoardAnnouncerTest(unittest.TestCase):
         announcer.stop()
         announcer.stop()
         self.assertIsNone(announcer.thread)
+
+    def test_name_is_resolved_once_and_the_address_reused(self):
+        # The default --announce-url is a .local name, and resolving it is the
+        # expensive half of the knock: the board publishes no AAAA record, so
+        # getaddrinfo waits out the full mDNS IPv6 timeout (5.01s measured)
+        # before returning the A record. gethostbyname skips that, and caching
+        # the result keeps it off the repeat path entirely.
+        server, seen = self._stub_board()
+        port = server.server_address[1]
+        calls: list[str] = []
+
+        announcer = lyrics_display_daemon.BoardAnnouncer(
+            f"http://clawdmeter.local:{port}", interval=60.0
+        )
+
+        # Patched on the instance rather than on the socket module: local_ipv4(),
+        # which the mDNS advertiser uses, also calls socket.gethostbyname, and
+        # this suite runs it on other threads.
+        def fake_resolve() -> str:
+            calls.append(announcer.host)
+            return "127.0.0.1"
+
+        with mock.patch.object(announcer, "_resolve", fake_resolve):
+            announcer._announce_once()
+            announcer._announce_once()
+            announcer._announce_once()
+
+        self.assertEqual(calls, ["clawdmeter.local"], "resolved more than once")
+        self.assertEqual(len(seen), 3)
+        # The port from --announce-url has to survive the swap to a numeric host.
+        self.assertEqual(announcer.address, "127.0.0.1")
+
+    def test_failed_knock_forgets_the_address_so_a_moved_board_recovers(self):
+        # A cached address would otherwise outlive the board's DHCP lease and
+        # the daemon would knock into the void forever. Dropping it on failure
+        # costs one lookup per failed cycle and nothing while the knock lands.
+        server, seen = self._stub_board()
+        live_port = server.server_address[1]
+        announcer = lyrics_display_daemon.BoardAnnouncer(
+            f"http://clawdmeter.local:{live_port}", interval=60.0
+        )
+        announcer.address = "127.0.0.1"
+        announcer.port = 9  # discard port: nothing listens, the knock must fail
+        announcer._announce_once()
+        self.assertIs(announcer.reachable, False)
+        self.assertIsNone(announcer.address, "stale address survived a failed knock")
+
+        announcer.port = live_port
+        with mock.patch.object(announcer, "_resolve", lambda: "127.0.0.1"):
+            announcer._announce_once()
+        self.assertIs(announcer.reachable, True)
+        self.assertEqual(len(seen), 1)
+
+    def test_unresolvable_host_is_survivable(self):
+        # mDNS goes quiet whenever the board is off or the Mac has just woken.
+        # That must read as "not reachable", not as an exception out of _serve.
+        announcer = lyrics_display_daemon.BoardAnnouncer(
+            "http://clawdmeter.local", interval=60.0
+        )
+
+        def boom(host: str) -> str:
+            raise OSError("nodename nor servname provided")
+
+        # Here the real _resolve is the thing under test -- it must turn the
+        # OSError into "not reachable" rather than let it out of _serve -- so
+        # this one patches the lookup itself, scoped to a call with no threads.
+        with mock.patch.object(lyrics_display_daemon.socket, "gethostbyname", boom):
+            announcer._announce_once()
+        self.assertIs(announcer.reachable, False)
+        self.assertIsNone(announcer.address)

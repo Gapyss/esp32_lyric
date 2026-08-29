@@ -3,7 +3,10 @@
   "name": "g4pys Lyrics Display Bridge",
   "version": "0.1.0",
   "description": "Streams YouTube Music track and playback position to the local lyrics display daemon.",
-  "permissions": ["storage"],
+  "permissions": ["storage", "alarms"],
+  "background": {
+    "service_worker": "background.js"
+  },
   "host_permissions": [
     "https://music.youtube.com/*",
     "http://127.0.0.1/*",
