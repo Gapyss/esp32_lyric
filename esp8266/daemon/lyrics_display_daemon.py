@@ -1684,7 +1684,7 @@ class CoreTextFrameRenderer(FrameRenderer):
                 ctx, "PLAYING", 13, 14, 292, 120, "left", font_name=label_font, tracking=TRACKING_MEGA
             )
         self._draw_text(
-            ctx, "g4pys.company", 13, 260, 292, 126, "right", font_name=MONO_FONT_NAME, tracking=TRACKING_WIDE
+            ctx, "1.0.0", 13, 260, 292, 126, "right", font_name=MONO_FONT_NAME, tracking=TRACKING_WIDE
         )
 
     def _draw_square(self, ctx: Any, state: AppState, profile: RenderProfile) -> None:
@@ -1711,7 +1711,7 @@ class CoreTextFrameRenderer(FrameRenderer):
             )
             self._screen_rect(ctx, 12, 126, width - 24, 18)
             self._draw_text(
-                ctx, "g4pys.company", 11, 116, 228, width - 128, "right", font_name=MONO_FONT_NAME, tracking=TRACKING_WIDE
+                ctx, "1.0.0", 11, 116, 228, width - 128, "right", font_name=MONO_FONT_NAME, tracking=TRACKING_WIDE
             )
             return
 
@@ -1739,7 +1739,7 @@ class CoreTextFrameRenderer(FrameRenderer):
                 ctx, "PLAYING", 11, 12, 234, 110, "left", font_name=label_font, tracking=TRACKING_MEGA
             )
         self._draw_text(
-            ctx, "g4pys.company", 11, 116, 234, width - 128, "right", font_name=MONO_FONT_NAME, tracking=TRACKING_WIDE
+            ctx, "1.0.0", 11, 116, 234, width - 128, "right", font_name=MONO_FONT_NAME, tracking=TRACKING_WIDE
         )
 
     def _break_text(self, text: str, size: float, width: int) -> list[str]:
