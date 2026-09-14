@@ -12,6 +12,13 @@
 
 ESP8266WebServer server(80);
 
+// Firmware version. Single source of truth: it is published as "fw" in
+// /usage.json, and both the dashboard and the OTA page read it from there
+// rather than carrying their own copy -- a second literal in the HTML would
+// be gzipped into index_html_gz.h and drift silently. Bumping this line is
+// the whole change.
+#define FW_VERSION "1.0.0"
+
 // --- GeekMagic HelloCubic Lite / SmallTV-Ultra: ESP8266 + ST7789 240x240 ---
 // Pins/SPI mirror the GeekMagic open firmware. CS is tied to GND, the backlight
 // is ACTIVE LOW (GPIO5 LOW = on), and the panel needs SPI mode 3.
@@ -224,7 +231,7 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
 </style></head><body>
 <main>
 <header>
-  <div><div class="eb">tend &middot; lyrics display</div><h1>clawdmeter</h1></div>
+  <div><div class="eb">tend &middot; lyrics display</div><h1>clawdmeter <span class="mut mono" id="fw" style="font-size:13px;font-weight:400"></span></h1></div>
   <div class="status"><span class="dot" id="dot"></span><span class="mut" id="status">connecting</span></div>
 </header>
 <section class="card">
@@ -341,6 +348,7 @@ async function tick(){
     $('heap').textContent=Math.round(d.heap/1024)+'k';
     $('up').textContent=upText(d.up);
     $('rst').textContent=d.rst||'--';
+    $('fw').textContent=d.fw||'';
     if(!blBusy&&d.bl>=0){$('bl').value=d.bl;$('blV').textContent=d.bl}
   }catch(e){st.textContent='device unreachable';dot.className='dot hot'}
   ticking=false;
@@ -371,12 +379,13 @@ const char UPDATE_HTML[] PROGMEM = R"HTML(
   button:hover{border-color:var(--ember)}
   code{color:var(--ink)}
 </style></head><body><main>
-<h1>firmware update</h1>
+<h1>firmware update <span id="fw" style="color:var(--mut);font-size:13px;font-weight:400"></span></h1>
 <p>upload only <code>clawdmeter_esp8266.ino.bin</code> · close dashboard tabs and stop the daemon while updating</p>
 <form method="POST" action="/update" enctype="multipart/form-data">
   <input type="file" name="firmware" accept=".bin,.bin.gz" required>
   <button type="submit">update firmware</button>
 </form>
+<script>fetch("/usage.json",{cache:"no-store"}).then(function(r){return r.json()}).then(function(d){document.getElementById("fw").textContent=d.fw||""}).catch(function(_){})</script>
 <p>the device reboots after a successful upload · if the browser disconnects, wait 20 seconds and reopen the dashboard</p>
 </main></body></html>
 )HTML";
@@ -495,6 +504,7 @@ void handleUsageJson() {
              ",\"now\":" + String(nowEpoch()) +
              ",\"rst\":\"" + bootReason + "\"" +
              ",\"rinfo\":\"" + jsonEscape(bootInfo) + "\"" +
+             ",\"fw\":\"" FW_VERSION "\"" +
              ",\"up\":" + String(millis() / 1000) +
              ",\"age\":" + String(age) + "}";
   server.sendHeader("Cache-Control", "no-store");
