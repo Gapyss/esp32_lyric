@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import importlib.util
 import json
 import hmac
@@ -1436,3 +1437,134 @@ class BoardAnnouncerTest(unittest.TestCase):
             announcer._announce_once()
         self.assertIs(announcer.reachable, False)
         self.assertIsNone(announcer.address)
+
+
+def _pillow_renderer_deps() -> bool:
+    return all(importlib.util.find_spec(name) is not None for name in ("PIL", "uharfbuzz", "freetype"))
+
+
+def _lit(frame: bytes) -> int:
+    return sum(bin(b).count("1") for b in frame)
+
+
+class IcuBreakerTests(unittest.TestCase):
+    THAI = "ฉันรักเธอมากกว่าใครในโลกนี้ ที่นี่"
+
+    def test_fallback_breaks_after_whitespace_only(self) -> None:
+        breaker = lyrics_display_daemon.IcuBreaker()
+        breaker._lib = None
+        text = "ฉันรัก เธอ  hello"
+        self.assertEqual(breaker.line_boundaries(text), [0, 7, 12, len(text)])
+
+    def test_fallback_graphemes_keep_thai_marks_on_their_base(self) -> None:
+        breaker = lyrics_display_daemon.IcuBreaker()
+        breaker._lib = None
+        # ที่ = consonant + sara ii + mai ek: one cluster, not three.
+        self.assertEqual(breaker.grapheme_boundaries("ที่นี่"), [0, 3, 6])
+
+    @unittest.skipUnless(sys.platform in ("darwin", "win32"), "ICU ships with the OS only on macOS and Windows")
+    def test_os_icu_splits_thai_words(self) -> None:
+        breaker = lyrics_display_daemon.IcuBreaker()
+        self.assertTrue(breaker.available)
+        stops = breaker.line_boundaries(self.THAI)
+        words = [self.THAI[a:b] for a, b in zip(stops, stops[1:])]
+        self.assertIn("มากกว่า", words)
+        self.assertEqual("".join(words), self.THAI)
+        self.assertEqual(breaker.grapheme_boundaries("ที่นี่"), [0, 3, 6])
+
+
+class BuildRendererTests(unittest.TestCase):
+    def test_forced_fallback(self) -> None:
+        renderer = lyrics_display_daemon.build_renderer("x", "fallback")
+        self.assertIsInstance(renderer, FallbackFrameRenderer)
+
+    def test_auto_degrades_to_fallback_when_nothing_loads(self) -> None:
+        with mock.patch.object(lyrics_display_daemon, "CoreTextFrameRenderer", side_effect=ImportError("no")), \
+                mock.patch.object(lyrics_display_daemon, "PillowFrameRenderer", side_effect=ImportError("no")):
+            renderer = lyrics_display_daemon.build_renderer("x", "auto")
+        self.assertIsInstance(renderer, FallbackFrameRenderer)
+
+    def test_forced_pillow_refuses_to_downgrade(self) -> None:
+        with mock.patch.object(lyrics_display_daemon, "PillowFrameRenderer", side_effect=ImportError("no")):
+            with self.assertRaises(SystemExit):
+                lyrics_display_daemon.build_renderer("x", "pillow")
+
+    def test_forced_pillow_reports_missing_fonts(self) -> None:
+        with mock.patch.object(lyrics_display_daemon, "PillowFrameRenderer", side_effect=RuntimeError("fonts")):
+            with self.assertRaises(SystemExit):
+                lyrics_display_daemon.build_renderer("x", "pillow")
+
+    def test_vendored_fonts_are_all_present(self) -> None:
+        for filename in lyrics_display_daemon.PILLOW_FONT_FILES.values():
+            self.assertTrue((lyrics_display_daemon.PILLOW_FONT_DIR / filename).is_file(), filename)
+
+
+@unittest.skipUnless(_pillow_renderer_deps(), "pip install -r daemon/requirements-windows.txt")
+class PillowRendererTests(unittest.TestCase):
+    renderer: "lyrics_display_daemon.PillowFrameRenderer"
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.renderer = lyrics_display_daemon.PillowFrameRenderer()
+
+    def _playing_state(self, line: str) -> AppState:
+        state = AppState()
+        state.track = TrackInfo(video_id="v", title="เพลง Title", artist="Artist", duration_sec=200)
+        state.lyrics = Lyrics(synced=[(0, line), (4000, "next line"), (8000, "third")], resolved=True)
+        state.clock.update(1.0, False, 1.0)
+        return state
+
+    def test_frames_have_profile_size_and_carry_text(self) -> None:
+        state = self._playing_state("ฉันรักเธอมากกว่าใครในโลกนี้")
+        for profile in (lyrics_display_daemon.SQUARE_PROFILE, lyrics_display_daemon.WIDE_PROFILE):
+            frame = self.renderer.render(state, profile)
+            geometry_only = FallbackFrameRenderer().render(state, profile)
+            self.assertEqual(len(frame), profile.frame_bytes)
+            self.assertGreater(_lit(frame), _lit(geometry_only) * 3)
+
+    def test_idle_screen_renders(self) -> None:
+        frame = self.renderer.render(AppState(), lyrics_display_daemon.SQUARE_PROFILE)
+        self.assertGreater(_lit(frame), 0)
+
+    def test_break_text_rows_fit_and_keep_clusters_whole(self) -> None:
+        text = "ฉันรักเธอมากกว่าใครในโลกนี้ ที่นี่และตลอดไป forever and ever"
+        for size, width in ((22, 216), (14, 120), (30, 60)):
+            rows = self.renderer._break_text(text, size, width)
+            self.assertEqual("".join(rows).replace(" ", ""), text.replace(" ", ""))
+            for row in rows:
+                self.assertFalse(lyrics_display_daemon.unicodedata.combining(row[0]), row)
+                self.assertNotEqual(lyrics_display_daemon.unicodedata.category(row[0]), "Mn", row)
+                graphemes = self.renderer.breaker.grapheme_boundaries(row.rstrip())
+                if len(graphemes) > 2:  # a lone cluster may overflow; anything longer must fit
+                    self.assertLessEqual(self.renderer._text_width(row.rstrip(), size, "display"), width, row)
+
+    def test_karaoke_fill_changes_the_frame(self) -> None:
+        state = self._playing_state("hollow until it is sung")
+        profile = lyrics_display_daemon.SQUARE_PROFILE
+        state.clock.update(0.2, True, 1.0)
+        early = self.renderer.render(state, profile)
+        state.clock.update(3.8, True, 1.0)
+        late = self.renderer.render(state, profile)
+        self.assertNotEqual(early, late)
+
+    def test_decode_cover_matches_the_core_text_contract(self) -> None:
+        from PIL import Image
+
+        buf = io.BytesIO()
+        Image.new("RGBA", (90, 60), (255, 0, 0, 255)).save(buf, "PNG")
+        cover = self.renderer.decode_cover(buf.getvalue(), 52)
+        self.assertIsNotNone(cover)
+        assert cover is not None
+        self.assertEqual(cover.size, 52)
+        self.assertEqual(len(cover.bits), 52 * 52)
+        self.assertEqual(len(cover.rgb565), 52 * 52 * 2)
+        self.assertEqual(cover.rgb565[:2], bytes([0xF8, 0x00]))  # pure red in RGB565
+        self.assertIsNone(self.renderer.decode_cover(b"not an image", 52))
+
+    def test_pause_chip_layers_are_packed_to_chip_size(self) -> None:
+        for profile in (lyrics_display_daemon.SQUARE_PROFILE, lyrics_display_daemon.WIDE_PROFILE):
+            value, mask, chip_w, chip_h = self.renderer.render_pause_chip(profile)
+            self.assertEqual(len(value), ((chip_w + 7) // 8) * chip_h)
+            self.assertEqual(len(mask), len(value))
+            # The label is ink cut out of the pill, so the value layer lights less.
+            self.assertLess(_lit(value), _lit(mask))
