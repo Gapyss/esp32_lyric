@@ -23,10 +23,11 @@ lyrics daemon (esp8266/daemon/lyrics_display_daemon.py --insecure)
 
 ### The screen
 
-The lyrics screen is rendered **entirely on the Mac** by
-`esp8266/daemon/lyrics_display_daemon.py`: a Tend-color 240×240 UI with Core Text Thai
-shaping, syllable karaoke, and real-color album covers, streamed to the panel
-frame by frame. There is no on-device now-playing renderer.
+The lyrics screen is rendered **entirely on the computer** (a Mac or a Windows
+PC) by `esp8266/daemon/lyrics_display_daemon.py`: a Tend-color 240×240 UI with
+Thai shaping (Core Text on macOS, HarfBuzz on Windows), syllable karaoke, and
+real-color album covers, streamed to the panel frame by frame. There is no
+on-device now-playing renderer.
 
 When no frame is flowing — daemon off, Mac asleep, nothing playing — the panel
 falls back to the **waiting screen**, which is deliberately useful rather than
@@ -54,7 +55,8 @@ changes, and turns into `wifi lost / reconnecting` in ember if the link drops.
   240×240 board — pins are set at the top of the sketch).
 - A USB data cable for the **first** flash (updates after that are OTA).
 - Arduino IDE or `arduino-cli` on your computer.
-- A Mac on the same WiFi to run the daemons (see step 4).
+- A Mac **or a Windows 10/11 PC** on the same WiFi to run the daemon (see
+  step 4, or [4b](#4b-or-start-the-daemon-on-windows) for Windows).
 
 ## Setup
 
@@ -308,6 +310,62 @@ authentication for ~7 KB of heap, so run it on a trusted home network.
 > unpacked extension; `esp8266/browser_extension/` stays on 8765 for this board.
 > Otherwise, run one or the other.
 
+### 4b. Or start the daemon on Windows
+
+The same daemon runs on Windows 10/11. On a Mac it draws the screen with Core
+Text; anywhere else it switches to a Pillow renderer that draws the identical
+Tend layout, with HarfBuzz for Thai shaping, FreeType for the glyphs and the
+ICU that Windows ships (`icu.dll`) for Thai word breaks. The fonts come with it
+(`daemon/assets/fonts/`: IBM Plex Sans Thai + IBM Plex Mono, OFL), because
+Sukhumvit Set exists only on macOS.
+
+1. Install **Python 3.10 or newer** from python.org (tick *Add python.exe to
+   PATH*; the `py` launcher comes with it).
+2. Install the renderer's three packages. All of them ship their native
+   libraries inside the wheel, so nothing else needs installing:
+
+   ```powershell
+   py -3 -m pip install -r esp8266\daemon\requirements-windows.txt
+   ```
+
+3. Load `esp8266\browser_extension\` into Chrome or Edge as an unpacked
+   extension, exactly as on the Mac.
+4. Start it:
+
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File esp8266\tools\lyrics.ps1
+   ```
+
+`lyrics.ps1` is the PowerShell twin of `lyrics.sh`: same `start` / `start -f` /
+`status` / `stop` verbs, same guards (refuses a second daemon on `:8766`,
+always passes `--insecure`, prints the board's own `lyr`/wifi/heap), and it
+also refuses to start if the renderer packages are missing, since a daemon
+without them would stream a screen with no text on it. The log goes to
+`%LOCALAPPDATA%\g4pys\lyrics-display.log`. The direct command still works:
+
+```powershell
+py -3 esp8266\daemon\lyrics_display_daemon.py serve --insecure
+```
+
+**Windows Firewall is the Windows-only way to end up stuck on "waiting for
+lyrics".** The board dials *in* to the PC on TCP 8766, so the first start
+raises a firewall prompt. Allow **Private networks**, and make sure the WiFi
+network is set to *Private* rather than *Public*. If you dismissed the prompt,
+add the rule from an administrator PowerShell:
+
+```powershell
+New-NetFirewallRule -DisplayName "Clawdmeter lyrics" -Direction Inbound -Protocol TCP -LocalPort 8766 -Action Allow -Profile Private
+```
+
+The symptom is a log with `board announce reached …` and never a
+`board connected` line: the knock gets out, the board's dial back is dropped.
+
+Everything else carries over unchanged: `--announce-url http://<ip>` when
+`clawdmeter.local` doesn't resolve, the shared cache (here
+`%USERPROFILE%\.g4pys\lyrics-display.sqlite3`), and `--renderer` to force a
+renderer (`pillow` on a Mac is how the Pillow path is tested without a Windows
+machine).
+
 ### 5. Play something
 
 Load the browser extension (`esp8266/browser_extension/` → `chrome://extensions`
@@ -360,11 +418,15 @@ esp8266/
 │   ├── lyrics_stream.cpp        # the lyrics screen: WS client for the lyrics daemon
 │   └── index_html_gz.h          # generated — gzipped dashboard served at /
 ├── daemon/
-│   └── lyrics_display_daemon.py # renders the screen; knocks on /usage. The Mac side.
+│   ├── lyrics_display_daemon.py # renders the screen; knocks on /usage. The PC side.
+│   ├── requirements-windows.txt # Pillow renderer packages (Windows / non-Mac only)
+│   └── assets/fonts/            # IBM Plex Sans Thai + Mono (OFL) for the Pillow renderer
 ├── browser_extension/           # feeds YouTube Music playback to the daemon
 ├── tests/
 │   └── test_lyrics_display_daemon.py
 └── tools/
+    ├── lyrics.sh                # start/stop/status the daemon (macOS)
+    ├── lyrics.ps1               # the same, for Windows PowerShell
     └── gen_index_gz.py          # regenerate index_html_gz.h after editing INDEX_HTML
 ```
 
@@ -373,6 +435,11 @@ Run the tests from the repo root:
 ```sh
 python3 -m unittest discover -s esp8266/tests -t .
 ```
+
+The Pillow renderer's tests skip unless its packages are installed, and the
+system `python3` on macOS is too old for them (the wheels need 3.10+), so run
+the suite a second time from a 3.10+ environment with
+`daemon/requirements-windows.txt` installed to actually exercise them.
 
 ### This daemon is a fork, not a shared module
 
@@ -383,13 +450,14 @@ still dials that other copy with the SEC2 handshake
 be split into its own repository. **A fix that matters to both boards has to be
 applied twice** — that is the accepted cost of the split.
 
-The two copies have already diverged in three ways, all in this one:
+The two copies have already diverged in four ways, all in this one:
 
 | | `daemon/` (ESP32 e-ink) | `esp8266/daemon/` (here) |
 |---|---|---|
 | Board learns the daemon's address by | browsing `_lyrics._tcp` over mDNS | the `/usage` knock (`BoardAnnouncer`) |
 | mDNS advertising | on | **off** by default (`--mdns` opts in) |
 | Needs `claudemeter_daemon.py` | no | no (it used to) |
+| Renderer without Core Text (Windows) | geometry only, no text | `PillowFrameRenderer`, same layout |
 
 ### Splitting this into its own repo
 

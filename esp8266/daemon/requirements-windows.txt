@@ -1,0 +1,10 @@
+# The Pillow frame renderer: what the daemon needs anywhere Core Text is not
+# available (Windows, Linux). macOS needs none of this.
+#
+#   py -3 -m pip install -r daemon\requirements-windows.txt
+#
+# All three ship their native libraries (FreeType, HarfBuzz) inside the wheel,
+# so there is nothing else to install. Current wheels need Python 3.10+.
+Pillow>=10.0
+uharfbuzz>=0.39
+freetype-py>=2.4

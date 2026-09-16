@@ -13,7 +13,9 @@ What it does:
 - listens for the browser extension on localhost WebSocket port 8765;
 - tracks playback using extension ticks plus local interpolation;
 - resolves lyrics through manual/cache SQLite rows, then lrclib;
-- renders 1-bpp frames on macOS with Core Text when available;
+- renders 1-bpp frames with Core Text on macOS, or with the Pillow renderer
+  (HarfBuzz shaping, FreeType glyphs, OS ICU line breaks) on Windows and
+  anywhere else Core Text is missing;
 - exposes a board-facing WebSocket on port 8766 and sends self-describing
   binary framebuffer envelopes;
 - knocks on the board's /usage endpoint so it learns this Mac's address
@@ -32,8 +34,11 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import ctypes
+import ctypes.util
 import hmac
 import hashlib
+import io
 import json
 import math
 import os
@@ -44,12 +49,15 @@ import socket
 import sqlite3
 import struct
 import subprocess
+import sys
 import secrets
 import threading
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -153,6 +161,23 @@ TRACKING_WIDE = 0.04  # em; matches the design system's mono-caption letter-spac
 # 1-bit threshold, thin enough to keep letter counters open. Smaller wrapped
 # sizes bump the percentage so the outline never falls below ~1px.
 KARAOKE_STROKE_PCT = 3.5
+
+# The same Tend roles for the Pillow renderer (Windows and anywhere without Core
+# Text). Sukhumvit Set ships only with macOS, so the Pillow renderer uses the
+# vendored IBM Plex Sans Thai: one loopless Thai+Latin family with the weight
+# ladder the roles need (Plex has no "Text" cut on Google Fonts; Regular stands
+# in for body). IBM Plex Mono Medium stands in for Menlo, whose Regular cut
+# reads heavier on the 1-bit panel than Plex Mono's. All OFL, see assets/fonts.
+PILLOW_FONT_DIR = Path(__file__).resolve().parent / "assets" / "fonts"
+PILLOW_FONT_FILES = {
+    "display": "IBMPlexSansThai-Bold.ttf",
+    "lyric": "IBMPlexSansThai-SemiBold.ttf",
+    "body": "IBMPlexSansThai-Regular.ttf",
+    "body_medium": "IBMPlexSansThai-Medium.ttf",
+    "label": "IBMPlexSansThai-SemiBold.ttf",
+    "mono": "IBMPlexMono-Medium.ttf",
+}
+RENDERER_CHOICES = ("auto", "coretext", "pillow", "fallback")
 
 LyricBreakFn = Callable[[str, float, int], list[str]]
 
@@ -1414,7 +1439,154 @@ class FrameRenderer:
         raise NotImplementedError
 
 
-class CoreTextFrameRenderer(FrameRenderer):
+class TendLayoutMixin:
+    """The Tend screen layout, shared by every text-capable renderer.
+
+    Only positions and type roles live here. Each renderer supplies the
+    primitives (_draw_text, _draw_rule, _screen_rect, _draw_state_chip,
+    _draw_progress, _draw_cover_card, _draw_karaoke_text, _break_text,
+    _role_font) and takes every y as top-origin, so a layout change lands on
+    the Core Text and Pillow renderers at once.
+    """
+
+    def _draw_lyric_band(self, ctx: Any, state: AppState, profile: RenderProfile) -> LyricLayout:
+        lyric_font = self._role_font("lyric")
+        current, _next_line, _third = state.current_lines()
+        current_layout = fit_lyric_layout(
+            current,
+            profile.lyric_box_width,
+            profile.lyric_band_bottom_y - profile.lyric_sizes.band_top_y,
+            profile.lyric_sizes,
+            self._break_text,
+        )
+        # Karaoke fill only makes sense for timed lines; loading/error/plain and
+        # "Instrumental" copy would otherwise render fully hollow at fraction 0.
+        karaoke = bool(state.lyrics.synced) and not state.lyrics.instrumental
+        fraction = state.current_line_highlight_fraction() if karaoke else 1.0
+        total_chars = sum(len(row) for row in current_layout.rows) or 1
+        consumed_chars = 0
+        for row, baseline_y in zip(current_layout.rows, current_layout.baselines):
+            row_fraction = clamp(
+                (fraction * total_chars - consumed_chars) / max(1, len(row)), 0.0, 1.0
+            )
+            self._draw_karaoke_text(
+                ctx,
+                row,
+                current_layout.font_size,
+                profile.lyric_box_x,
+                baseline_y,
+                profile.lyric_box_width,
+                row_fraction if karaoke else 1.0,
+                lyric_font,
+            )
+            consumed_chars += len(row)
+        return current_layout
+
+    def _draw_wide(self, ctx: Any, state: AppState, profile: RenderProfile) -> None:
+        label_font = self._role_font("label")
+        display_font = self._role_font("display")
+        body_font = self._role_font("body")
+        body_medium_font = self._role_font("body_medium")
+
+        self._draw_text(
+            ctx, "NOW PLAYING", 13, 14, 18, DISPLAY_WIDTH - 28, "left", font_name=label_font, tracking=TRACKING_MEGA
+        )
+        self._draw_rule(ctx, 12, 28, DISPLAY_WIDTH - 24)
+
+        if not state.track.title:
+            # Idle: quiet centered copy in the design system's lowercase voice.
+            self._draw_text(ctx, "nothing playing", 30, 14, 150, DISPLAY_WIDTH - 28, "center", font_name=display_font)
+            self._draw_text(
+                ctx, "waiting for youtube music", 15, 14, 182, DISPLAY_WIDTH - 28, "center", font_name=body_font
+            )
+            self._screen_rect(ctx, 14, 168, DISPLAY_WIDTH - 28, 20)
+            self._draw_text(
+                ctx, "POWERED BY CLAUDE", 13, 260, 292, 126, "right", font_name=MONO_FONT_NAME, tracking=TRACKING_WIDE
+            )
+            return
+
+        place = cover_placement(profile) if state.cover is not None else None
+        header_w = place.title_w if place is not None else DISPLAY_WIDTH - 28
+        self._draw_text(ctx, state.track.title, 28, 14, 60, header_w, "left", font_name=display_font)
+        self._draw_text(ctx, state.track.artist, 18, 14, 88, header_w, "left", font_name=body_medium_font)
+        if place is not None:
+            self._draw_cover_card(ctx, place)
+        self._draw_progress(ctx, state, MONO_FONT_NAME, WIDE_PROGRESS_GEOM)
+        self._draw_rule(ctx, 12, 130, DISPLAY_WIDTH - 24)
+
+        _current, next_line, third = state.current_lines()
+        current_layout = self._draw_lyric_band(ctx, state, profile)
+        self._draw_text(ctx, next_line, 21, 14, 224, DISPLAY_WIDTH - 28, "center", font_name=body_font)
+        if not current_layout.hide_third and third:
+            self._draw_text(ctx, third, 16, 14, 252, DISPLAY_WIDTH - 28, "center", font_name=body_font)
+            self._screen_rect(ctx, 14, 238, DISPLAY_WIDTH - 28, 22)
+        if state.clock.paused:
+            self._draw_state_chip(ctx, "PAUSED", 14, 292, font_name=label_font)
+        else:
+            self._draw_text(
+                ctx, "PLAYING", 13, 14, 292, 120, "left", font_name=label_font, tracking=TRACKING_MEGA
+            )
+        self._draw_text(
+            ctx, "1.0.0", 13, 260, 292, 126, "right", font_name=MONO_FONT_NAME, tracking=TRACKING_WIDE
+        )
+
+    def _draw_square(self, ctx: Any, state: AppState, profile: RenderProfile) -> None:
+        """Compact 240x240 layout for the ESP8266 SmallTV boards.
+
+        Same structure as the wide layout -- eyebrow, title/artist, progress,
+        karaoke lyric band, next line, footer -- just tighter type scale.
+        """
+        width = profile.width
+        label_font = self._role_font("label")
+        display_font = self._role_font("display")
+        body_font = self._role_font("body")
+        body_medium_font = self._role_font("body_medium")
+
+        self._draw_text(
+            ctx, "NOW PLAYING", 11, 12, 14, width - 24, "left", font_name=label_font, tracking=TRACKING_MEGA
+        )
+        self._draw_rule(ctx, 10, 24, width - 20)
+
+        if not state.track.title:
+            self._draw_text(ctx, "nothing playing", 22, 12, 112, width - 24, "center", font_name=display_font)
+            self._draw_text(
+                ctx, "waiting for youtube music", 13, 12, 140, width - 24, "center", font_name=body_font
+            )
+            self._screen_rect(ctx, 12, 126, width - 24, 18)
+            self._draw_text(
+                ctx, "1.0.0", 11, 116, 228, width - 128, "right", font_name=MONO_FONT_NAME, tracking=TRACKING_WIDE
+            )
+            return
+
+        place = cover_placement(profile) if state.cover is not None else None
+        header_w = place.title_w if place is not None else width - 24
+        self._draw_text(ctx, state.track.title, 20, 12, 52, header_w, "left", font_name=display_font)
+        self._draw_text(ctx, state.track.artist, 14, 12, 74, header_w, "left", font_name=body_medium_font)
+        if place is not None:
+            self._draw_cover_card(ctx, place)
+        self._draw_progress(ctx, state, MONO_FONT_NAME, SQUARE_PROGRESS_GEOM)
+        self._draw_rule(ctx, 10, 104, width - 20)
+
+        _current, next_line, third = state.current_lines()
+        current_layout = self._draw_lyric_band(ctx, state, profile)
+        self._draw_text(ctx, next_line, 14, 12, 202, width - 24, "center", font_name=body_font)
+        if not current_layout.hide_third and third:
+            self._draw_text(ctx, third, 12, 12, 222, width - 24, "center", font_name=body_font)
+            self._screen_rect(ctx, 12, 210, width - 24, 16)
+        if state.clock.paused:
+            self._draw_state_chip(
+                ctx, "PAUSED", 12, 234, font_name=label_font, size=11, pad_x=7, chip_h=16, rise=11
+            )
+        else:
+            self._draw_text(
+                ctx, "PLAYING", 11, 12, 234, 110, "left", font_name=label_font, tracking=TRACKING_MEGA
+            )
+        self._draw_text(
+            ctx, "1.0.0", 11, 116, 234, width - 128, "right", font_name=MONO_FONT_NAME, tracking=TRACKING_WIDE
+        )
+
+
+class CoreTextFrameRenderer(TendLayoutMixin, FrameRenderer):
     def __init__(self, font_name: str = "Tahoma") -> None:
         import CoreText  # type: ignore
         import Quartz  # type: ignore
@@ -1605,142 +1777,6 @@ class CoreTextFrameRenderer(FrameRenderer):
         pixels = bytes(q.CGDataProviderCopyData(q.CGImageGetDataProvider(image)))
         stride = q.CGImageGetBytesPerRow(image)
         return pack_1bpp(pixels, chip_w, chip_h, stride)
-
-    def _draw_lyric_band(self, ctx: Any, state: AppState, profile: RenderProfile) -> LyricLayout:
-        lyric_font = self._role_font("lyric")
-        current, _next_line, _third = state.current_lines()
-        current_layout = fit_lyric_layout(
-            current,
-            profile.lyric_box_width,
-            profile.lyric_band_bottom_y - profile.lyric_sizes.band_top_y,
-            profile.lyric_sizes,
-            self._break_text,
-        )
-        # Karaoke fill only makes sense for timed lines; loading/error/plain and
-        # "Instrumental" copy would otherwise render fully hollow at fraction 0.
-        karaoke = bool(state.lyrics.synced) and not state.lyrics.instrumental
-        fraction = state.current_line_highlight_fraction() if karaoke else 1.0
-        total_chars = sum(len(row) for row in current_layout.rows) or 1
-        consumed_chars = 0
-        for row, baseline_y in zip(current_layout.rows, current_layout.baselines):
-            row_fraction = clamp(
-                (fraction * total_chars - consumed_chars) / max(1, len(row)), 0.0, 1.0
-            )
-            self._draw_karaoke_text(
-                ctx,
-                row,
-                current_layout.font_size,
-                profile.lyric_box_x,
-                baseline_y,
-                profile.lyric_box_width,
-                row_fraction if karaoke else 1.0,
-                lyric_font,
-            )
-            consumed_chars += len(row)
-        return current_layout
-
-    def _draw_wide(self, ctx: Any, state: AppState, profile: RenderProfile) -> None:
-        label_font = self._role_font("label")
-        display_font = self._role_font("display")
-        body_font = self._role_font("body")
-        body_medium_font = self._role_font("body_medium")
-
-        self._draw_text(
-            ctx, "NOW PLAYING", 13, 14, 18, DISPLAY_WIDTH - 28, "left", font_name=label_font, tracking=TRACKING_MEGA
-        )
-        self._draw_rule(ctx, 12, 28, DISPLAY_WIDTH - 24)
-
-        if not state.track.title:
-            # Idle: quiet centered copy in the design system's lowercase voice.
-            self._draw_text(ctx, "nothing playing", 30, 14, 150, DISPLAY_WIDTH - 28, "center", font_name=display_font)
-            self._draw_text(
-                ctx, "waiting for youtube music", 15, 14, 182, DISPLAY_WIDTH - 28, "center", font_name=body_font
-            )
-            self._screen_rect(ctx, 14, 168, DISPLAY_WIDTH - 28, 20)
-            self._draw_text(
-                ctx, "POWERED BY CLAUDE", 13, 260, 292, 126, "right", font_name=MONO_FONT_NAME, tracking=TRACKING_WIDE
-            )
-            return
-
-        place = cover_placement(profile) if state.cover is not None else None
-        header_w = place.title_w if place is not None else DISPLAY_WIDTH - 28
-        self._draw_text(ctx, state.track.title, 28, 14, 60, header_w, "left", font_name=display_font)
-        self._draw_text(ctx, state.track.artist, 18, 14, 88, header_w, "left", font_name=body_medium_font)
-        if place is not None:
-            self._draw_cover_card(ctx, place)
-        self._draw_progress(ctx, state, MONO_FONT_NAME, WIDE_PROGRESS_GEOM)
-        self._draw_rule(ctx, 12, 130, DISPLAY_WIDTH - 24)
-
-        _current, next_line, third = state.current_lines()
-        current_layout = self._draw_lyric_band(ctx, state, profile)
-        self._draw_text(ctx, next_line, 21, 14, 224, DISPLAY_WIDTH - 28, "center", font_name=body_font)
-        if not current_layout.hide_third and third:
-            self._draw_text(ctx, third, 16, 14, 252, DISPLAY_WIDTH - 28, "center", font_name=body_font)
-            self._screen_rect(ctx, 14, 238, DISPLAY_WIDTH - 28, 22)
-        if state.clock.paused:
-            self._draw_state_chip(ctx, "PAUSED", 14, 292, font_name=label_font)
-        else:
-            self._draw_text(
-                ctx, "PLAYING", 13, 14, 292, 120, "left", font_name=label_font, tracking=TRACKING_MEGA
-            )
-        self._draw_text(
-            ctx, "1.0.0", 13, 260, 292, 126, "right", font_name=MONO_FONT_NAME, tracking=TRACKING_WIDE
-        )
-
-    def _draw_square(self, ctx: Any, state: AppState, profile: RenderProfile) -> None:
-        """Compact 240x240 layout for the ESP8266 SmallTV boards.
-
-        Same structure as the wide layout -- eyebrow, title/artist, progress,
-        karaoke lyric band, next line, footer -- just tighter type scale.
-        """
-        width = profile.width
-        label_font = self._role_font("label")
-        display_font = self._role_font("display")
-        body_font = self._role_font("body")
-        body_medium_font = self._role_font("body_medium")
-
-        self._draw_text(
-            ctx, "NOW PLAYING", 11, 12, 14, width - 24, "left", font_name=label_font, tracking=TRACKING_MEGA
-        )
-        self._draw_rule(ctx, 10, 24, width - 20)
-
-        if not state.track.title:
-            self._draw_text(ctx, "nothing playing", 22, 12, 112, width - 24, "center", font_name=display_font)
-            self._draw_text(
-                ctx, "waiting for youtube music", 13, 12, 140, width - 24, "center", font_name=body_font
-            )
-            self._screen_rect(ctx, 12, 126, width - 24, 18)
-            self._draw_text(
-                ctx, "1.0.0", 11, 116, 228, width - 128, "right", font_name=MONO_FONT_NAME, tracking=TRACKING_WIDE
-            )
-            return
-
-        place = cover_placement(profile) if state.cover is not None else None
-        header_w = place.title_w if place is not None else width - 24
-        self._draw_text(ctx, state.track.title, 20, 12, 52, header_w, "left", font_name=display_font)
-        self._draw_text(ctx, state.track.artist, 14, 12, 74, header_w, "left", font_name=body_medium_font)
-        if place is not None:
-            self._draw_cover_card(ctx, place)
-        self._draw_progress(ctx, state, MONO_FONT_NAME, SQUARE_PROGRESS_GEOM)
-        self._draw_rule(ctx, 10, 104, width - 20)
-
-        _current, next_line, third = state.current_lines()
-        current_layout = self._draw_lyric_band(ctx, state, profile)
-        self._draw_text(ctx, next_line, 14, 12, 202, width - 24, "center", font_name=body_font)
-        if not current_layout.hide_third and third:
-            self._draw_text(ctx, third, 12, 12, 222, width - 24, "center", font_name=body_font)
-            self._screen_rect(ctx, 12, 210, width - 24, 16)
-        if state.clock.paused:
-            self._draw_state_chip(
-                ctx, "PAUSED", 12, 234, font_name=label_font, size=11, pad_x=7, chip_h=16, rise=11
-            )
-        else:
-            self._draw_text(
-                ctx, "PLAYING", 11, 12, 234, 110, "left", font_name=label_font, tracking=TRACKING_MEGA
-            )
-        self._draw_text(
-            ctx, "1.0.0", 11, 116, 234, width - 128, "right", font_name=MONO_FONT_NAME, tracking=TRACKING_WIDE
-        )
 
     def _break_text(self, text: str, size: float, width: int) -> list[str]:
         if not text:
@@ -2055,6 +2091,636 @@ class CoreTextFrameRenderer(FrameRenderer):
         q.CGContextFillEllipseInRect(
             ctx, q.CGRectMake(bar_x + played_w - dot_r, center_y - dot_r, dot_r * 2, dot_r * 2)
         )
+
+
+UBRK_CHARACTER = 0
+UBRK_LINE = 2
+
+
+class IcuBreaker:
+    """Line and grapheme boundaries from the operating system's own ICU.
+
+    Core Text breaks Thai with ICU's dictionary, and so does this: Windows 10+
+    ships ICU as icu.dll (icuuc.dll on 1703-1809) and macOS as libicucore, both
+    with unversioned exports. Linux distros suffix every symbol with the ICU
+    major version, which the soname gives away. Nothing to install anywhere.
+
+    When no ICU loads, boundaries fall back to "after whitespace" for lines and
+    "before any non-combining character" for graphemes. Thai lyrics usually put
+    spaces between phrases, so that degrades to phrase-level wrapping.
+    """
+
+    def __init__(self) -> None:
+        self._lib: Any = None
+        self._suffix = ""
+        self._lock = threading.Lock()
+        for name, suffix in self._candidates():
+            try:
+                lib = ctypes.CDLL(name)
+                getattr(lib, "ubrk_open" + suffix)
+            except (OSError, AttributeError):
+                continue
+            self._bind(lib, suffix)
+            break
+
+    @property
+    def available(self) -> bool:
+        return self._lib is not None
+
+    @staticmethod
+    def _candidates() -> list[tuple[str, str]]:
+        if sys.platform == "win32":
+            return [("icu.dll", ""), ("icuuc.dll", "")]
+        if sys.platform == "darwin":
+            return [("/usr/lib/libicucore.A.dylib", "")]
+        found = ctypes.util.find_library("icuuc")
+        if not found:
+            return []
+        match = re.search(r"\.so\.(\d+)", found)
+        return [(found, "_" + match.group(1) if match else "")]
+
+    def _bind(self, lib: Any, suffix: str) -> None:
+        opener = getattr(lib, "ubrk_open" + suffix)
+        opener.restype = ctypes.c_void_p
+        opener.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int32,
+                           ctypes.POINTER(ctypes.c_int)]
+        for name in ("ubrk_first", "ubrk_next"):
+            fn = getattr(lib, name + suffix)
+            fn.restype = ctypes.c_int32
+            fn.argtypes = [ctypes.c_void_p]
+        getattr(lib, "ubrk_close" + suffix).argtypes = [ctypes.c_void_p]
+        getattr(lib, "ubrk_close" + suffix).restype = None
+        self._lib = lib
+        self._suffix = suffix
+
+    def line_boundaries(self, text: str) -> list[int]:
+        """Sorted string indices where a line may start, including 0 and len."""
+        found = self._icu_boundaries(text, UBRK_LINE)
+        if found is not None:
+            return found
+        out = [0]
+        for idx in range(1, len(text)):
+            if text[idx - 1].isspace() and not text[idx].isspace():
+                out.append(idx)
+        if text:
+            out.append(len(text))
+        return out
+
+    def grapheme_boundaries(self, text: str) -> list[int]:
+        found = self._icu_boundaries(text, UBRK_CHARACTER)
+        if found is not None:
+            return found
+        out = [0]
+        for idx in range(1, len(text)):
+            if not unicodedata.combining(text[idx]) and unicodedata.category(text[idx]) not in ("Mn", "Me"):
+                out.append(idx)
+        if text:
+            out.append(len(text))
+        return out
+
+    def _icu_boundaries(self, text: str, kind: int) -> list[int] | None:
+        if self._lib is None:
+            return None
+        if not text:
+            return [0]
+        encoded = text.encode("utf-16-le")
+        units = len(encoded) // 2
+        # ICU counts UTF-16 code units; map each back to a Python str index.
+        unit_to_index: list[int] = []
+        for idx, ch in enumerate(text):
+            unit_to_index.append(idx)
+            if ord(ch) > 0xFFFF:
+                unit_to_index.append(idx)
+        unit_to_index.append(len(text))
+        buf = ctypes.create_string_buffer(encoded, len(encoded) + 2)
+        status = ctypes.c_int(0)
+        lib, sfx = self._lib, self._suffix
+        with self._lock:
+            it = getattr(lib, "ubrk_open" + sfx)(kind, b"th", buf, units, ctypes.byref(status))
+            if not it or status.value > 0:  # negative status values are warnings
+                return None
+            try:
+                out = [getattr(lib, "ubrk_first" + sfx)(it)]
+                nxt = getattr(lib, "ubrk_next" + sfx)
+                while True:
+                    pos = nxt(it)
+                    if pos < 0:
+                        break
+                    out.append(pos)
+            finally:
+                getattr(lib, "ubrk_close" + sfx)(it)
+        return sorted({unit_to_index[min(p, units)] for p in out})
+
+
+@dataclass(frozen=True)
+class LineRaster:
+    """One shaped line of text as an 8-bit coverage mask.
+
+    ``left``/``top`` place the mask relative to the pen origin on the baseline
+    (top-origin, so ``top`` is negative for ink above the baseline). ``mask`` is
+    None for a line with no ink (all spaces).
+    """
+
+    mask: Any
+    left: int
+    top: int
+    advance: float
+
+    @property
+    def visual_left(self) -> float:
+        return min(0.0, float(self.left)) if self.mask is not None else 0.0
+
+    @property
+    def visual_width(self) -> float:
+        if self.mask is None:
+            return max(0.0, self.advance)
+        right = max(self.advance, float(self.left + self.mask.width))
+        return max(0.0, right - self.visual_left)
+
+
+class PillowFrameRenderer(TendLayoutMixin, FrameRenderer):
+    """Cross-platform stand-in for CoreTextFrameRenderer.
+
+    Draws the same Tend layout (TendLayoutMixin) into an 8-bit Pillow canvas,
+    white ink on black, then packs it with the same pack_1bpp threshold. Text
+    is shaped by HarfBuzz (uharfbuzz) and rasterized by FreeType (freetype-py)
+    rather than by Pillow: Pillow only shapes Thai through libraqm, which its
+    Windows wheels leave disabled unless fribidi.dll is installed by hand, and
+    unshaped Thai stacks its tone marks on top of its vowels. Both packages ship
+    their native libraries inside the wheel.
+
+    Every coordinate here is top-origin, so the Core Text renderer's
+    ``self._h - y`` flips have no counterpart. Shapes are drawn 4x supersampled
+    and box-filtered back down, which stands in for Quartz antialiasing before
+    the >32 threshold.
+    """
+
+    SUPERSAMPLE = 4
+    # FreeType's antialiased fringe on both sides of the karaoke stroke survives
+    # pack_1bpp's >32 threshold, so the same nominal width reads heavier than
+    # Core Text's. At 0.8 the hollow band lights within 3% of Core Text's pixel
+    # count at both profiles.
+    STROKE_SCALE = 0.8
+
+    def __init__(self, font_dir: Path | None = None) -> None:
+        import freetype  # type: ignore
+        import uharfbuzz  # type: ignore
+        from PIL import Image, ImageDraw  # type: ignore
+
+        self.ft = freetype
+        self.hb = uharfbuzz
+        self.Image = Image
+        self.ImageDraw = ImageDraw
+        font_dir = font_dir or PILLOW_FONT_DIR
+        self.font_paths: dict[str, str] = {}
+        missing = []
+        for role, filename in PILLOW_FONT_FILES.items():
+            path = font_dir / filename
+            if path.is_file():
+                self.font_paths[role] = str(path)
+            else:
+                missing.append(filename)
+        if missing:
+            raise RuntimeError(f"fonts missing from {font_dir}: {', '.join(missing)}")
+        self.breaker = IcuBreaker()
+        if not self.breaker.available:
+            print("ICU unavailable; lyrics wrap at spaces only")
+        self._ft_faces: dict[str, Any] = {}
+        self._hb_fonts: dict[str, tuple[Any, int]] = {}
+        self._glyphs: dict[tuple[str, float, int, float], tuple[Any, int, int]] = {}
+        self._lines: OrderedDict[tuple[str, str, float, float, float], LineRaster] = OrderedDict()
+        self._breaks: OrderedDict[tuple[str, float, int], list[str]] = OrderedDict()
+        self._widths: OrderedDict[tuple[str, str, float], float] = OrderedDict()
+        self._h = DISPLAY_HEIGHT
+
+    # -- fonts and shaping -------------------------------------------------
+
+    def _role_font(self, role: str) -> str:
+        return role
+
+    def _font_path(self, font_name: str | None) -> str:
+        if font_name == MONO_FONT_NAME:
+            return self.font_paths["mono"]
+        return self.font_paths.get(font_name or "body", self.font_paths["body"])
+
+    def _shape(self, path: str, size: float, text: str, tracking: float) -> tuple[list[tuple[int, float, float]], float]:
+        """Return ([(glyph_id, x_px, y_px_up)], advance_px) for one line."""
+        hb = self.hb
+        cached = self._hb_fonts.get(path)
+        if cached is None:
+            face = hb.Face(hb.Blob.from_file_path(path))
+            cached = (hb.Font(face), face.upem)
+            self._hb_fonts[path] = cached
+        font, upem = cached
+        buf = hb.Buffer()
+        buf.add_str(text)
+        buf.guess_segment_properties()
+        hb.shape(font, buf, {"kern": True, "liga": True})
+        scale = size / upem
+        # kCTKernAttributeName adds to every character's advance, last one included.
+        extra = tracking * size
+        pen = 0.0
+        glyphs: list[tuple[int, float, float]] = []
+        for info, pos in zip(buf.glyph_infos, buf.glyph_positions):
+            glyphs.append((info.codepoint, pen + pos.x_offset * scale, pos.y_offset * scale))
+            advance = pos.x_advance * scale
+            if advance and extra:
+                advance += extra
+            pen += advance
+        return glyphs, pen
+
+    def _text_width(self, text: str, size: float, font_name: str) -> float:
+        key = (text, font_name, size)
+        width = self._widths.get(key)
+        if width is None:
+            width = self._shape(self._font_path(font_name), size, text, 0.0)[1]
+            self._remember(self._widths, key, width, 4096)
+        return width
+
+    def _glyph(self, path: str, size: float, gid: int, stroke_px: float) -> tuple[Any, int, int]:
+        """(mask | None, left, top_up) for one glyph at one size."""
+        key = (path, size, gid, stroke_px)
+        hit = self._glyphs.get(key)
+        if hit is not None:
+            return hit
+        ft = self.ft
+        face = self._ft_faces.get(path)
+        if face is None:
+            face = ft.Face(path)
+            self._ft_faces[path] = face
+        face.set_char_size(int(round(size * 64)))
+        # Light (vertical-only) hinting snaps horizontal stems to the pixel grid.
+        # Unhinted, the 11px black-on-white PAUSED label loses the E's bars to
+        # the threshold. Advances still come from HarfBuzz, so layout is unchanged.
+        face.load_glyph(gid, ft.FT_LOAD_TARGET_LIGHT | ft.FT_LOAD_NO_BITMAP)
+        if stroke_px > 0:
+            stroker = ft.Stroker()
+            stroker.set(int(round(stroke_px * 32)), ft.FT_STROKER_LINECAP_ROUND,
+                        ft.FT_STROKER_LINEJOIN_ROUND, 0)
+            glyph = face.glyph.get_glyph()
+            glyph.stroke(stroker, True)
+            bitmap_glyph = glyph.to_bitmap(ft.FT_RENDER_MODE_NORMAL, ft.Vector(0, 0), True)
+            bitmap, left, top = bitmap_glyph.bitmap, bitmap_glyph.left, bitmap_glyph.top
+        else:
+            face.glyph.render(ft.FT_RENDER_MODE_NORMAL)
+            bitmap, left, top = face.glyph.bitmap, face.glyph.bitmap_left, face.glyph.bitmap_top
+        mask = None
+        if bitmap.width > 0 and bitmap.rows > 0:
+            mask = self.Image.frombytes(
+                "L", (bitmap.width, bitmap.rows), bytes(bitmap.buffer), "raw", "L", bitmap.pitch
+            )
+        if len(self._glyphs) > 20000:
+            self._glyphs.clear()
+        hit = (mask, left, top)
+        self._glyphs[key] = hit
+        return hit
+
+    def _line(self, text: str, size: float, font_name: str | None, tracking: float = 0.0,
+              stroke_px: float = 0.0) -> LineRaster:
+        path = self._font_path(font_name)
+        key = (text, path, size, tracking, stroke_px)
+        hit = self._lines.get(key)
+        if hit is not None:
+            self._lines.move_to_end(key)
+            return hit
+        glyphs, advance = self._shape(path, size, text, tracking)
+        placed = []
+        for gid, x, y_up in glyphs:
+            mask, left, top = self._glyph(path, size, gid, stroke_px)
+            if mask is None:
+                continue
+            placed.append((mask, int(round(x)) + left, -int(round(y_up)) - top))
+        if not placed:
+            raster = LineRaster(None, 0, 0, advance)
+        else:
+            x0 = min(gx for _m, gx, _gy in placed)
+            y0 = min(gy for _m, _gx, gy in placed)
+            x1 = max(gx + m.width for m, gx, _gy in placed)
+            y1 = max(gy + m.height for m, _gx, gy in placed)
+            canvas = self.Image.new("L", (x1 - x0, y1 - y0), 0)
+            for mask, gx, gy in placed:
+                canvas.paste(255, (gx - x0, gy - y0), mask)
+            raster = LineRaster(canvas, x0, y0, advance)
+        self._remember(self._lines, key, raster, 512)
+        return raster
+
+    @staticmethod
+    def _remember(cache: OrderedDict, key: Any, value: Any, limit: int) -> None:
+        cache[key] = value
+        if len(cache) > limit:
+            cache.popitem(last=False)
+
+    def _blit(self, canvas: Any, raster: LineRaster, pen_x: float, baseline_y: int,
+              clip: tuple[float, float, float, float], gray: float = 1.0) -> None:
+        if raster.mask is None:
+            return
+        left = int(round(pen_x)) + raster.left
+        top = baseline_y + raster.top
+        cx0 = max(left, int(math.floor(clip[0])), 0)
+        cy0 = max(top, int(math.floor(clip[1])), 0)
+        cx1 = min(left + raster.mask.width, int(math.ceil(clip[2])), canvas.width)
+        cy1 = min(top + raster.mask.height, int(math.ceil(clip[3])), canvas.height)
+        if cx1 <= cx0 or cy1 <= cy0:
+            return
+        mask = raster.mask.crop((cx0 - left, cy0 - top, cx1 - left, cy1 - top))
+        canvas.paste(int(round(gray * 255)), (cx0, cy0), mask)
+
+    # -- shapes -------------------------------------------------------------
+
+    def _fill_aa(self, canvas: Any, box: tuple[float, float, float, float],
+                 paint: Callable[[Any, Callable[[float, float], tuple[float, float]]], None],
+                 gray: float = 1.0) -> None:
+        """Supersample ``paint`` over a top-origin float box and composite it.
+
+        ``paint(draw, at)`` draws with ``at(x, y)``, which maps canvas
+        coordinates into the supersampled scratch image.
+        """
+        x0, y0 = int(math.floor(box[0])) - 1, int(math.floor(box[1])) - 1
+        x1, y1 = int(math.ceil(box[2])) + 1, int(math.ceil(box[3])) + 1
+        w, h = x1 - x0, y1 - y0
+        if w <= 0 or h <= 0:
+            return
+        ss = self.SUPERSAMPLE
+        big = self.Image.new("L", (w * ss, h * ss), 0)
+        paint(self.ImageDraw.Draw(big), lambda x, y: ((x - x0) * ss, (y - y0) * ss))
+        self._paste_clipped(canvas, big.resize((w, h), self.Image.BOX), x0, y0, gray)
+
+    def _paste_clipped(self, canvas: Any, mask: Any, x: int, y: int, gray: float) -> None:
+        cx0, cy0 = max(x, 0), max(y, 0)
+        cx1, cy1 = min(x + mask.width, canvas.width), min(y + mask.height, canvas.height)
+        if cx1 <= cx0 or cy1 <= cy0:
+            return
+        canvas.paste(int(round(gray * 255)), (cx0, cy0), mask.crop((cx0 - x, cy0 - y, cx1 - x, cy1 - y)))
+
+    def _pill(self, canvas: Any, x: float, y: float, w: float, h: float, gray: float = 1.0) -> None:
+        if w <= 0 or h <= 0:
+            return
+        radius = min(w, h) / 2.0 * self.SUPERSAMPLE
+
+        def paint(draw: Any, at: Callable[[float, float], tuple[float, float]]) -> None:
+            (ax, ay), (bx, by) = at(x, y), at(x + w, y + h)
+            draw.rounded_rectangle((ax, ay, max(ax, bx - 1), max(ay, by - 1)), radius=radius, fill=255)
+
+        self._fill_aa(canvas, (x, y, x + w, y + h), paint, gray)
+
+    def _dot(self, canvas: Any, cx: float, cy: float, r: float) -> None:
+        def paint(draw: Any, at: Callable[[float, float], tuple[float, float]]) -> None:
+            (ax, ay), (bx, by) = at(cx - r, cy - r), at(cx + r, cy + r)
+            draw.ellipse((ax, ay, max(ax, bx - 1), max(ay, by - 1)), fill=255)
+
+        self._fill_aa(canvas, (cx - r, cy - r, cx + r, cy + r), paint)
+
+    # -- TendLayoutMixin primitives ----------------------------------------
+
+    def render(self, state: AppState, profile: RenderProfile = DEFAULT_PROFILE) -> bytes:
+        self._h = profile.height
+        canvas = self.Image.new("L", (profile.width, profile.height), 0)
+        if profile.name == SQUARE_PROFILE.name:
+            self._draw_square(canvas, state, profile)
+        else:
+            self._draw_wide(canvas, state, profile)
+        return pack_1bpp(canvas.tobytes(), profile.width, profile.height, profile.width)
+
+    def _break_text(self, text: str, size: float, width: int) -> list[str]:
+        """Greedy rows at ICU line-break opportunities, like CTTypesetterSuggestLineBreak.
+
+        Trailing whitespace may overhang the width. A single word wider than the
+        row is split at grapheme boundaries, never inside a Thai cluster.
+        """
+        if not text:
+            return []
+        key = (text, size, width)
+        hit = self._breaks.get(key)
+        if hit is not None:
+            return list(hit)
+        font = "display"
+        line_stops = self.breaker.line_boundaries(text)
+        rows: list[str] = []
+        offset = 0
+        while offset < len(text):
+            end = None
+            for stop in line_stops:
+                if stop <= offset:
+                    continue
+                if self._text_width(text[offset:stop].rstrip(), size, font) <= width:
+                    end = stop
+                else:
+                    break
+            if end is None:
+                word_end = next((stop for stop in line_stops if stop > offset), len(text))
+                word = text[offset:word_end]
+                end = offset
+                for stop in self.breaker.grapheme_boundaries(word)[1:]:
+                    if end > offset and self._text_width(word[:stop].rstrip(), size, font) > width:
+                        break
+                    end = offset + stop
+            rows.append(text[offset:end])
+            offset = end
+            while offset < len(text) and text[offset].isspace():
+                offset += 1
+        self._remember(self._breaks, key, rows, 1024)
+        return list(rows)
+
+    def _draw_text(
+        self,
+        ctx: Any,
+        text: str,
+        size: float,
+        x: int,
+        baseline_y_top_origin: int,
+        width: int,
+        align: str,
+        font_name: str | None = None,
+        tracking: float = 0.0,
+        gray: float = 1.0,
+    ) -> None:
+        if not text:
+            return
+        line = self._line(text, size, font_name, tracking)
+        visual_width = line.visual_width
+        if align == "center":
+            visual_x = x + max(0, int((width - visual_width) / 2))
+        elif align == "right":
+            visual_x = x + max(0, int(width - visual_width))
+        else:
+            visual_x = x
+        self._blit(ctx, line, visual_x - line.visual_left, baseline_y_top_origin,
+                   (x, 0, x + width, self._h), gray)
+
+    def _draw_rule(self, ctx: Any, x: int, y_top_origin: int, width: int) -> None:
+        # Quartz fills rect (x, h - y, w, 1) bottom-up, which is row y - 1 here.
+        self._paste_clipped(ctx, self.Image.new("L", (width, 1), 255), x, y_top_origin - 1, 1.0)
+
+    def _draw_cover_card(self, ctx: Any, place: "CoverPlacement") -> None:
+        """Radius-8 hairline card around the art, stroked on the pixel grid lines.
+
+        A 1px Quartz stroke centered on integer coordinates half-covers the two
+        pixels either side, and both survive the >32 threshold, so the frame is
+        drawn as a 1px-wide band straddling the path.
+        """
+        pad = place.frame_pad
+        fx = place.x - pad
+        fy = place.y - pad
+        fw = place.size + 2 * pad
+        ss = self.SUPERSAMPLE
+
+        def paint(draw: Any, at: Callable[[float, float], tuple[float, float]]) -> None:
+            (ax, ay), (bx, by) = at(fx - 0.5, fy - 0.5), at(fx + fw + 0.5, fy + fw + 0.5)
+            draw.rounded_rectangle((ax, ay, bx - 1, by - 1), radius=8.5 * ss, outline=255, width=ss)
+
+        self._fill_aa(ctx, (fx - 1, fy - 1, fx + fw + 1, fy + fw + 1), paint)
+
+    def _draw_karaoke_text(
+        self,
+        ctx: Any,
+        text: str,
+        size: float,
+        x: int,
+        baseline_y_top_origin: int,
+        width: int,
+        fraction: float,
+        font_name: str,
+    ) -> None:
+        """Centered lyric row: sung portion solid, unsung portion hollow outline."""
+        if not text:
+            return
+        solid = self._line(text, size, font_name)
+        # Core Text strokes at a percentage of the point size, centered on the outline.
+        stroke_px = max(KARAOKE_STROKE_PCT, 100.0 / size) * size / 100.0 * self.STROKE_SCALE
+        visual_width = solid.visual_width
+        visual_x = x + max(0, int((width - visual_width) / 2))
+        pen_x = visual_x - solid.visual_left
+        band_top = baseline_y_top_origin - size * 1.6
+        band_bottom = baseline_y_top_origin + size * 0.8
+        fraction = clamp(fraction, 0.0, 1.0)
+        split_x = int(round(visual_x + visual_width * fraction))
+        if fraction < 1.0:
+            hollow = self._line(text, size, font_name, stroke_px=stroke_px)
+            self._blit(ctx, hollow, pen_x, baseline_y_top_origin, (split_x, band_top, x + width, band_bottom))
+        if fraction > 0.0:
+            self._blit(ctx, solid, pen_x, baseline_y_top_origin, (x, band_top, split_x, band_bottom))
+
+    def _screen_rect(self, ctx: Any, x: int, y_top_origin: int, w: int, h: int) -> None:
+        """Clear a 50% checkerboard over a band (the 1-bit ink-muted screen).
+
+        Mirrors the Core Text dash phase exactly: bottom-up row ``row`` clears
+        pixel px when (px + row) is even, and top-origin row ty is bottom-up
+        row (y + h - 1 - ty).
+        """
+        px_access = ctx.load()
+        for ty in range(max(0, y_top_origin), min(ctx.height, y_top_origin + h)):
+            row = y_top_origin + h - 1 - ty
+            start = x + ((x + row) % 2)
+            for px in range(max(0, start), min(ctx.width, x + w), 2):
+                px_access[px, ty] = 0
+
+    def _draw_state_chip(
+        self,
+        ctx: Any,
+        text: str,
+        x: int,
+        baseline_y_top_origin: int,
+        font_name: str,
+        size: int = 13,
+        pad_x: int = 9,
+        chip_h: int = 20,
+        rise: int = 14,
+    ) -> None:
+        """Inverted pill chip -- the 1-bit stand-in for the ember accent."""
+        chip_w = int(self._line(text, size, font_name, TRACKING_MEGA).visual_width) + pad_x * 2
+        self._pill(ctx, x, baseline_y_top_origin - rise, chip_w, chip_h)
+        self._draw_text(
+            ctx, text, size, x + pad_x, baseline_y_top_origin, chip_w, "left",
+            font_name=font_name, tracking=TRACKING_MEGA, gray=0.0,
+        )
+
+    def _draw_progress(self, ctx: Any, state: AppState, font_name: str, geom: ProgressGeom) -> None:
+        elapsed = state.clock.interpolated_position()
+        duration = max(0.0, state.track.duration_sec)
+        self._draw_text(
+            ctx, format_time(elapsed), geom.time_size, geom.left_x, geom.baseline_y, geom.left_w,
+            "left", font_name=font_name,
+        )
+        remaining = max(0.0, duration - elapsed) if duration else 0.0
+        self._draw_text(
+            ctx, "-" + format_time(remaining), geom.time_size, geom.right_x, geom.baseline_y, geom.right_w,
+            "right", font_name=font_name,
+        )
+        bar_x, bar_w = geom.bar_x, geom.bar_w
+        fraction = clamp(elapsed / duration, 0.0, 1.0) if duration > 0 else 0.0
+        played_w = bar_w * fraction
+        # remaining track: a 1-on/3-off dotted hairline on the track's center row
+        px_access = ctx.load()
+        row = geom.center_y
+        if 0 <= row < ctx.height:
+            for px in range(int(bar_x + played_w), min(bar_x + bar_w, ctx.width), 4):
+                px_access[px, row] = 255
+        if played_w > 0:
+            self._pill(ctx, bar_x, geom.center_y - 1.5, played_w, 3)
+        self._dot(ctx, bar_x + played_w, geom.center_y, geom.dot_r)
+
+    # -- cover art and the pause chip ----------------------------------------
+
+    def decode_cover(self, data: bytes, size: int) -> CoverArt | None:
+        """Pillow twin of CoreTextFrameRenderer.decode_cover (same crop, luma, dither).
+
+        Runs off the event loop (asyncio.to_thread), so it must touch only
+        locals: the FreeType faces and every cache on this renderer belong to
+        the render path and are not thread-safe.
+        """
+        Image = self.Image
+        try:
+            image = Image.open(io.BytesIO(data))
+            image.load()
+        except (OSError, ValueError, Image.DecompressionBombError):
+            return None
+        iw, ih = image.size
+        if iw <= 0 or ih <= 0 or size <= 0:
+            return None
+        # Quartz draws premultiplied into a transparent context: alpha becomes black.
+        rgba = image.convert("RGBA")
+        rgb = Image.alpha_composite(Image.new("RGBA", rgba.size, (0, 0, 0, 255)), rgba).convert("RGB")
+        side = min(iw, ih)
+        left, top = (iw - side) // 2, (ih - side) // 2
+        rgb = rgb.resize((size, size), Image.LANCZOS, box=(left, top, left + side, top + side))
+        pixels = rgb.tobytes()
+        gray: list[int] = []
+        rgb565 = bytearray(size * size * 2)
+        dst = 0
+        for src_px in range(0, size * size * 3, 3):
+            r, g, b = pixels[src_px], pixels[src_px + 1], pixels[src_px + 2]
+            gray.append((77 * r + 150 * g + 29 * b) >> 8)
+            color = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
+            rgb565[dst] = color >> 8
+            rgb565[dst + 1] = color & 0xFF
+            dst += 2
+        return CoverArt(size=size, bits=floyd_steinberg_1bit(gray, size, size), rgb565=bytes(rgb565))
+
+    def render_pause_chip(self, profile: RenderProfile) -> tuple[bytes, bytes, int, int]:
+        """Same contract as CoreTextFrameRenderer.render_pause_chip."""
+        font_name = self._role_font("label")
+        if profile.name == SQUARE_PROFILE.name:
+            size, pad_x, chip_h, rise = 11, 7, 16, 11
+        else:
+            size, pad_x, chip_h, rise = 13, 9, 20, 14
+        text = "PAUSED"
+        chip_w = int(self._line(text, size, font_name, TRACKING_MEGA).visual_width) + pad_x * 2
+        layers = []
+        for with_text in (True, False):
+            layer = self.Image.new("L", (chip_w, chip_h), 0)
+            prev_h = self._h
+            self._h = chip_h
+            try:
+                self._pill(layer, 0, 0, chip_w, chip_h)
+                if with_text:
+                    self._draw_text(
+                        layer, text, size, pad_x, rise, chip_w, "left",
+                        font_name=font_name, tracking=TRACKING_MEGA, gray=0.0,
+                    )
+            finally:
+                self._h = prev_h
+            layers.append(pack_1bpp(layer.tobytes(), chip_w, chip_h, chip_w))
+        return layers[0], layers[1], chip_w, chip_h
 
 
 class FallbackFrameRenderer(FrameRenderer):
@@ -3417,15 +4083,37 @@ class BoardAnnouncer:
             self.thread = None
 
 
-def build_renderer(font_name: str) -> FrameRenderer:
-    try:
-        return CoreTextFrameRenderer(font_name)
-    except ImportError as exc:
-        print(
-            f"Core Text renderer unavailable ({exc}); using geometry-only fallback "
-            "(rules/progress only, no text)"
-        )
-        return FallbackFrameRenderer()
+PILLOW_INSTALL_HINT = f"pip install -r \"{Path(__file__).resolve().parent / 'requirements-windows.txt'}\""
+
+
+def build_renderer(font_name: str, choice: str = "auto") -> FrameRenderer:
+    """Pick Core Text on macOS, the Pillow renderer elsewhere, geometry last.
+
+    ``choice`` forces one ("coretext", "pillow", "fallback"); a forced renderer
+    that cannot load is an error rather than a silent downgrade, because the
+    downgrade is a screen with no text on it.
+    """
+    if choice in ("auto", "coretext"):
+        try:
+            return CoreTextFrameRenderer(font_name)
+        except ImportError as exc:
+            if choice == "coretext":
+                raise SystemExit(f"Core Text renderer unavailable ({exc})")
+            print(f"Core Text renderer unavailable ({exc}); trying the Pillow renderer")
+    if choice in ("auto", "pillow"):
+        try:
+            renderer = PillowFrameRenderer()
+        except (ImportError, OSError, RuntimeError) as exc:
+            if choice == "pillow":
+                raise SystemExit(f"Pillow renderer unavailable ({exc}); run: {PILLOW_INSTALL_HINT}")
+            print(
+                f"Pillow renderer unavailable ({exc}); using geometry-only fallback "
+                f"(rules/progress only, no text). To fix: {PILLOW_INSTALL_HINT}"
+            )
+        else:
+            print("rendering with Pillow (HarfBuzz + FreeType)")
+            return renderer
+    return FallbackFrameRenderer()
 
 
 def default_db_path() -> str:
@@ -3491,7 +4179,7 @@ async def run(args: argparse.Namespace) -> None:
             if not re.fullmatch(r"[0-9a-fA-F]{64}", args.board_token):
                 raise ValueError("--board-token must be exactly 64 hexadecimal characters")
             identity = DaemonIdentity(identity.daemon_uuid, args.board_token)
-    daemon = LyricsDisplayDaemon(store, build_renderer(args.font),
+    daemon = LyricsDisplayDaemon(store, build_renderer(args.font, args.renderer),
                                  board_token=identity.token if identity else "",
                                  identity=identity, allow_legacy_proto1=args.allow_legacy_proto1)
     daemon_uuid = identity.daemon_uuid if identity else ""
@@ -3533,7 +4221,9 @@ async def run(args: argparse.Namespace) -> None:
     # covers that case on the next start.
     loop = asyncio.get_running_loop()
     stopping = loop.create_future()
-    for sig in (signal.SIGTERM, signal.SIGHUP):
+    # Windows has no SIGHUP, and its event loop cannot install handlers at all
+    # (NotImplementedError below); Ctrl+C still unwinds through the finally.
+    for sig in [s for s in (signal.SIGTERM, getattr(signal, "SIGHUP", None)) if s is not None]:
         try:
             loop.add_signal_handler(
                 sig, lambda: stopping.done() or stopping.set_result(None))
@@ -3558,6 +4248,13 @@ async def run(args: argparse.Namespace) -> None:
 
 
 def main() -> int:
+    # Windows writes a redirected stdout in the locale code page (cp1252/cp874),
+    # where the first Thai track title in a log line raises UnicodeEncodeError.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="backslashreplace")  # type: ignore[union-attr]
+        except (AttributeError, ValueError):
+            pass
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command")
 
@@ -3569,6 +4266,12 @@ def main() -> int:
         target.add_argument("--board-port", type=int, default=int(os.environ.get("G4PYS_LYRICS_BOARD_PORT", str(BOARD_PORT))))
         target.add_argument("--db", default=os.environ.get("G4PYS_LYRICS_DB", default_db_path()))
         target.add_argument("--font", default=os.environ.get("G4PYS_LYRICS_FONT", "Sukhumvit Set Semi Bold"))
+        target.add_argument(
+            "--renderer",
+            choices=RENDERER_CHOICES,
+            default=os.environ.get("G4PYS_LYRICS_RENDERER", "auto"),
+            help="frame renderer: auto (Core Text on macOS, else Pillow), or force one",
+        )
         target.add_argument("--mdns-instance", default=os.environ.get("G4PYS_LYRICS_MDNS_INSTANCE", "g4pys Lyrics Display"))
         target.add_argument("--board-token", default=os.environ.get("G4PYS_LYRICS_BOARD_TOKEN", ""))
         target.add_argument("--identity", default=os.environ.get("G4PYS_LYRICS_IDENTITY", str(default_identity_path())))
