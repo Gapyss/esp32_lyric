@@ -22,7 +22,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 EXT_DIR = ROOT / "browser_extension"
 DIST_DIR = ROOT / "dist"
-INCLUDE = ("manifest.json", "content_script.js", "popup.html", "popup.js", "README.md")
+INCLUDE = ("manifest.json", "content_script.js", "background.js", "popup.html", "popup.js", "README.md")
 
 
 def validate_manifest(ext_dir: Path) -> dict[str, object]:
@@ -37,6 +37,25 @@ def validate_manifest(ext_dir: Path) -> dict[str, object]:
     for rel in INCLUDE:
         if rel != "README.md" and not (ext_dir / rel).is_file():
             raise ValueError(f"extension file missing: {rel}")
+    # INCLUDE is an allow-list, so a newly referenced script is silently dropped
+    # from the zip unless someone remembers to add it here -- and the result is
+    # a manifest pointing at a file that is not in the package, which Chrome
+    # rejects at load time with nothing to say which file is missing. Derive the
+    # requirement from the manifest instead of trusting the list.
+    referenced = set()
+    worker = manifest.get("background", {}).get("service_worker")
+    if worker:
+        referenced.add(worker)
+    for entry in manifest.get("content_scripts", []):
+        referenced.update(entry.get("js", []))
+    action_popup = manifest.get("action", {}).get("default_popup")
+    if action_popup:
+        referenced.add(action_popup)
+    not_packaged = sorted(referenced - set(INCLUDE))
+    if not_packaged:
+        raise ValueError(
+            "manifest references file(s) that INCLUDE would not package: "
+            + ", ".join(not_packaged))
     return manifest
 
 

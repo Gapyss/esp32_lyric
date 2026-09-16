@@ -50,6 +50,9 @@ Features:
 
 Status: Implemented
 
+Serves the **ESP32 e-ink board**. The ESP8266 has its own forked copy — see
+"Standalone ESP8266 Lyrics Daemon" below.
+
 Files:
 
 - `daemon/lyrics_display_daemon.py`
@@ -78,6 +81,38 @@ Features:
 - Keeps per-profile frame caches; scheduled swaps render every active profile.
 - Uses Core Text rendering when PyObjC is available.
 - Uses a geometry-only fallback renderer when Core Text is unavailable.
+
+### Standalone ESP8266 Lyrics Daemon
+
+Status: Implemented
+
+A fork of the daemon above, so `esp8266/` can be split out with
+`git subtree split -P esp8266`. It is a copy, not a shared import: the ESP32
+e-ink board still speaks SEC2 to `daemon/lyrics_display_daemon.py`, so fixes
+wanted on both boards must be applied to both files.
+
+Files:
+
+- `esp8266/daemon/lyrics_display_daemon.py`
+- `esp8266/tests/test_lyrics_display_daemon.py`
+- `esp8266/browser_extension/`
+
+Features:
+
+- Everything the daemon above does; the render, store, and protocol code is identical.
+- Knocks `GET /usage?t=<epoch>` on the board every 60s (`BoardAnnouncer`), so the
+  board learns this Mac's IP from the request's source address and dials `:8766` back.
+- Replaces the `claudemeter_daemon.py` dependency: that Claude-usage poller was
+  previously the only thing making those requests, so a lyrics-only board needed it running.
+- Repeats the knock because the firmware forgets a Mac unseen for
+  `LYR_HOST_FRESH_MS` (10 minutes); `t=` drives the waiting screen's clock.
+- Defaults to `--no-mdns` (`--mdns` opts in) so it does not contest the
+  `_lyrics._tcp` instance name with the ESP32 daemon.
+- `--announce-url` targets a board that is not at `clawdmeter.local`;
+  `--no-announce` disables the knock.
+- Shares the lyrics cache at `~/.g4pys/lyrics-display.sqlite3` with the ESP32 daemon.
+- Loads the daemon by file path in tests, so the suite works both in this repo
+  and in the spun-off one.
 - Generates `LYR1` binary frame envelopes for the ESP32 board.
 - Sends full-frame updates and dirty-rectangle updates.
 - Schedules future lyric-line frames with relative `swapInMs`.
@@ -455,6 +490,7 @@ Status: Implemented
 Files:
 
 - `tests/test_lyrics_display_daemon.py`
+- `esp8266/tests/test_lyrics_display_daemon.py`
 
 Covered areas:
 

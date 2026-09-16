@@ -14,17 +14,17 @@ The device drives the LCD **and** serves a small web dashboard at the same URL,
 which is where you tend it: it has no buttons.
 
 ```
-lyrics daemon (lyrics_display_daemon.py --insecure)
-   └── WebSocket :8766 ──1-bit UI + RGB565 cover art──> ESP8266 lyrics screen
-
-claudemeter daemon (claudemeter_daemon.py)
-   └── HTTP POST /usage + /nowplaying ──> ESP8266   (teaches it the Mac's IP)
+lyrics daemon (esp8266/daemon/lyrics_display_daemon.py --insecure)
+   ├── WebSocket :8766 ──1-bit UI + RGB565 cover art──> ESP8266 lyrics screen
+   └── HTTP GET /usage every 60s ─────────────────────> ESP8266
+                                        (teaches it the Mac's IP; the board
+                                         dials :8766 back on its own)
 ```
 
 ### The screen
 
 The lyrics screen is rendered **entirely on the Mac** by
-`daemon/lyrics_display_daemon.py`: a Tend-color 240×240 UI with Core Text Thai
+`esp8266/daemon/lyrics_display_daemon.py`: a Tend-color 240×240 UI with Core Text Thai
 shaping, syllable karaoke, and real-color album covers, streamed to the panel
 frame by frame. There is no on-device now-playing renderer.
 
@@ -101,6 +101,59 @@ The credentials persist across reboots and OTA updates. If nobody finishes the
 portal within 3 minutes the device reboots and retries the saved network, so a
 temporary router outage just heals itself.
 
+**The WiFi watchdog.** `wm.autoConnect()` runs exactly once, in `setup()`, so
+until recently nothing re-read `WiFi.status()` afterwards: an association lost
+*after* boot parked the panel on `wifi lost` until someone power-cycled the box.
+`wifiWatchdogTick()` in `loop()` now closes that. Two stages, deliberately far
+apart (`WIFI_WATCHDOG_*` at the top of the sketch):
+
+| Down for | What happens |
+|---|---|
+| 30s | `WiFi.reconnect()`, repeated every 30s. Cheap and non-destructive — it does not clear credentials |
+| 10 min | `ESP.restart()`, which lands back in `setup()` and retries the saved network first |
+
+The 10-minute gap is the load-bearing number. A reboot lands in
+`wm.autoConnect()`, which *blocks* in the captive portal for
+`WIFI_PORTAL_TIMEOUT_S` (3 min) and then reboots again — so restarting eagerly
+would turn a fifteen-minute router outage into a hotspot loop that also puts
+`/update` out of reach. A screen reading `wifi lost` while the router comes back
+is the better failure.
+
+Two details that are easy to get wrong if you touch this:
+
+- The tick sits **below** the `if (otaInProgress) return;` line in `loop()`. A
+  WiFi hiccup mid-upload must never fire `reconnect()` — let alone
+  `ESP.restart()` — while `Update.write()` has the flash open. That is the same
+  reset-mid-flash hazard `backlightStopForFlash()` exists to prevent, on the one
+  operation that cannot be retried. Both OTA exit paths re-arm `wifiOkMs`, which
+  is otherwise as stale as the transfer was long.
+- Regaining the association calls `MDNS.notifyAPChange()`. Without it
+  `clawdmeter.local` stays dark for the rest of the session even though the box
+  answers on its IP — and that name is what the daemon's announce knock
+  resolves, so a silent SDK reconnect would still cost you the stream.
+
+**Reading the watchdog from the Mac.** None of its `Serial.println()` output is
+reachable — this board is updated over the air with no USB attached — and
+`ESP.getResetReason()` reports `Software/System restarted` for a watchdog reboot,
+`/restart` and `/wifi-reset` alike. So `/usage.json` carries three fields, and
+`tools/lyrics.sh status` prints them:
+
+| Field | Meaning |
+|---|---|
+| `wifidrops` | Associations lost since boot. Climbing steadily = a flapping link |
+| `wifidown` | Seconds since the association dropped; `0` while connected |
+| `mdnsok` | `0` if the last `notifyAPChange()` failed — `.local` may be dark, fall back to `--announce-url http://<ip>` |
+
+A `rst` of `Software/System restarted` with a low `up` **and** a non-zero
+`wifidrops` is the signature of a watchdog reboot rather than someone hitting
+`/restart`.
+
+One deliberate hole: any connected tick resets the clock, so a link that
+associates for a moment every 25 seconds keeps resetting it and never reaches
+the restart stage — `reconnect()` just fires forever. That is the intended
+trade (a flapping link is still a link, and rebooting into a 3-minute blocking
+portal would make it worse), and `wifidrops` is what makes it visible.
+
 **Automatic recovery:** if the device can't reach its saved network (new router,
 new password, moved house), it reopens the **Clawdmeter-setup** hotspot by
 itself on the next boot. No reflashing.
@@ -123,55 +176,142 @@ if the dashboard is out of reach. They reset-and-reboot rather than opening the
 portal in place: the portal blocks until someone finishes it, and running it
 from inside a request handler would take the web server down with it.
 
-### 4. Start the Mac daemons
-
-The lyrics screen needs **two** processes on the Mac. Start order doesn't
-matter.
+### 4. Start the Mac daemon
 
 ```sh
-# terminal 1 — renders the frames and serves this board on :8766
-python3 daemon/lyrics_display_daemon.py serve --insecure
-
-# terminal 2 — teaches the board where the Mac is (see below)
-CLAWDMETER_DEVICE_URL=http://clawdmeter.local \
-CLAWDMETER_DAILY_IMAGES=off \
-python3 daemon/claudemeter_daemon.py
+esp8266/tools/lyrics.sh
 ```
 
-**Why the third one?** The board is never told the Mac's address — it *learns*
-it from the source IP of a `/usage` or `/nowplaying` push, then dials back to
-port 8766. `claudemeter_daemon.py` is what makes those pushes, so without it the
-board sits on `waiting for lyrics` forever. Set `CLAWDMETER_DAILY_IMAGES=off`:
-this firmware has no comic/APOD screen and no `/daily` endpoint, so leaving it
-on just logs a failed push every 6 hours. Usage polling stays off by default and
-there's no usage screen here, but the numbers still show on the dashboard if you
-want them (`CLAWDMETER_USAGE_SOURCE=api`).
+That is the whole Mac side. It renders the frames, serves the board on `:8766`,
+and knocks on the board's `/usage` every 60s so it learns where the Mac is.
 
-**Why `--insecure`?** By default the lyrics daemon creates an identity and
-requires a mutual HMAC-SHA256 handshake (secure proto=2) — the scheme the ESP32
-e-ink board uses. The ESP8266 lacks the heap to buffer-and-verify a whole SEC2
-record on top of its framebuffer, so it speaks the unauthenticated proto=1
-instead. `--insecure` drops the identity, advertises `proto=1`, and streams
-unwrapped frames this board can render. (Or set `G4PYS_LYRICS_INSECURE=1`.)
-Without it the board can't complete the handshake and the panel just stays on
-the waiting screen.
+The script is a wrapper around one `python3` invocation, and it exists because
+three mistakes are always one keystroke away and all three produce the *same*
+useless symptom — a panel stuck on `waiting for lyrics` with nothing to say why.
+It refuses to start a second daemon on top of a running one, always passes
+`--insecure`, and reports what the board itself thinks before and after:
+
+```
+pre-flight
+  + clawdmeter.local resolves to 192.168.1.35
+  + board wifi GE v2 (-46 dBm) - streaming - heap 26k - up 0h33m - boot External System
+
+starting
+  + daemon up (pid 51114), logging to ~/Library/Logs/g4pys-lyrics-display.log
+
+waiting for the board
+  lyrics are on the panel.
+```
+
+It reports `lyrics are on the panel` in about 8 seconds, or tells you which link
+in the chain is broken. Two other verbs:
+
+```sh
+esp8266/tools/lyrics.sh status   # daemon up? extension attached? board streaming?
+esp8266/tools/lyrics.sh stop
+esp8266/tools/lyrics.sh start -f # foreground, if you want the output live
+```
+
+Everything after `start` is passed through to the daemon, so
+`esp8266/tools/lyrics.sh start --announce-url http://192.168.1.35` works. The
+underlying command is unchanged and still fine to run directly:
+
+```sh
+python3 esp8266/daemon/lyrics_display_daemon.py serve --insecure
+```
+
+> Run it that way and stdout is block-buffered into whatever you redirect to,
+> so `board announce reached …` and `board connected` will not appear in a log
+> file until the buffer fills. The script sets `PYTHONUNBUFFERED=1` for exactly
+> this reason — the log is the only record of why a run failed.
+
+**Why the knock?** The board is never told the Mac's address — it *learns* it
+from the source IP of a request to `/usage`, then dials that IP back on port
+8766. It also forgets a Mac it hasn't heard from in 10 minutes
+(`LYR_HOST_FRESH_MS` in `lyrics_stream.cpp`), which is why the knock repeats
+instead of firing once at startup. The `t=` parameter it carries is what drives
+the clock on the waiting screen.
+
+The announcer resolves `clawdmeter.local` **once**, with `gethostbyname`, and
+knocks the numeric address from then on. That is not premature tidying: the
+board publishes an A record and no AAAA, so the `getaddrinfo` that `urlopen`
+would otherwise do sits out the full mDNS IPv6 timeout before handing back the
+address it already had — measured at 5.01s per knock against 0.00s for
+`gethostbyname`. Worse, `urlopen`'s `timeout` covers socket operations but *not*
+name resolution, so `BOARD_ANNOUNCE_TIMEOUT_SECONDS` never bounded that wait.
+A failed knock drops the cached address, so a board that takes a new DHCP lease
+is picked up on the next cycle.
+
+If your board answers to something other than `clawdmeter.local`:
+
+```sh
+python3 esp8266/daemon/lyrics_display_daemon.py serve --insecure \
+  --announce-url http://192.168.1.35
+```
+
+`--no-announce` turns the knock off, for when something else is already pushing
+to the board's `/usage`.
+
+> There is no launchd plist pointing at `esp8266/daemon/`, by choice — the
+> daemon runs when you start it. After editing it, `tools/lyrics.sh stop` then
+> `tools/lyrics.sh` restarts it; `stop` keys off whatever holds `:8766` and
+> refuses to kill a process that isn't a lyrics daemon.
+>
+> The repo's older `clear_lyric_daemon.sh` still works but is the blunt version:
+> its `lyrics_display_daemon.py` pattern matches the ESP32 daemon too, so it
+> stops both, and it lives outside `esp8266/` so it does not come along in a
+> split. Prefer `tools/lyrics.sh stop`.
+
+> **This used to need `claudemeter_daemon.py` too.** That daemon polls Claude
+> usage and has nothing to do with lyrics; it was only ever here because its
+> HTTP pushes happened to teach the board the Mac's IP. The daemon now does its
+> own knock, so this board no longer depends on it. Nothing on this board draws
+> a usage screen — if you still want the dashboard's meters populated, running
+> `claudemeter_daemon.py` alongside remains optional and harmless.
+
+**Why `--insecure`?** By default the daemon creates an identity and requires a
+mutual HMAC-SHA256 handshake (secure proto=2) — the scheme the ESP32 e-ink
+board uses. The ESP8266 lacks the heap to buffer-and-verify a whole SEC2 record
+on top of its framebuffer, so it speaks the unauthenticated proto=1 instead.
+`--insecure` drops the identity, advertises `proto=1`, and streams unwrapped
+frames this board can render. (Or set `G4PYS_LYRICS_INSECURE=1`.) Without it the
+board can't complete the handshake and the panel stays on the waiting screen.
 
 There is no pairing step and no token on this link — the trade is LAN-link
 authentication for ~7 KB of heap, so run it on a trusted home network.
 
-> If you also run the ESP32 e-ink board, note that `--insecure` is process-wide
-> and there is one daemon: the e-ink board finds it over mDNS and dials the same
-> process, so turning the flag on for this box drops that board's authentication
-> too. Splitting them is not currently an escape — a second daemon has no way to
-> learn playback state, since the browser extension connects to one address.
-
-> The lyrics daemon has no launchd plist wired up — restart it by hand after
-> editing daemon code.
+> **Running this alongside the ESP32 e-ink board.** They are separate daemons
+> now (`daemon/` serves the e-ink board, `esp8266/daemon/` serves this one), but
+> they still default to the same ports and the same mDNS name. This fork
+> defaults to `--no-mdns` so it won't contest the `_lyrics._tcp` instance the
+> e-ink board browses for — Bonjour gives a contested name to the oldest holder,
+> which would otherwise feed the e-ink board this fork's `proto=1` record and
+> break its handshake.
+>
+> To run both at once, move the **ESP32** daemon, not this one. This board dials
+> a hardcoded port (`#define LYR_PORT 8766` in `lyrics_stream.cpp`) and there is
+> no way to tell it otherwise — it only ever learns an *address*, never a port.
+> The e-ink board reads its port out of the mDNS SRV record instead
+> (`r->port ? r->port : LYRICS_DAEMON_PORT`, `firmware/main/board_client.cpp`),
+> so it is the one that can move:
+>
+> ```sh
+> # this board — unchanged, on the ports it insists on
+> python3 esp8266/daemon/lyrics_display_daemon.py serve --insecure
+>
+> # the ESP32 e-ink daemon — moved out of the way
+> python3 daemon/lyrics_display_daemon.py serve --extension-port 8775 --board-port 8767
+> ```
+>
+> Then point the *root* `browser_extension/content_script.js` at the moved
+> daemon (`WS_URL` → `ws://127.0.0.1:8775/extension`) and load it as a second
+> unpacked extension; `esp8266/browser_extension/` stays on 8765 for this board.
+> Otherwise, run one or the other.
 
 ### 5. Play something
 
-Load the browser extension (`browser_extension/` → `chrome://extensions` →
-Developer mode → Load unpacked) and play a track in **YouTube Music**. It feeds
+Load the browser extension (`esp8266/browser_extension/` → `chrome://extensions`
+→ Developer mode → Load unpacked) and play a track in **YouTube Music**. It feeds
 title/artist/position to the lyrics daemon.
 
 Within a few seconds the panel switches from the waiting screen to the streamed
@@ -180,9 +320,14 @@ half is missing:
 
 | The panel says | What it means | Fix |
 |---|---|---|
-| `waiting for lyrics` | No Mac IP known yet, or the daemon is connected but idle between tracks | Start `claudemeter_daemon.py` (step 4) — that's what teaches the board the Mac's IP |
-| `reaching the lyrics daemon…` | Mac IP known, the socket won't come up | Start `lyrics_display_daemon.py serve --insecure`; check nothing is blocking `:8766` between Mac and board |
-| Streamed frames never appear, but the socket connects | The daemon is demanding a proto=2 handshake this board can't do | Restart it with `--insecure` — a bare `lyrics_display_daemon.py serve` won't talk to this board |
+| `waiting for lyrics` | No Mac IP known yet, **or** the daemon is connected but idle between tracks — the panel genuinely cannot tell these apart | `tools/lyrics.sh status` separates them: it checks for an established socket on `:8766` from the board and reports `connected, idle (nothing playing)` or `NOT connected (no Mac address known)` |
+| `reaching the lyrics daemon…` | Mac IP known, the socket won't come up | `tools/lyrics.sh start`; check nothing is blocking `:8766` between Mac and board |
+| Streamed frames never appear, but the socket connects | The daemon is demanding a proto=2 handshake this board can't do | `tools/lyrics.sh status` flags a daemon running without `--insecure`; restart it with the script |
+| `wifi lost` / `reconnecting` in place of the IP | The board dropped its association | Wait. The watchdog calls `WiFi.reconnect()` after 30s and keeps retrying; if the network is still gone after 10 minutes it reboots into `setup()`, which retries the saved network and only opens the setup hotspot if that fails too |
+
+`tools/lyrics.sh status` answers the same question from the Mac side, and covers
+the one case the panel cannot show you — that the daemon is up but running in
+the wrong mode.
 
 If the stream drops (Mac asleep, daemon stopped), the panel returns to the
 waiting screen within seconds and reconnects on its own when the daemon comes
@@ -201,6 +346,12 @@ there; the device flashes and reboots on its own.
 
 ## Source layout
 
+Everything this board needs lives under `esp8266/`. The one piece of state that
+sits outside it is the lyrics cache at `~/.g4pys/lyrics-display.sqlite3`
+(`--db` overrides it) — deliberately, so both boards share one cache and neither
+re-fetches from lrclib after the other already has. It is created on demand, so
+a fresh clone needs nothing seeded.
+
 ```
 esp8266/
 ├── clawdmeter_esp8266/
@@ -208,9 +359,56 @@ esp8266/
 │   ├── tend.h                   # shared Tend palette + the .ino/stream contract
 │   ├── lyrics_stream.cpp        # the lyrics screen: WS client for the lyrics daemon
 │   └── index_html_gz.h          # generated — gzipped dashboard served at /
+├── daemon/
+│   └── lyrics_display_daemon.py # renders the screen; knocks on /usage. The Mac side.
+├── browser_extension/           # feeds YouTube Music playback to the daemon
+├── tests/
+│   └── test_lyrics_display_daemon.py
 └── tools/
     └── gen_index_gz.py          # regenerate index_html_gz.h after editing INDEX_HTML
 ```
+
+Run the tests from the repo root:
+
+```sh
+python3 -m unittest discover -s esp8266/tests -t .
+```
+
+### This daemon is a fork, not a shared module
+
+`esp8266/daemon/lyrics_display_daemon.py` is a copy of
+`daemon/lyrics_display_daemon.py`, not an import of it. The ESP32 e-ink board
+still dials that other copy with the SEC2 handshake
+(`firmware/main/board_client.cpp`), and this tree has to stand alone so it can
+be split into its own repository. **A fix that matters to both boards has to be
+applied twice** — that is the accepted cost of the split.
+
+The two copies have already diverged in three ways, all in this one:
+
+| | `daemon/` (ESP32 e-ink) | `esp8266/daemon/` (here) |
+|---|---|---|
+| Board learns the daemon's address by | browsing `_lyrics._tcp` over mDNS | the `/usage` knock (`BoardAnnouncer`) |
+| mDNS advertising | on | **off** by default (`--mdns` opts in) |
+| Needs `claudemeter_daemon.py` | no | no (it used to) |
+
+### Splitting this into its own repo
+
+`esp8266/` is a clean subtree boundary, so history comes with it:
+
+```sh
+git subtree split -P esp8266 -b esp8266-only
+```
+
+Two things to fix in the new repo afterwards, neither of which blocks the split:
+
+- paths lose their `esp8266/` prefix (`esp8266/daemon/…` → `daemon/…`), so the
+  commands in this README and the `-s esp8266/tests` in the test invocation
+  shorten;
+- the 400×300 ESP32 e-ink render path (`WIDE_PROFILE`, `_draw_wide`,
+  `WIDE_PROGRESS_GEOM`, its cover placement) and the whole SEC2/identity/pairing
+  layer become dead code there, since this board uses neither. They are still
+  present and still work; deleting them is a separate cleanup, and doing it
+  *after* the split keeps this repo's e-ink board unaffected.
 
 ## Device HTTP API
 

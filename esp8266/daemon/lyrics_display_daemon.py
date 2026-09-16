@@ -1,22 +1,30 @@
 #!/usr/bin/env python3
-"""Local daemon for the browser-extension synced-lyrics display design.
+"""Standalone lyrics daemon for the ESP8266 board. Runs the whole screen.
 
-This is the first implementation slice for lyrics-display-design.md:
+This is the ESP8266 fork of the daemon. It is deliberately a *copy* of
+``daemon/lyrics_display_daemon.py`` rather than a shared import: the ESP32
+e-ink board still speaks the SEC2 handshake against that one, and this tree is
+meant to be split out into its own repository with nothing left behind. Fixes
+worth having on both boards have to be carried across by hand -- that is the
+accepted cost of the split, not an oversight.
+
+What it does:
 
 - listens for the browser extension on localhost WebSocket port 8765;
 - tracks playback using extension ticks plus local interpolation;
 - resolves lyrics through manual/cache SQLite rows, then lrclib;
-- renders a full 400x300 1-bpp frame on macOS with Core Text when available;
+- renders 1-bpp frames on macOS with Core Text when available;
 - exposes a board-facing WebSocket on port 8766 and sends self-describing
   binary framebuffer envelopes;
-- advertises the board endpoint as _lyrics._tcp through a stdlib mDNS responder
-  with dns-sd fallback.
+- knocks on the board's /usage endpoint so it learns this Mac's address
+  (BoardAnnouncer). This is what makes the daemon standalone: the board has no
+  configured daemon address and learns it from the source IP of that request.
+  In the ESP32 repo the knock was a side effect of claudemeter_daemon.py, so a
+  lyrics-only board needed an unrelated Claude-usage daemon running to work.
 
-This copy serves the ESP32 e-ink board (firmware/main/board_client.cpp, SEC2
-handshake). The ESP8266 has a forked copy at esp8266/daemon/, split off so that
-tree can become its own repository; it adds a /usage knock so its board learns
-this Mac's IP without claudemeter_daemon.py, and defaults mDNS off. The two do
-not share code -- a fix that matters to both boards has to be applied twice.
+mDNS advertising is off by default here (--mdns opts back in): this board is
+found by the knock, not by browsing, and advertising would contest the
+_lyrics._tcp instance name with the ESP32 repo's daemon.
 """
 
 from __future__ import annotations
@@ -70,6 +78,12 @@ LRCLIB_MAX_RETRY_AFTER_SECONDS = 10.0
 LRCLIB_USER_AGENT = "g4pys-lyrics-display/0.1"
 MIN_SCHEDULE_SWAP_MS = 25
 ALBUM_ART_INTRO_SECONDS = 5.0
+# The board learns this Mac's address from the source IP of an HTTP request to
+# its /usage endpoint (see BoardAnnouncer). Its firmware ages that host out
+# after LYR_HOST_FRESH_MS -- 10 minutes -- so knock well inside that window.
+BOARD_ANNOUNCE_URL = "http://clawdmeter.local"
+BOARD_ANNOUNCE_INTERVAL_SECONDS = 60.0
+BOARD_ANNOUNCE_TIMEOUT_SECONDS = 3.0
 MDNS_GROUP = "224.0.0.251"
 MDNS_PORT = 5353
 FRAME_ENVELOPE_MAGIC = b"LYR1"
@@ -3286,6 +3300,123 @@ class DnsSdAdvertiser:
         self.proc = None
 
 
+class BoardAnnouncer:
+    """Teach the ESP8266 where this Mac is by knocking on its /usage endpoint.
+
+    The board is never configured with the daemon's address. It learns it from
+    the *source IP* of an inbound HTTP request -- handleUsage() in the sketch
+    calls lyricsStreamNoteHost(server.client().remoteIP()) -- and then dials
+    that IP back on the board port. Until something knocks, the panel sits on
+    "waiting for lyrics" forever.
+
+    In the ESP32 repo that knock was a side effect of claudemeter_daemon.py
+    pushing Claude usage numbers, which made a lyrics-only board depend on an
+    unrelated daemon. Doing it here instead is what makes this daemon standalone.
+
+    Two details the firmware imposes:
+
+    - The board ages the host out after LYR_HOST_FRESH_MS (10 minutes, see
+      lyrics_stream.cpp) and stops dialing, so this has to repeat rather than
+      fire once at startup. The default interval leaves a wide margin.
+    - ``t`` is the Unix epoch, which drives the clock on the waiting screen.
+      Everything else handleUsage() reads is optional -- it applies only the
+      args that are present -- so a bare knock plus the time is enough.
+    """
+
+    def __init__(self, url: str, interval: float = BOARD_ANNOUNCE_INTERVAL_SECONDS) -> None:
+        self.url = url.rstrip("/")
+        self.interval = interval
+        self.stop_event = threading.Event()
+        self.thread: threading.Thread | None = None
+        self.reachable: bool | None = None  # None = nothing tried yet
+        parsed = urlparse(self.url)
+        self.scheme = parsed.scheme or "http"
+        self.host = parsed.hostname or ""
+        self.port = parsed.port
+        self.address: str | None = None  # numeric IP, resolved once and reused
+
+    def start(self) -> None:
+        self.thread = threading.Thread(target=self._serve, name="lyrics-announce", daemon=True)
+        self.thread.start()
+        print(f"board announce: {self.url}/usage every {self.interval:g}s")
+
+    def _resolve(self) -> str | None:
+        """Turn the board's host into a numeric IPv4 address.
+
+        gethostbyname deliberately, rather than leaving it to the getaddrinfo
+        that urlopen would do for us. The board publishes an A record and no
+        AAAA, so a getaddrinfo for ``clawdmeter.local`` sits out the full mDNS
+        IPv6 timeout before handing back the address it already had: measured at
+        5.01s per call against 0.00s for gethostbyname, which is IPv4-only and
+        never asks for AAAA. Knocking the name directly therefore parked this
+        thread for five seconds every cycle -- and because urlopen's ``timeout``
+        covers socket operations but *not* name resolution,
+        BOARD_ANNOUNCE_TIMEOUT_SECONDS never bounded that wait. Resolving here
+        and dialing the numeric address is what makes the timeout mean what it
+        says. A literal IP in --announce-url passes through unchanged.
+        """
+        if not self.host:
+            return None
+        try:
+            return socket.gethostbyname(self.host)
+        except OSError:
+            return None
+
+    def _target(self, address: str) -> str:
+        netloc = f"{address}:{self.port}" if self.port else address
+        return f"{self.scheme}://{netloc}/usage?t={int(time.time())}"
+
+    def _fail(self, detail: str) -> None:
+        # Drop the cached address as well as flagging the failure: the board may
+        # have taken a new DHCP lease, in which case re-resolving next cycle is
+        # exactly what recovers us. Costs one name lookup per failed cycle and
+        # nothing at all while the knock is landing.
+        self.address = None
+        if self.reachable is not False:
+            print(f"board announce failed ({self.url}): {detail}")
+        self.reachable = False
+
+    def _announce_once(self) -> None:
+        # The board reads our source IP off this connection, so the request only
+        # has to arrive -- the response body is irrelevant.
+        if self.address is None:
+            self.address = self._resolve()
+            if self.address is None:
+                self._fail(f"cannot resolve {self.host!r}")
+                return
+        target = self._target(self.address)
+        try:
+            request = urllib.request.Request(target, method="GET")
+            with urllib.request.urlopen(request, timeout=BOARD_ANNOUNCE_TIMEOUT_SECONDS):
+                pass
+        except Exception as exc:
+            # Deliberately broad. The obvious cases are URLError/OSError from an
+            # unplugged board or a just-woken Mac, but a heap-starved ESP8266 can
+            # also answer with a truncated or malformed response, which surfaces
+            # as http.client.HTTPException -- not an OSError. Letting that escape
+            # would kill the announce thread outright: the board would forget
+            # this Mac after LYR_HOST_FRESH_MS and the panel would drop back to
+            # the waiting screen with nothing in the log to explain why. A daemon
+            # meant to run unattended has to treat a bad answer like no answer.
+            self._fail(repr(exc))
+            return
+        if self.reachable is not True:
+            print(f"board announce reached {self.url} at {self.address} "
+                  "(it now knows this Mac's address)")
+        self.reachable = True
+
+    def _serve(self) -> None:
+        while not self.stop_event.is_set():
+            self._announce_once()
+            self.stop_event.wait(self.interval)
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        if self.thread is not None:
+            self.thread.join(timeout=BOARD_ANNOUNCE_TIMEOUT_SECONDS + 1)
+            self.thread = None
+
+
 def build_renderer(font_name: str) -> FrameRenderer:
     try:
         return CoreTextFrameRenderer(font_name)
@@ -3392,6 +3523,10 @@ async def run(args: argparse.Namespace) -> None:
         advertiser.start()
         if legacy_advertiser is not None:
             legacy_advertiser.start()
+    announcer = (None if args.no_announce
+                 else BoardAnnouncer(args.announce_url, args.announce_interval))
+    if announcer is not None:
+        announcer.start()
     # SIGTERM and SIGHUP (closed terminal) otherwise kill us outright, skipping
     # the finally below and orphaning the dns-sd child. Turn them into a normal
     # unwind so stop() runs. SIGKILL still can't be caught -- _reap_stale_dns_sd
@@ -3418,6 +3553,8 @@ async def run(args: argparse.Namespace) -> None:
         advertiser.stop()
         if legacy_advertiser is not None:
             legacy_advertiser.stop()
+        if announcer is not None:
+            announcer.stop()
 
 
 def main() -> int:
@@ -3442,7 +3579,29 @@ def main() -> int:
                             help="run with no board identity: boards connect unauthenticated "
                                  "(proto=1, unwrapped frames, no pairing token). Needed for the "
                                  "ESP8266, which lacks the heap for the SEC2 record layer.")
-        target.add_argument("--no-mdns", action="store_true", default=os.environ.get("G4PYS_LYRICS_NO_MDNS") == "1")
+        # Unlike the ESP32 e-ink board, the ESP8266 never browses for the
+        # daemon -- it dials the IP it learned from the announce knock. The
+        # advertiser is therefore dead weight here, and worse: it registers the
+        # same _lyrics._tcp instance name as the ESP32 repo's daemon, and
+        # Bonjour hands a contested name to the oldest holder. Running both
+        # daemons with mDNS on makes the e-ink board read this fork's proto=1
+        # TXT record and refuse the handshake. Default it off; --mdns opts in.
+        target.add_argument("--mdns", dest="no_mdns", action="store_false",
+                            default=os.environ.get("G4PYS_LYRICS_NO_MDNS", "1") != "0",
+                            help="advertise _lyrics._tcp over mDNS (off by default: this "
+                                 "board is found by the announce knock, not by browsing)")
+        target.add_argument("--no-mdns", dest="no_mdns", action="store_true")
+        target.add_argument("--announce-url",
+                            default=os.environ.get("G4PYS_LYRICS_ANNOUNCE_URL", BOARD_ANNOUNCE_URL),
+                            help="board base URL to knock on so it learns this Mac's IP "
+                                 f"(default {BOARD_ANNOUNCE_URL})")
+        target.add_argument("--announce-interval", type=float,
+                            default=float(os.environ.get("G4PYS_LYRICS_ANNOUNCE_INTERVAL",
+                                                         str(BOARD_ANNOUNCE_INTERVAL_SECONDS))),
+                            help="seconds between knocks; the board forgets this Mac after 10 minutes")
+        target.add_argument("--no-announce", action="store_true",
+                            default=os.environ.get("G4PYS_LYRICS_NO_ANNOUNCE") == "1",
+                            help="do not knock on the board (something else pushes to its /usage)")
 
     import_parser = subparsers.add_parser("import-lrc", help="import one or more .lrc files as manual lyrics")
     import_parser.add_argument("files", nargs="+")

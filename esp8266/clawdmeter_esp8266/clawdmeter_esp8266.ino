@@ -12,6 +12,13 @@
 
 ESP8266WebServer server(80);
 
+// Firmware version. Single source of truth: it is published as "fw" in
+// /usage.json, and both the dashboard and the OTA page read it from there
+// rather than carrying their own copy -- a second literal in the HTML would
+// be gzipped into index_html_gz.h and drift silently. Bumping this line is
+// the whole change.
+#define FW_VERSION "1.0.0"
+
 // --- GeekMagic HelloCubic Lite / SmallTV-Ultra: ESP8266 + ST7789 240x240 ---
 // Pins/SPI mirror the GeekMagic open firmware. CS is tied to GND, the backlight
 // is ACTIVE LOW (GPIO5 LOW = on), and the panel needs SPI mode 3.
@@ -99,6 +106,37 @@ static void applyBrightness(uint8_t brightness, bool persist) {
 // the box opens this hotspot and runs a captive setup portal on it; see setup().
 #define WIFI_SETUP_AP "Clawdmeter-setup"
 #define WIFI_PORTAL_TIMEOUT_S 180   // give up, reboot, and retry the saved network
+
+// WiFi watchdog. autoConnect() runs exactly once, in setup(); before this,
+// nothing in loop() ever re-read WiFi.status(), so an association lost *after*
+// boot -- router reboot, channel change, a weak-signal eviction -- parked the
+// panel on "wifi lost" until somebody power-cycled the box. Every other recovery
+// path in this firmware is automatic; this one was a hole.
+//
+// Two stages, deliberately far apart:
+//
+//   reconnect()   cheap, non-destructive (wifi_station_disconnect + connect; it
+//                 does NOT clear credentials), so it fires early and repeats.
+//   ESP.restart() held back a long way on purpose. A reboot lands in
+//                 wm.autoConnect(), which BLOCKS in the captive portal for
+//                 WIFI_PORTAL_TIMEOUT_S and then reboots again. Restart eagerly
+//                 and a fifteen-minute router outage becomes a hotspot loop that
+//                 also puts /update out of reach -- strictly worse than a screen
+//                 that says "wifi lost" until the router comes back.
+#define WIFI_WATCHDOG_RECONNECT_MS  (30UL * 1000UL)         // down this long -> reconnect()
+#define WIFI_WATCHDOG_RETRY_MS      (30UL * 1000UL)         // ... and again this often
+#define WIFI_WATCHDOG_RESTART_MS    (10UL * 60UL * 1000UL)  // still down -> ESP.restart()
+
+static unsigned long wifiOkMs = 0;         // millis() of the last confirmed association
+static unsigned long wifiNextRetryMs = 0;  // next reconnect() attempt, 0 = none pending
+static bool wifiWasDown = false;           // edge flag: drives the log and the mDNS refresh
+// Surfaced in /usage.json, because none of the watchdog's Serial output is
+// reachable: this board is updated over the air with no USB attached, and a
+// watchdog reboot is indistinguishable from any other -- ESP.getResetReason()
+// says "Software/System restarted" for /restart and /wifi-reset too. Without
+// these two counters "it rebooted at some point" is all anyone could ever learn.
+static unsigned long wifiDrops = 0;        // associations lost since boot
+static bool wifiMdnsRefreshOk = true;      // did the last notifyAPChange() take?
 
 // Latest usage, pushed by the daemon. -1 = no data yet.
 int sessionPct = -1;            // 5-hour utilization %
@@ -193,7 +231,7 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
 </style></head><body>
 <main>
 <header>
-  <div><div class="eb">tend &middot; lyrics display</div><h1>clawdmeter</h1></div>
+  <div><div class="eb">tend &middot; lyrics display</div><h1>clawdmeter <span class="mut mono" id="fw" style="font-size:13px;font-weight:400"></span></h1></div>
   <div class="status"><span class="dot" id="dot"></span><span class="mut" id="status">connecting</span></div>
 </header>
 <section class="card">
@@ -310,6 +348,7 @@ async function tick(){
     $('heap').textContent=Math.round(d.heap/1024)+'k';
     $('up').textContent=upText(d.up);
     $('rst').textContent=d.rst||'--';
+    $('fw').textContent=d.fw||'';
     if(!blBusy&&d.bl>=0){$('bl').value=d.bl;$('blV').textContent=d.bl}
   }catch(e){st.textContent='device unreachable';dot.className='dot hot'}
   ticking=false;
@@ -340,12 +379,13 @@ const char UPDATE_HTML[] PROGMEM = R"HTML(
   button:hover{border-color:var(--ember)}
   code{color:var(--ink)}
 </style></head><body><main>
-<h1>firmware update</h1>
+<h1>firmware update <span id="fw" style="color:var(--mut);font-size:13px;font-weight:400"></span></h1>
 <p>upload only <code>clawdmeter_esp8266.ino.bin</code> · close dashboard tabs and stop the daemon while updating</p>
 <form method="POST" action="/update" enctype="multipart/form-data">
   <input type="file" name="firmware" accept=".bin,.bin.gz" required>
   <button type="submit">update firmware</button>
 </form>
+<script>fetch("/usage.json",{cache:"no-store"}).then(function(r){return r.json()}).then(function(d){document.getElementById("fw").textContent=d.fw||""}).catch(function(_){})</script>
 <p>the device reboots after a successful upload · if the browser disconnects, wait 20 seconds and reopen the dashboard</p>
 </main></body></html>
 )HTML";
@@ -452,11 +492,19 @@ void handleUsageJson() {
              ",\"ip\":\"" + WiFi.localIP().toString() + "\"" +
              ",\"rssi\":" + String(WiFi.isConnected() ? WiFi.RSSI() : 0) +
              ",\"wifi\":" + String(WiFi.isConnected() ? 1 : 0) +
+             // Watchdog state. wifidown counts seconds since the association
+             // dropped (0 while up), so "rst":"Software/System restarted" with a
+             // low "up" plus a non-zero wifidrops reads as a watchdog reboot
+             // rather than someone hitting /restart.
+             ",\"wifidrops\":" + String(wifiDrops) +
+             ",\"wifidown\":" + String(WiFi.isConnected() ? 0UL : (millis() - wifiOkMs) / 1000UL) +
+             ",\"mdnsok\":" + String(wifiMdnsRefreshOk ? 1 : 0) +
              ",\"bl\":" + String(lcdBrightness) +
              ",\"heap\":" + String(ESP.getFreeHeap()) +
              ",\"now\":" + String(nowEpoch()) +
              ",\"rst\":\"" + bootReason + "\"" +
              ",\"rinfo\":\"" + jsonEscape(bootInfo) + "\"" +
+             ",\"fw\":\"" FW_VERSION "\"" +
              ",\"up\":" + String(millis() / 1000) +
              ",\"age\":" + String(age) + "}";
   server.sendHeader("Cache-Control", "no-store");
@@ -804,6 +852,12 @@ void handleUpdateDone() {
     otaInProgress = false;
     otaUpdateOk = false;
     WiFi.setSleepMode(WIFI_MODEM_SLEEP);
+    // The watchdog was parked above the OTA return for the whole upload, so its
+    // last good timestamp is now as old as the transfer. Re-arm it here or a
+    // long upload that ends with the link down would satisfy the restart stage
+    // on the very first tick after OTA, rebooting instead of trying reconnect().
+    wifiOkMs = millis();
+    wifiNextRetryMs = 0;
     musicScreenBegin();
     return;
   }
@@ -852,11 +906,68 @@ void handleFirmwareUpload() {
     otaInProgress = false;
     otaUpdateOk = false;
     WiFi.setSleepMode(WIFI_MODEM_SLEEP);
+    wifiOkMs = millis();   // same re-arm as handleUpdateDone(); see the note there
+    wifiNextRetryMs = 0;
     setBacklight(lcdBrightness);   // OTA failed, no reboot: restore the live PWM level
     drawOtaStatus("aborted");
   }
 
   yield();
+}
+
+// Watch the association and claw it back. Called from loop() and ONLY outside
+// OTA -- see the call site for why that matters. Nothing here paints: the music
+// screen's own tick reads WiFi.isConnected() and repaints the address block when
+// the state changes, so the watchdog stays a pure network concern.
+static void wifiWatchdogTick() {
+  const unsigned long now = millis();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    // Any connected tick resets the clock, which means a link that associates
+    // for a moment every 25s keeps resetting it and never reaches the restart
+    // stage -- reconnect() just fires forever. That is the intended trade: a
+    // flapping link is still a link, and rebooting into a 3-minute blocking
+    // portal would make it worse. wifidrops in /usage.json is what makes the
+    // situation visible; a number climbing steadily is a flapping link.
+    wifiOkMs = now;
+    wifiNextRetryMs = 0;
+    if (wifiWasDown) {
+      wifiWasDown = false;
+      // The responder was bound to an address that just went away and came
+      // back. Without this, clawdmeter.local stays dark for the rest of the
+      // session even though the box answers fine on its IP -- and that name is
+      // exactly what the daemon's announce knock resolves, so a silent SDK
+      // reconnect would otherwise still cost us the lyrics stream.
+      wifiMdnsRefreshOk = MDNS.notifyAPChange();
+      Serial.print("wifi back: ");
+      Serial.println(WiFi.localIP());
+    }
+    return;
+  }
+
+  if (!wifiWasDown) {
+    wifiWasDown = true;
+    wifiDrops++;
+    Serial.println("wifi lost; watchdog armed");
+    // wifiOkMs is deliberately left alone: it holds the last good tick, which is
+    // the instant both stages below are measured from.
+  }
+
+  if (now - wifiOkMs >= WIFI_WATCHDOG_RESTART_MS) {
+    // Out of cheap options. Reboot into setup(), which retries the saved network
+    // first and only opens the portal if that fails -- so a network that came
+    // back during the outage is simply rejoined.
+    Serial.println("wifi down too long; restarting");
+    ESP.restart();
+    return;
+  }
+
+  if (now - wifiOkMs >= WIFI_WATCHDOG_RECONNECT_MS &&
+      (wifiNextRetryMs == 0 || (long)(now - wifiNextRetryMs) >= 0)) {
+    wifiNextRetryMs = now + WIFI_WATCHDOG_RETRY_MS;
+    Serial.println("wifi watchdog: reconnect()");
+    WiFi.reconnect();
+  }
 }
 
 void setup() {
@@ -910,6 +1021,17 @@ void setup() {
   Serial.print("Connected: http://");
   Serial.println(WiFi.localIP());
 
+  // Let the SDK try to re-associate on its own before the watchdog's coarser
+  // 30s reconnect() ever gets a turn. Never called anywhere before this, so the
+  // setting was whatever WiFiManager happened to leave behind.
+  WiFi.setAutoReconnect(true);
+  // Arm the watchdog from here, not from the zero-initialised global: leaving it
+  // at 0 would make the first tick measure the drop from boot and, on a box that
+  // took a while in the portal, trip the restart stage immediately.
+  wifiOkMs = millis();
+  wifiNextRetryMs = 0;
+  wifiWasDown = false;
+
   // Let the radio idle between AP beacons instead of full active RX. Combined with
   // the delay() in loop() (which yields to the SDK), average WiFi current drops a
   // lot -> the ESP8266 runs cooler. CPU stays on, so the web server stays responsive.
@@ -956,6 +1078,12 @@ void loop() {
     delay(2);
     return;
   }
+
+  // Strictly below the OTA return. A WiFi hiccup mid-upload must not be allowed
+  // to fire reconnect() -- let alone ESP.restart() -- while Update.write() has
+  // the flash open: that is the same reset-mid-flash hazard backlightStopForFlash()
+  // exists to prevent, on the one operation that cannot be retried.
+  wifiWatchdogTick();
 
   // The one screen, millis()-polled from here (never a timer ISR, so nothing
   // fights the WiFi/TCP stack and no IRAM is spent).
