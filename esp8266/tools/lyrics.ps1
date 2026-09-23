@@ -167,10 +167,33 @@ function Invoke-Stop {
 }
 
 # Windows PowerShell 5.1 turns any stderr from a native command into a
-# terminating error under ErrorActionPreference=Stop, so relax it for the probe.
+# terminating error under ErrorActionPreference=Stop, so relax it for the probes.
+# Both seed $LASTEXITCODE first: if the command cannot launch at all, PowerShell
+# raises instead of setting it, and the stale value from whatever ran last would
+# otherwise be read as the probe's answer.
+
+# Does an interpreter actually run, and is it new enough for the renderer wheels?
+# Get-Command is not enough: Windows keeps a python.exe App Execution Alias on
+# PATH that only opens the Microsoft Store, so a box with no Python at all still
+# resolves the name. Without this, both cases fell through to the package probe
+# below and were reported as "packages are missing" -- sending someone to pip
+# when the actual fix is installing Python.
+# The version gate is Python's own exit code, not string parsing here: anything
+# this returns other than 0 or 3 means no usable interpreter ran at all.
+function Test-Python {
+    $ErrorActionPreference = 'Continue'
+    $global:LASTEXITCODE = 9009
+    $probe = 'import sys; sys.stdout.write("%d.%d" % sys.version_info[:2]); sys.exit(0 if sys.version_info >= (3, 10) else 3)'
+    $version = & $PyExe @PyArgs -c $probe 2>$null
+    if ($LASTEXITCODE -eq 0) { return @{ Ok = $true; TooOld = $false; Version = [string]$version } }
+    if ($LASTEXITCODE -eq 3) { return @{ Ok = $false; TooOld = $true; Version = [string]$version } }
+    return @{ Ok = $false; TooOld = $false; Version = $null }
+}
+
 function Test-RendererPackages {
     $ErrorActionPreference = 'Continue'
-    & $PyExe @PyArgs -c 'import PIL, uharfbuzz, freetype' 2>&1 | Out-Null
+    $global:LASTEXITCODE = 9009
+    $null = & $PyExe @PyArgs -c 'import PIL, uharfbuzz, freetype' 2>$null
     return ($LASTEXITCODE -eq 0)
 }
 
@@ -199,6 +222,22 @@ function Invoke-Start([string[]]$argv) {
     if (-not $Daemon) { Bad 'daemon not found next to this script (..\daemon\lyrics_display_daemon.py)'; return 1 }
 
     Head 'pre-flight'
+    $python = Test-Python
+    # The renderer wheels need 3.10+, so an older Python fails `pip install` with
+    # "no matching distribution" -- name that here rather than at the package probe.
+    if ($python.TooOld) {
+        Bad "Python $($python.Version) is too old -- the renderer packages need 3.10 or newer"
+        Note 'install a newer Python from python.org, or set G4PYS_LYRICS_PYTHON to one'
+        return 1
+    }
+    if (-not $python.Ok) {
+        Bad "'$PyExe $($PyArgs -join ' ')' did not run -- Python is not installed"
+        Note 'install Python 3.10 or newer from python.org, ticking "Add python.exe to PATH"'
+        Note 'a python.exe that only opens the Microsoft Store is the placeholder, not an install'
+        Note 'or point G4PYS_LYRICS_PYTHON at an interpreter'
+        return 1
+    }
+    Good "Python $($python.Version)"
     if (-not (Test-RendererPackages)) {
         Bad "the Pillow renderer's packages are missing -- the panel would show no text"
         $req = Join-Path (Split-Path $Daemon) 'requirements-windows.txt'
