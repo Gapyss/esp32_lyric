@@ -315,50 +315,19 @@ authentication for ~7 KB of heap, so run it on a trusted home network.
 The same daemon runs on Windows 10/11. On a Mac it draws the screen with Core
 Text; anywhere else it switches to a Pillow renderer that draws the identical
 Tend layout, with HarfBuzz for Thai shaping, FreeType for the glyphs and the
-ICU that Windows ships (`icu.dll`) for Thai word breaks. The fonts come with it
+ICU that Windows ships for Thai word breaks. The fonts come with it
 (`daemon/assets/fonts/`: IBM Plex Sans Thai + IBM Plex Mono, OFL), because
 Sukhumvit Set exists only on macOS.
 
-1. Install **Python 3.10 or newer** from python.org (tick *Add python.exe to
-   PATH*; the `py` launcher comes with it).
-2. Install the renderer's three packages. All of them ship their native
-   libraries inside the wheel, so nothing else needs installing:
-
-   ```powershell
-   py -3 -m pip install -r esp8266\daemon\requirements-windows.txt
-   ```
-
-3. Load `esp8266\browser_extension\` into Chrome or Edge as an unpacked
-   extension, exactly as on the Mac.
-4. Start it:
-
-   ```powershell
-   powershell -ExecutionPolicy Bypass -File esp8266\tools\lyrics.ps1
-   ```
-
-`lyrics.ps1` is the PowerShell twin of `lyrics.sh`: same `start` / `start -f` /
-`status` / `stop` verbs, same guards (refuses a second daemon on `:8766`,
-always passes `--insecure`, prints the board's own `lyr`/wifi/heap), and it
-also refuses to start if the renderer packages are missing, since a daemon
-without them would stream a screen with no text on it. The log goes to
-`%LOCALAPPDATA%\g4pys\lyrics-display.log`. The direct command still works:
+**See [docs/windows-setup.md](../docs/windows-setup.md)** for the full walkthrough:
+installing Python and the three renderer packages, `tools\lyrics.ps1`, the
+Windows Firewall rule the board's inbound dial needs, and what each pre-flight
+message means. The short version:
 
 ```powershell
-py -3 esp8266\daemon\lyrics_display_daemon.py serve --insecure
+py -3 -m pip install -r esp8266\daemon\requirements-windows.txt
+powershell -ExecutionPolicy Bypass -File esp8266\tools\lyrics.ps1
 ```
-
-**Windows Firewall is the Windows-only way to end up stuck on "waiting for
-lyrics".** The board dials *in* to the PC on TCP 8766, so the first start
-raises a firewall prompt. Allow **Private networks**, and make sure the WiFi
-network is set to *Private* rather than *Public*. If you dismissed the prompt,
-add the rule from an administrator PowerShell:
-
-```powershell
-New-NetFirewallRule -DisplayName "Clawdmeter lyrics" -Direction Inbound -Protocol TCP -LocalPort 8766 -Action Allow -Profile Private
-```
-
-The symptom is a log with `board announce reached …` and never a
-`board connected` line: the knock gets out, the board's dial back is dropped.
 
 Everything else carries over unchanged: `--announce-url http://<ip>` when
 `clawdmeter.local` doesn't resolve, the shared cache (here

@@ -1538,14 +1538,27 @@ class PillowRendererTests(unittest.TestCase):
                 if len(graphemes) > 2:  # a lone cluster may overflow; anything longer must fit
                     self.assertLessEqual(self.renderer._text_width(row.rstrip(), size, "display"), width, row)
 
-    def test_karaoke_fill_changes_the_frame(self) -> None:
+    def test_karaoke_fill_changes_the_lyric_band(self) -> None:
+        # Slice to the lyric band before comparing. Asserting on the whole frame
+        # passes on the elapsed-time label alone ("0:00" vs "0:03"), so it would
+        # stay green with the karaoke fill removed entirely. Compare *which*
+        # pixels moved rather than how many are lit: hollowing a glyph trades
+        # interior pixels for outline pixels, so the lit count barely moves
+        # (1590 -> 1446 here) while ~730 bits change position.
         state = self._playing_state("hollow until it is sung")
         profile = lyrics_display_daemon.SQUARE_PROFILE
-        state.clock.update(0.2, True, 1.0)
-        early = self.renderer.render(state, profile)
+        stride = (profile.width + 7) // 8
+        band = slice(profile.lyric_sizes.band_top_y * stride,
+                     profile.lyric_band_bottom_y * stride)
+        state.clock.update(0.2, True, 1.0)  # paused: interpolation frozen, so this is exact
+        early = self.renderer.render(state, profile)[band]
         state.clock.update(3.8, True, 1.0)
-        late = self.renderer.render(state, profile)
+        late = self.renderer.render(state, profile)[band]
         self.assertNotEqual(early, late)
+        # Guard the size of the change too, so a stray antialiased pixel cannot
+        # stand in for the fill. Measured 730 on Pillow, 432 on Core Text.
+        moved = _lit(bytes(a ^ b for a, b in zip(early, late)))
+        self.assertGreater(moved, 100, f"only {moved} bits moved: karaoke fill is not drawing")
 
     def test_decode_cover_matches_the_core_text_contract(self) -> None:
         from PIL import Image

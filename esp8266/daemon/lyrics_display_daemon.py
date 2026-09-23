@@ -154,6 +154,9 @@ BRAND_FONT_NAMES = {
     "label": "Sukhumvit Set Semi Bold",
 }
 MONO_FONT_NAME = "Menlo"
+# The --font default. Named so build_renderer can tell an explicit --font from an
+# untouched default and warn only about the former (the Pillow renderer ignores it).
+DEFAULT_FONT_NAME = "Sukhumvit Set Semi Bold"
 TRACKING_MEGA = 0.12  # em; matches the design system's eyebrow/label letter-spacing
 TRACKING_WIDE = 0.04  # em; matches the design system's mono-caption letter-spacing
 # Karaoke hollow text: Core Text stroke width is a percentage of the font point
@@ -4112,6 +4115,12 @@ def build_renderer(font_name: str, choice: str = "auto") -> FrameRenderer:
             )
         else:
             print("rendering with Pillow (HarfBuzz + FreeType)")
+            # --font names a Core Text family. The Pillow renderer draws from the
+            # vendored files in PILLOW_FONT_FILES and has no way to honour it, so
+            # say so rather than letting the flag look like it took effect.
+            if font_name != DEFAULT_FONT_NAME:
+                print(f"note: --font {font_name!r} is ignored by the Pillow renderer; "
+                      f"its fonts are vendored in {PILLOW_FONT_DIR}")
             return renderer
     return FallbackFrameRenderer()
 
@@ -4265,7 +4274,9 @@ def main() -> int:
         target.add_argument("--board-host", default=os.environ.get("G4PYS_LYRICS_BOARD_HOST", BOARD_HOST))
         target.add_argument("--board-port", type=int, default=int(os.environ.get("G4PYS_LYRICS_BOARD_PORT", str(BOARD_PORT))))
         target.add_argument("--db", default=os.environ.get("G4PYS_LYRICS_DB", default_db_path()))
-        target.add_argument("--font", default=os.environ.get("G4PYS_LYRICS_FONT", "Sukhumvit Set Semi Bold"))
+        target.add_argument("--font", default=os.environ.get("G4PYS_LYRICS_FONT", DEFAULT_FONT_NAME),
+                            help="Core Text font family for the lyric role (macOS only; the "
+                                 "Pillow renderer uses the vendored fonts and ignores this)")
         target.add_argument(
             "--renderer",
             choices=RENDERER_CHOICES,
