@@ -1,0 +1,423 @@
+<!doctype html>
+<html lang="th">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>คู่มือ Clawdmeter</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@500&family=IBM+Plex+Sans+Thai:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --paper: #F8F3E1;
+    --soft: #FDFBF2;
+    --ink: #1F1D11;
+    --mut: #5E5A48;
+    --line: rgba(31, 29, 17, .16);
+    --ember: #D2502F;
+    --ember-bg: rgba(232, 93, 60, .10);
+    --ok: #2F7A4A;
+    --ok-bg: rgba(47, 122, 74, .10);
+    --warn-bg: rgba(196, 140, 20, .14);
+    --code-bg: rgba(31, 29, 17, .06);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --paper: #17160F;
+      --soft: #201E15;
+      --ink: #F1ECDA;
+      --mut: #B3AD96;
+      --line: rgba(241, 236, 218, .16);
+      --ember: #F07A5A;
+      --ember-bg: rgba(240, 122, 90, .14);
+      --ok: #6CC48C;
+      --ok-bg: rgba(108, 196, 140, .12);
+      --warn-bg: rgba(220, 170, 60, .16);
+      --code-bg: rgba(241, 236, 218, .08);
+    }
+  }
+  :root[data-theme="dark"] {
+    --paper: #17160F;
+    --soft: #201E15;
+    --ink: #F1ECDA;
+    --mut: #B3AD96;
+    --line: rgba(241, 236, 218, .16);
+    --ember: #F07A5A;
+    --ember-bg: rgba(240, 122, 90, .14);
+    --ok: #6CC48C;
+    --ok-bg: rgba(108, 196, 140, .12);
+    --warn-bg: rgba(220, 170, 60, .16);
+    --code-bg: rgba(241, 236, 218, .08);
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: "IBM Plex Sans Thai", -apple-system, "Segoe UI", system-ui, sans-serif;
+    font-size: 17px;
+    line-height: 1.7;
+  }
+  .wrap { max-width: 760px; margin: 0 auto; padding: 32px 16px 80px; }
+  header { margin-bottom: 28px; }
+  .eyebrow {
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-size: 13px; letter-spacing: .08em; text-transform: uppercase;
+    color: var(--ember);
+  }
+  h1 { font-size: 32px; line-height: 1.25; margin: 6px 0 8px; font-weight: 700; }
+  .lead { color: var(--mut); margin: 0; }
+  nav.toc {
+    display: flex; flex-wrap: wrap; gap: 8px; margin: 22px 0 8px;
+  }
+  nav.toc a {
+    color: var(--ink); text-decoration: none; font-size: 15px;
+    border: 1px solid var(--line); border-radius: 999px; padding: 4px 14px;
+    background: var(--soft);
+  }
+  nav.toc a:hover { border-color: var(--ember); }
+  section {
+    background: var(--soft); border: 1px solid var(--line); border-radius: 16px;
+    padding: 22px 20px; margin: 18px 0;
+  }
+  h2 { font-size: 23px; margin: 0 0 4px; line-height: 1.35; }
+  h2 .num {
+    display: inline-grid; place-items: center; width: 34px; height: 34px;
+    border-radius: 50%; background: var(--ember); color: var(--soft);
+    font-size: 17px; margin-right: 10px; vertical-align: 2px;
+  }
+  h3 { font-size: 18px; margin: 22px 0 6px; }
+  .sub { color: var(--mut); margin: 0 0 12px; }
+  ol.steps { padding-left: 0; list-style: none; counter-reset: s; margin: 12px 0 0; }
+  ol.steps > li {
+    counter-increment: s; position: relative; padding: 0 0 14px 40px;
+  }
+  ol.steps > li::before {
+    content: counter(s); position: absolute; left: 0; top: 2px;
+    width: 26px; height: 26px; border-radius: 50%;
+    border: 1.5px solid var(--ember); color: var(--ember);
+    display: grid; place-items: center; font-size: 14px; font-weight: 600;
+  }
+  ul { padding-left: 22px; }
+  code, kbd, .mono {
+    font-family: "IBM Plex Mono", ui-monospace, monospace; font-size: .88em;
+  }
+  code { background: var(--code-bg); border-radius: 6px; padding: 1px 6px; overflow-wrap: anywhere; }
+  pre {
+    background: var(--code-bg); border-radius: 10px; padding: 12px 14px;
+    overflow-x: auto; margin: 8px 0; font-size: 14.5px; line-height: 1.55;
+  }
+  pre code { background: none; padding: 0; }
+  .btnlike {
+    display: inline-block; border: 1px solid var(--line); border-radius: 8px;
+    padding: 0 8px; font-size: .9em; background: var(--paper); white-space: nowrap;
+  }
+  .note, .warn, .tip {
+    border-radius: 10px; padding: 12px 14px; margin: 14px 0; font-size: 15.5px;
+  }
+  .note { background: var(--ember-bg); }
+  .warn { background: var(--warn-bg); }
+  .tip { background: var(--ok-bg); }
+  .note b:first-child, .warn b:first-child, .tip b:first-child { display: block; margin-bottom: 2px; }
+  .screen {
+    font-family: "IBM Plex Mono", ui-monospace, monospace; font-size: 13.5px;
+    background: var(--paper); border: 1px solid var(--line); border-radius: 12px;
+    padding: 14px; text-align: center; line-height: 1.6; margin: 10px auto;
+    max-width: 300px;
+  }
+  .screen .em { color: var(--ember); font-weight: 600; font-size: 15px; }
+  .tabs { display: flex; gap: 6px; margin: 14px 0 0; flex-wrap: wrap; }
+  .tabs button {
+    font: inherit; font-size: 15px; color: var(--ink); background: var(--paper);
+    border: 1px solid var(--line); border-radius: 999px; padding: 4px 16px; cursor: pointer;
+  }
+  .tabs button[aria-selected="true"] { background: var(--ink); color: var(--paper); border-color: var(--ink); }
+  .panel[hidden] { display: none; }
+  table { width: 100%; border-collapse: collapse; font-size: 15.5px; }
+  th, td { text-align: left; vertical-align: top; padding: 10px 8px; border-top: 1px solid var(--line); }
+  th { font-weight: 600; color: var(--mut); font-size: 14px; border-top: none; }
+  td:first-child { white-space: nowrap; }
+  .tbl { overflow-x: auto; }
+  @media (max-width: 560px) {
+    body { font-size: 16px; }
+    h1 { font-size: 26px; }
+    section { padding: 18px 14px; }
+    td:first-child { white-space: normal; }
+    table, thead, tbody, tr, th, td { display: block; }
+    thead { display: none; }
+    tr { border-top: 1px solid var(--line); padding: 8px 0; }
+    td { border: none; padding: 2px 0; }
+    td:first-child { font-weight: 600; }
+  }
+  footer { color: var(--mut); font-size: 14px; text-align: center; margin-top: 30px; }
+  @media print {
+    body { background: #fff; }
+    section { break-inside: avoid; border-color: #ccc; }
+    .tabs { display: none; }
+    .panel[hidden] { display: block; }
+    nav.toc { display: none; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <div class="eyebrow">Clawdmeter · ESP8266</div>
+  <h1>คู่มืออัปเดตเฟิร์มแวร์<br>และเชื่อมต่อเนื้อเพลง</h1>
+  <p class="lead">ทำตามทีละขั้นได้เลย ไม่ต้องเขียนโค้ด ใช้เวลารวมประมาณ 15 นาที</p>
+  <nav class="toc" aria-label="สารบัญ">
+    <a href="#prep">ก่อนเริ่ม</a>
+    <a href="#update">1 · อัปเดตเฟิร์มแวร์</a>
+    <a href="#wifi">2 · ต่อ WiFi</a>
+    <a href="#lyrics">3 · เชื่อมเนื้อเพลง</a>
+    <a href="#fix">แก้ปัญหา</a>
+  </nav>
+</header>
+
+<section id="prep">
+  <h2>ก่อนเริ่ม</h2>
+  <p class="sub">เตรียมของเหล่านี้ไว้ให้พร้อม</p>
+  <ul>
+    <li>จอ Clawdmeter เสียบไฟแล้ว</li>
+    <li>คอมพิวเตอร์ Mac หรือ Windows ที่มี <b>Google Chrome</b> หรือ <b>Microsoft Edge</b></li>
+    <li>ไฟล์เฟิร์มแวร์ <code>clawdmeter_esp8266.ino.bin</code> ที่ได้รับจากเรา</li>
+    <li>โฟลเดอร์โปรแกรม Clawdmeter ที่ได้รับจากเรา (ในคู่มือนี้จะเรียกว่า <b>โฟลเดอร์โปรแกรม</b>)</li>
+  </ul>
+  <div class="note">
+    <b>สำคัญ: จอกับคอมต้องอยู่ WiFi วงเดียวกัน</b>
+    จอใช้ได้เฉพาะ WiFi <b>2.4 GHz</b> ถ้าเราเตอร์แยกชื่อ 2.4 GHz กับ 5 GHz ให้เลือกตัว 2.4 GHz
+  </div>
+</section>
+
+<section id="update">
+  <h2><span class="num">1</span>อัปเดตเฟิร์มแวร์</h2>
+  <p class="sub">อัปเดตผ่าน WiFi ได้เลย ไม่ต้องต่อสาย USB</p>
+
+  <div class="warn">
+    <b>ถ้าตอนนี้จอยังต่อ WiFi ไม่ได้เลย (เช่น WiFi ที่ทำงาน)</b>
+    ให้ต่อจอกับ WiFi บ้าน หรือ Hotspot จากมือถือ/คอมไปก่อน (ดูวิธีที่<a href="#wifi">ขั้นที่ 2</a>) อัปเดตให้เสร็จ แล้วค่อยเปลี่ยนไปใช้ WiFi ที่ทำงาน
+  </div>
+
+  <ol class="steps">
+    <li>
+      ดู <b>IP address</b> ที่หน้าจอ Clawdmeter เช่น <code>192.168.1.35</code>
+    </li>
+    <li>
+      ถ้าเปิดโปรแกรมเนื้อเพลงค้างไว้ ให้ปิดก่อน (ดูวิธีปิดที่<a href="#stop">ขั้นที่ 3</a>) และปิดแท็บหน้าตั้งค่าของจอที่เปิดค้างไว้
+    </li>
+    <li>
+      เปิดเบราว์เซอร์บนคอม ไปที่
+      <pre><code>http://clawdmeter.local/update</code></pre>
+      ถ้าเปิดไม่ขึ้น ให้ใช้ IP จากข้อ 1 แทน เช่น <code>http://192.168.1.35/update</code>
+    </li>
+    <li>
+      หน้าเว็บจะขึ้นหัวข้อ <b>firmware update</b> พร้อมเวอร์ชันปัจจุบัน กด <span class="btnlike">Choose File</span> แล้วเลือกไฟล์ <code>clawdmeter_esp8266.ino.bin</code>
+    </li>
+    <li>
+      กด <span class="btnlike">update firmware</span> แล้ว<b>รอ ห้ามถอดปลั๊ก</b> ประมาณ 30 วินาที
+    </li>
+    <li>
+      จอจะรีสตาร์ตเองและกลับมาแสดง IP อีกครั้ง ถ้าเบราว์เซอร์ค้าง ให้รอ 20 วินาทีแล้วเปิด <code>http://clawdmeter.local</code> ใหม่
+    </li>
+  </ol>
+
+  <div class="tip">
+    <b>เช็กว่าอัปเดตสำเร็จหรือยัง</b>
+    เปิด <code>http://clawdmeter.local/update</code> อีกครั้ง เลขเวอร์ชันข้างหัวข้อต้องเป็น <b>1.1.0</b> หรือใหม่กว่า
+  </div>
+</section>
+
+<section id="wifi">
+  <h2><span class="num">2</span>ต่อ WiFi</h2>
+  <p class="sub">ทำครั้งแรกครั้งเดียว หรือเมื่อต้องการย้ายไปใช้ WiFi อื่น</p>
+
+  <h3>จะเข้าโหมดตั้งค่า WiFi ได้อย่างไร</h3>
+  <ul>
+    <li><b>ครั้งแรก หรือจอหา WiFi เดิมไม่เจอ:</b> จอจะเข้าโหมดตั้งค่าเอง</li>
+    <li><b>ต้องการเปลี่ยน WiFi:</b> เปิด <code>http://clawdmeter.local</code> แล้วกด <span class="btnlike">change wifi</span></li>
+  </ul>
+
+  <p>เมื่ออยู่ในโหมดตั้งค่า หน้าจอจะขึ้นแบบนี้</p>
+  <div class="screen">
+    wifi setup<br><br>
+    join this hotspot from a phone<br>
+    <span class="em">Clawdmeter-setup</span><br><br>
+    a setup page opens by itself<br>
+    if not, browse to<br>
+    <b>192.168.4.1</b>
+  </div>
+
+  <ol class="steps">
+    <li>เอามือถือต่อ WiFi ชื่อ <b>Clawdmeter-setup</b></li>
+    <li>หน้าตั้งค่าจะเด้งขึ้นมาเอง ถ้าไม่เด้ง ให้เปิดเบราว์เซอร์ไปที่ <code>192.168.4.1</code></li>
+    <li>กด <span class="btnlike">Configure WiFi</span> แล้วเลือกชื่อ WiFi ของคุณ</li>
+    <li>
+      ใส่รหัสผ่าน แล้วดูช่อง <b>Username</b>
+      <ul>
+        <li><b>WiFi บ้านทั่วไป:</b> ปล่อยช่อง Username ว่างไว้</li>
+        <li><b>WiFi ที่ทำงานที่ถามทั้ง username และ password ตอนต่อ</b> (802.1X / WPA2-Enterprise / PEAP): ใส่ username และ password แบบเดียวกับที่ใช้ต่อจากมือถือ</li>
+      </ul>
+    </li>
+    <li>กด <span class="btnlike">Save</span> แล้วรอจนจอแสดง IP address ใหม่ (WiFi ที่ทำงานอาจใช้เวลาถึง 30 วินาที)</li>
+  </ol>
+
+  <div class="note">
+    <b>เรื่องที่ควรรู้ถ้าใช้ WiFi ที่ทำงาน</b>
+    <ul style="margin:4px 0 0">
+      <li>ถ้าต่อ WiFi ได้ก่อนแล้วค่อยเด้ง<b>หน้าเว็บให้ login</b> แบบนี้ไม่ใช่ 802.1X จอกรอกหน้านั้นให้ไม่ได้ แนะนำให้ใช้ Hotspot จากคอมแทน (ดูหัวข้อ<a href="#fix">แก้ปัญหา</a>)</li>
+      <li>รหัสผ่าน WiFi จะถูกเก็บไว้ในตัวจอ ถ้าเป็นไปได้ ให้ขอบัญชีสำหรับอุปกรณ์จากฝ่าย IT แทนการใช้บัญชีส่วนตัว</li>
+      <li>WiFi ที่ต้องใช้ใบรับรอง (certificate) ของเครื่องยังใช้ไม่ได้</li>
+    </ul>
+  </div>
+</section>
+
+<section id="lyrics">
+  <h2><span class="num">3</span>เชื่อมต่อเนื้อเพลง</h2>
+  <p class="sub">คอมทำหน้าที่วาดเนื้อเพลงแล้วส่งไปที่จอ ต้องเปิดโปรแกรมนี้ทุกครั้งที่อยากให้จอแสดงเนื้อเพลง</p>
+
+  <div class="tabs" role="tablist">
+    <button role="tab" aria-selected="true" aria-controls="p-mac" id="t-mac">Mac</button>
+    <button role="tab" aria-selected="false" aria-controls="p-win" id="t-win">Windows</button>
+  </div>
+
+  <div class="panel" id="p-mac" role="tabpanel" aria-labelledby="t-mac">
+    <h3>ติดตั้งครั้งแรก (ทำครั้งเดียว)</h3>
+    <ol class="steps">
+      <li>เปิดแอป <b>Terminal</b> (กด <kbd>⌘</kbd> + <kbd>Space</kbd> แล้วพิมพ์ Terminal)</li>
+      <li>
+        พิมพ์ <code>cd</code> ตามด้วยเว้นวรรค แล้วลากโฟลเดอร์โปรแกรมมาวางในหน้าต่าง Terminal กด <kbd>Enter</kbd>
+      </li>
+      <li>
+        ติดตั้งส่วนที่ใช้วาดตัวอักษร
+        <pre><code>python3 -m pip install --user pyobjc-framework-CoreText pyobjc-framework-Quartz</code></pre>
+        ถ้าเครื่องถามให้ติดตั้ง Command Line Tools ให้กดติดตั้ง แล้วรันคำสั่งนี้ซ้ำอีกครั้ง
+      </li>
+    </ol>
+
+    <h3>เปิดโปรแกรมเนื้อเพลง (ทุกครั้งที่ใช้)</h3>
+    <ol class="steps">
+      <li>ใน Terminal ให้เข้าโฟลเดอร์โปรแกรมเหมือนข้อ 2 ด้านบน</li>
+      <li>
+        พิมพ์
+        <pre><code>esp8266/tools/lyrics.sh</code></pre>
+      </li>
+      <li>
+        รอประมาณ 10 วินาที ถ้าขึ้น <code>lyrics are on the panel.</code> แปลว่าเชื่อมสำเร็จ ถ้าไม่ขึ้น โปรแกรมจะบอกว่าติดตรงไหน
+      </li>
+    </ol>
+  </div>
+
+  <div class="panel" id="p-win" role="tabpanel" aria-labelledby="t-win" hidden>
+    <h3>ติดตั้งครั้งแรก (ทำครั้งเดียว)</h3>
+    <ol class="steps">
+      <li>
+        ติดตั้ง Python 3.10 ขึ้นไปจาก <a href="https://www.python.org/downloads/windows/">python.org</a>
+        ตอนติดตั้ง<b>ต้องติ๊ก</b> <span class="btnlike">Add python.exe to PATH</span>
+      </li>
+      <li>เปิดโฟลเดอร์โปรแกรมใน File Explorer คลิกที่แถบที่อยู่ด้านบน พิมพ์ <code>powershell</code> แล้วกด <kbd>Enter</kbd></li>
+      <li>
+        ในหน้าต่าง PowerShell พิมพ์
+        <pre><code>py -3 -m pip install -r esp8266\daemon\requirements-windows.txt</code></pre>
+      </li>
+      <li>ตั้งค่า WiFi ที่ใช้เป็น <b>Private network</b>: Settings → Network &amp; internet → Wi-Fi → เลือก WiFi ที่ต่ออยู่ → Network profile type → <b>Private</b></li>
+    </ol>
+
+    <h3>เปิดโปรแกรมเนื้อเพลง (ทุกครั้งที่ใช้)</h3>
+    <ol class="steps">
+      <li>เปิด PowerShell ในโฟลเดอร์โปรแกรมเหมือนข้อ 2 ด้านบน</li>
+      <li>
+        พิมพ์
+        <pre><code>powershell -ExecutionPolicy Bypass -File esp8266\tools\lyrics.ps1</code></pre>
+      </li>
+      <li>ครั้งแรก Windows จะถามเรื่อง Firewall ให้กด <span class="btnlike">Allow</span> สำหรับ <b>Private networks</b></li>
+      <li>รอประมาณ 10 วินาที โปรแกรมจะบอกว่าเชื่อมกับจอสำเร็จหรือติดตรงไหน</li>
+    </ol>
+  </div>
+
+  <h3>ติดตั้งส่วนขยายในเบราว์เซอร์ (ทำครั้งเดียว)</h3>
+  <ol class="steps">
+    <li>เปิด Chrome แล้วพิมพ์ <code>chrome://extensions</code> ในช่องที่อยู่ (Edge ใช้ <code>edge://extensions</code>)</li>
+    <li>เปิดสวิตช์ <b>Developer mode</b> ที่มุมขวาบน</li>
+    <li>กด <span class="btnlike">Load unpacked</span> แล้วเลือกโฟลเดอร์ <code>esp8266/browser_extension</code> ในโฟลเดอร์โปรแกรม</li>
+  </ol>
+
+  <h3>เริ่มฟังเพลง</h3>
+  <ol class="steps">
+    <li>เปิด <a href="https://music.youtube.com">music.youtube.com</a> ใน Chrome หรือ Edge ตัวเดียวกับที่ติดตั้งส่วนขยาย</li>
+    <li>เปิดเพลง ภายในไม่กี่วินาทีเนื้อเพลงจะขึ้นที่จอ</li>
+  </ol>
+
+  <h3 id="stop">ปิดโปรแกรมเนื้อเพลง</h3>
+  <p>Mac: <code>esp8266/tools/lyrics.sh stop</code><br>
+     Windows: <code>powershell -ExecutionPolicy Bypass -File esp8266\tools\lyrics.ps1 stop</code></p>
+  <p>ถ้าไม่แน่ใจว่าตอนนี้ทำงานอยู่หรือเปล่า ให้ใช้ <code>status</code> แทน <code>stop</code> โปรแกรมจะบอกสถานะของทั้งคอมและจอ</p>
+</section>
+
+<section id="fix">
+  <h2>แก้ปัญหา</h2>
+  <p class="sub">ดูจากข้อความบนจอ แล้วทำตามช่องขวา</p>
+  <div class="tbl">
+  <table>
+    <thead><tr><th>จอแสดง</th><th>หมายความว่า</th><th>วิธีแก้</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><code>Clawdmeter-setup</code></td>
+        <td>จอต่อ WiFi ที่บันทึกไว้ไม่ได้</td>
+        <td>ตั้งค่า WiFi ใหม่ตาม<a href="#wifi">ขั้นที่ 2</a> และเช็กว่าเป็น WiFi 2.4 GHz รหัสผ่านถูกต้อง ถ้าเป็น WiFi ที่ทำงานต้องกรอก Username ด้วย</td>
+      </tr>
+      <tr>
+        <td><code>waiting for lyrics</code></td>
+        <td>จอยังไม่เจอคอม หรือยังไม่ได้เปิดเพลง</td>
+        <td>เปิดโปรแกรมเนื้อเพลง (<a href="#lyrics">ขั้นที่ 3</a>) แล้วเปิดเพลงใน YouTube Music จากนั้นรัน <code>status</code> ดูว่าติดตรงไหน</td>
+      </tr>
+      <tr>
+        <td><code>reaching the lyrics daemon…</code></td>
+        <td>จอเจอคอมแล้ว แต่ต่อเข้าไม่ได้</td>
+        <td>Windows: อนุญาต Firewall และตั้ง WiFi เป็น Private ส่วน Mac: กด Allow ถ้าเครื่องถามเรื่องการเชื่อมต่อเข้า</td>
+      </tr>
+      <tr>
+        <td><code>wifi lost</code></td>
+        <td>จอหลุดจาก WiFi</td>
+        <td>รอสักครู่ จอจะต่อใหม่เอง ถ้าเกิน 10 นาทีจะรีสตาร์ตเอง</td>
+      </tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h3>เปิด <code>clawdmeter.local</code> ไม่ขึ้น</h3>
+  <p>ให้ใช้ IP ที่จอแสดงแทนทุกที่ ส่วนโปรแกรมเนื้อเพลง ให้เติม IP ต่อท้ายคำสั่งเปิด เช่น</p>
+  <pre><code>esp8266/tools/lyrics.sh start --announce-url http://192.168.1.35</code></pre>
+
+  <h3>ใช้ WiFi ที่ทำงานแล้วจอขึ้น IP แต่เนื้อเพลงไม่มาเลย</h3>
+  <p>WiFi องค์กรหลายแห่งไม่ให้อุปกรณ์คุยกันเอง จึงไม่เกี่ยวกับตัวจอ มีทางแก้ 2 ทาง</p>
+  <ul>
+    <li><b>ใช้ Hotspot จากคอม (แนะนำ ทำได้เองทันที):</b> Mac ใช้ System Settings → General → Sharing → Internet Sharing ส่วน Windows ใช้ Settings → Network &amp; internet → Mobile hotspot ตั้ง Hotspot ให้เป็น 2.4 GHz แล้วให้จอต่อ Hotspot นั้นตาม<a href="#wifi">ขั้นที่ 2</a></li>
+    <li><b>ขอฝ่าย IT:</b> ขอให้อนุญาตอุปกรณ์นี้ (แจ้ง MAC address ของจอ) และเปิดให้คุยกับคอมได้ที่พอร์ต 8766</li>
+  </ul>
+</section>
+
+<footer>Clawdmeter · คู่มือสำหรับเฟิร์มแวร์ 1.1.0</footer>
+</div>
+
+<script>
+  (function () {
+    var tabs = document.querySelectorAll('.tabs [role="tab"]');
+    function pick(tab) {
+      tabs.forEach(function (t) {
+        var on = t === tab;
+        t.setAttribute('aria-selected', on ? 'true' : 'false');
+        document.getElementById(t.getAttribute('aria-controls')).hidden = !on;
+      });
+      try { localStorage.setItem('clawd-os', tab.id); } catch (e) {}
+    }
+    tabs.forEach(function (t) { t.addEventListener('click', function () { pick(t); }); });
+    var saved = null;
+    try { saved = localStorage.getItem('clawd-os'); } catch (e) {}
+    if (!saved && /Windows/i.test(navigator.userAgent)) saved = 't-win';
+    if (saved && document.getElementById(saved)) pick(document.getElementById(saved));
+  })();
+</script>
+</body>
+</html>

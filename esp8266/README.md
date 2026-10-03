@@ -99,6 +99,31 @@ tells you so on the LCD:
 2. Pick your WiFi, enter the password. The device saves it and reboots onto
    your network, then shows its new IP on the waiting screen.
 
+**Work WiFi that asks for a username (802.1X / WPA2-Enterprise).** The setup
+page has one extra box under the password: **Username**. Leave it blank for a
+home network. If your office WiFi asks for a username *and* a password when you
+join it (on a phone it usually says PEAP or "enterprise"), type both. The board
+then joins with 802.1X, and `/usage.json` reports `"eap":1`. Some limits:
+
+- PEAP and TTLS with MSCHAPv2 only, which is what most offices run. Networks
+  that need a client certificate (EAP-TLS) won't work.
+- The server certificate is not checked, because the board has no CA
+  certificate to check it against.
+- The SDK doesn't keep enterprise settings across a reset, so the username and
+  password are stored in EEPROM bytes 16..179 and re-applied on every boot.
+  **change wifi** and **reset settings** wipe them along with the rest.
+- This only gets the board onto the network. The daemon still has to be able to
+  reach the board. Many office and guest networks block device-to-device
+  traffic (client isolation). If the board shows an IP but no lyrics ever
+  arrive, that is the likely cause, and no firmware fix gets around it. Ask IT
+  to allow the board's MAC address, or put the board on your computer's own
+  hotspot (Mac: Internet Sharing; Windows: Mobile Hotspot). If `.local` names
+  don't resolve, run the daemon with `--announce-url http://<board ip>`.
+- A network that lets you join first and then shows a login web page is a
+  captive portal, not 802.1X. The board can't fill in that page. It doesn't
+  need the internet, though, so it may still work if the portal allows LAN
+  traffic. The hotspot route always works.
+
 The credentials persist across reboots and OTA updates. If nobody finishes the
 portal within 3 minutes the device reboots and retries the saved network, so a
 temporary router outage just heals itself.

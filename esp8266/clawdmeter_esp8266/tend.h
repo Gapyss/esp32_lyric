@@ -87,11 +87,18 @@ void tendEepromCommit(void);
 
 // EEPROM layout v2 (v1 was marker+brightness only; loadBrightness migrates).
 // Bytes 2..15 held config for screens this board no longer has; the region stays
-// reserved so EE_SIZE and the addresses above are unchanged and already-flashed
+// reserved so the addresses below are unchanged and already-flashed
 // boards still read their stored brightness across an OTA to this firmware.
 static const int EE_MARKER_ADDR = 0;       // 0xC2
 static const int EE_BRIGHTNESS_ADDR = 1;   // u8
-static const int EE_SIZE = 16;
+// WPA2-Enterprise (802.1X) block, appended past the old 16-byte layout so a
+// board OTA'd from an older build reads its brightness unchanged. Valid only
+// while EE_EAP_FLAG_ADDR holds EEPROM_EAP_MARKER; each string is NUL-terminated.
+static const int EE_EAP_FLAG_ADDR = 16;    // EEPROM_EAP_MARKER = 802.1X on
+static const int EE_EAP_SSID_ADDR = 17;    // 33 bytes
+static const int EE_EAP_USER_ADDR = 50;    // 65 bytes
+static const int EE_EAP_PASS_ADDR = 115;   // 65 bytes
+static const int EE_SIZE = 180;
 
 // ---- Lyrics frame stream (lyrics_stream.cpp) -------------------------------
 // The box dials back to the Mac that pushes /usage & /nowplaying and speaks the
