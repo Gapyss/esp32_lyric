@@ -9,6 +9,10 @@
 #include <Arduino_GFX_Library.h>  // install "GFX Library for Arduino" by moononournation
 #include <time.h>                 // NTP clock (so the wait screen has time before any push)
 #include "tend.h"                 // shared palette / screen registry / helpers
+extern "C" {
+#include <user_interface.h>
+#include <wpa2_enterprise.h>      // 802.1X (WPA2-Enterprise) station auth, in the core's SDK
+}
 
 ESP8266WebServer server(80);
 
@@ -17,7 +21,7 @@ ESP8266WebServer server(80);
 // rather than carrying their own copy -- a second literal in the HTML would
 // be gzipped into index_html_gz.h and drift silently. Bumping this line is
 // the whole change.
-#define FW_VERSION "1.0.0"
+#define FW_VERSION "1.1.0"
 
 // --- GeekMagic HelloCubic Lite / SmallTV-Ultra: ESP8266 + ST7789 240x240 ---
 // Pins/SPI mirror the GeekMagic open firmware. CS is tied to GND, the backlight
@@ -106,6 +110,95 @@ static void applyBrightness(uint8_t brightness, bool persist) {
 // the box opens this hotspot and runs a captive setup portal on it; see setup().
 #define WIFI_SETUP_AP "Clawdmeter-setup"
 #define WIFI_PORTAL_TIMEOUT_S 180   // give up, reboot, and retry the saved network
+
+// WPA2-Enterprise (802.1X: PEAP / TTLS with MSCHAPv2). Office networks that ask
+// for a username *and* a password at join time. WiFiManager's portal only has a
+// password box, so the portal grows one optional "username" field: left blank it
+// is the plain WPA2-PSK flow as before; filled in, the board joins with 802.1X.
+// The SDK keeps none of the enterprise settings across a reset, so they live in
+// EEPROM (see tend.h) and are re-applied every boot before the first connect.
+// No CA certificate is pinned -- the server certificate is not validated -- and
+// EAP-TLS (client certificate) networks are not supported.
+#define EEPROM_EAP_MARKER 0xE1
+#define WIFI_EAP_CONNECT_MS (30UL * 1000UL)   // EAP handshake is slower than PSK
+
+struct EapConfig {
+  char ssid[33];
+  char user[65];
+  char pass[65];
+};
+static EapConfig eapCfg;
+static bool eapOn = false;   // 802.1X credentials loaded and applied to the SDK
+
+static void eepromReadStr(int addr, char *dst, size_t len) {
+  for (size_t i = 0; i < len; i++) dst[i] = (char)EEPROM.read(addr + i);
+  dst[len - 1] = '\0';
+}
+
+static void eepromWriteStr(int addr, const String &src, size_t len) {
+  for (size_t i = 0; i < len; i++) {
+    EEPROM.write(addr + i, i < src.length() && i < len - 1 ? (uint8_t)src[i] : 0);
+  }
+}
+
+static bool eapLoad() {
+  if (EEPROM.read(EE_EAP_FLAG_ADDR) != EEPROM_EAP_MARKER) return false;
+  eepromReadStr(EE_EAP_SSID_ADDR, eapCfg.ssid, sizeof(eapCfg.ssid));
+  eepromReadStr(EE_EAP_USER_ADDR, eapCfg.user, sizeof(eapCfg.user));
+  eepromReadStr(EE_EAP_PASS_ADDR, eapCfg.pass, sizeof(eapCfg.pass));
+  return eapCfg.ssid[0] && eapCfg.user[0];
+}
+
+// Arm the SDK for 802.1X. Takes effect on the next station connect, whoever
+// issues it: our WiFi.begin(), WiFiManager's, or the watchdog's reconnect().
+static void eapApply() {
+  wifi_station_set_wpa2_enterprise_auth(1);
+  wifi_station_clear_enterprise_identity();
+  wifi_station_clear_enterprise_username();
+  wifi_station_clear_enterprise_password();
+  wifi_station_clear_enterprise_cert_key();
+  wifi_station_clear_enterprise_ca_cert();
+  // Same string for the outer (identity) and inner (username) EAP names: what
+  // the user typed is what their laptop would send for both.
+  wifi_station_set_enterprise_identity((u8 *)eapCfg.user, strlen(eapCfg.user));
+  wifi_station_set_enterprise_username((u8 *)eapCfg.user, strlen(eapCfg.user));
+  wifi_station_set_enterprise_password((u8 *)eapCfg.pass, strlen(eapCfg.pass));
+  // No CA cert to check against anyway, and before NTP the clock reads 1970.
+  wifi_station_set_enterprise_disable_time_check(true);
+  eapOn = true;
+}
+
+static void eapDisable() {
+  wifi_station_clear_enterprise_identity();
+  wifi_station_clear_enterprise_username();
+  wifi_station_clear_enterprise_password();
+  wifi_station_set_wpa2_enterprise_auth(0);
+  eapOn = false;
+}
+
+// Join the stored 802.1X network ourselves. WiFi.begin(ssid) with no password,
+// not WiFiManager's begin(ssid, pass): a password makes the core set a WPA-PSK
+// auth threshold, which an enterprise AP need not satisfy. persistent(false)
+// keeps this out of the SDK's flash sector -- nothing to write, and no flash
+// write while the backlight PWM is running (see backlightStopForFlash).
+static bool eapConnect() {
+  WiFi.persistent(false);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(eapCfg.ssid);
+  const unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < WIFI_EAP_CONNECT_MS) {
+    delay(100);
+  }
+  WiFi.persistent(true);
+  return WiFi.status() == WL_CONNECTED;
+}
+
+// Wipe the stored 802.1X credentials (the /wifi-reset and /factory-reset path).
+// Caller commits.
+static void eapForget() {
+  EEPROM.write(EE_EAP_FLAG_ADDR, 0x00);
+  eepromWriteStr(EE_EAP_PASS_ADDR, String(), sizeof(eapCfg.pass));
+}
 
 // WiFi watchdog. autoConnect() runs exactly once, in setup(); before this,
 // nothing in loop() ever re-read WiFi.status(), so an association lost *after*
@@ -492,6 +585,7 @@ void handleUsageJson() {
              ",\"ip\":\"" + WiFi.localIP().toString() + "\"" +
              ",\"rssi\":" + String(WiFi.isConnected() ? WiFi.RSSI() : 0) +
              ",\"wifi\":" + String(WiFi.isConnected() ? 1 : 0) +
+             ",\"eap\":" + String(eapOn ? 1 : 0) +   // 1 = joined via 802.1X
              // Watchdog state. wifidown counts seconds since the association
              // dropped (0 while up), so "rst":"Software/System restarted" with a
              // low "up" plus a non-zero wifidrops reads as a watchdog reboot
@@ -613,6 +707,8 @@ void handleWifiReset() {
   backlightStopForFlash();
   WiFiManager wm;
   wm.resetSettings();
+  eapForget();       // the 802.1X username/password are WiFi credentials too
+  EEPROM.commit();   // bare, like /factory-reset: the PWM must stay parked
   ESP.restart();   // no delay: resetSettings() has already dropped the STA link
 }
 
@@ -631,6 +727,7 @@ void handleFactoryReset() {
   backlightStopForFlash();
   WiFiManager wm;
   wm.resetSettings();
+  eapForget();
   EEPROM.write(EE_MARKER_ADDR, 0x00);   // invalid marker -> defaults on reboot
   EEPROM.commit();
   ESP.restart();
@@ -1000,21 +1097,86 @@ void setup() {
   // here on demand. autoConnect() blocks for the whole portal session, which is
   // exactly why the reset endpoints reboot into it rather than opening it from a
   // request handler (that would stall loop() and the web server with it).
-  WiFiManager wm;
-  wm.setConfigPortalTimeout(WIFI_PORTAL_TIMEOUT_S);
-  wm.setAPCallback([](WiFiManager *) {    // the portal is up — say so on the panel
-    tendHeader("wifi setup");
-    printCentered(52, 1, "join this hotspot from a phone", C_TND_MUTE, C_TND_PAPER);
-    printCentered(74, 2, WIFI_SETUP_AP, C_TND_EMBER, C_TND_PAPER);
-    printCentered(116, 1, "a setup page opens by itself", C_TND_MUTE, C_TND_PAPER);
-    printCentered(132, 1, "if not, browse to", C_TND_MUTE, C_TND_PAPER);
-    printCentered(152, 2, WiFi.softAPIP().toString(), C_TND_INK, C_TND_PAPER);
-    printCentered(224, 1, "waiting 3 min, then retrying", C_TND_FAINT, C_TND_PAPER);
-  });
-  if (!wm.autoConnect(WIFI_SETUP_AP)) {
-    // Nobody finished the portal in time. Reboot rather than sit here: the saved
-    // network may simply have come back (router reboot), and if it hasn't, the
-    // next pass reopens the portal.
+  // An 802.1X network from an earlier portal session goes first, joined by us:
+  // the SDK forgot the enterprise settings at reset, and WiFiManager's own
+  // attempt would set a WPA-PSK threshold the AP need not meet (see eapConnect).
+  bool joined = false;
+  if (eapLoad()) {
+    eapApply();
+    joined = eapConnect();
+    if (!joined) Serial.println("802.1X join failed; falling back to the portal");
+  }
+
+  if (!joined) {
+    WiFiManager wm;
+    wm.setConfigPortalTimeout(WIFI_PORTAL_TIMEOUT_S);
+    wm.setAPCallback([](WiFiManager *) {    // the portal is up — say so on the panel
+      tendHeader("wifi setup");
+      printCentered(52, 1, "join this hotspot from a phone", C_TND_MUTE, C_TND_PAPER);
+      printCentered(74, 2, WIFI_SETUP_AP, C_TND_EMBER, C_TND_PAPER);
+      printCentered(116, 1, "a setup page opens by itself", C_TND_MUTE, C_TND_PAPER);
+      printCentered(132, 1, "if not, browse to", C_TND_MUTE, C_TND_PAPER);
+      printCentered(152, 2, WiFi.softAPIP().toString(), C_TND_INK, C_TND_PAPER);
+      printCentered(184, 1, "work wifi asks for a username?", C_TND_MUTE, C_TND_PAPER);
+      printCentered(198, 1, "fill in the username box too", C_TND_MUTE, C_TND_PAPER);
+      printCentered(224, 1, "waiting 3 min, then retrying", C_TND_FAINT, C_TND_PAPER);
+    });
+
+    // The one extra portal field. Shown on the WiFi page under the password box
+    // and read back in the save callback below, which WiFiManager runs before it
+    // tries to connect -- so a filled-in username arms 802.1X in time.
+    WiFiManagerParameter eapUser("eap_user",
+        "Username &mdash; only for work wifi (802.1X / WPA2-Enterprise). "
+        "Leave blank for home wifi.", "", 64);
+    wm.addParameter(&eapUser);
+    bool eapFromPortal = false;
+    wm.setSaveParamsCallback([&]() {
+      const String ssid = wm.server->arg("s");
+      if (ssid.length() == 0) return;            // params-only save, no network picked
+      String user = eapUser.getValue();
+      user.trim();
+      if (user.length() == 0) {                  // a normal home (WPA2-PSK) network
+        if (eapOn) eapDisable();
+        if (EEPROM.read(EE_EAP_FLAG_ADDR) == EEPROM_EAP_MARKER) {
+          eapForget();
+          tendEepromCommit();
+        }
+        return;
+      }
+      const String pass = wm.server->arg("p");
+      strlcpy(eapCfg.ssid, ssid.c_str(), sizeof(eapCfg.ssid));
+      strlcpy(eapCfg.user, user.c_str(), sizeof(eapCfg.user));
+      strlcpy(eapCfg.pass, pass.c_str(), sizeof(eapCfg.pass));
+      eepromWriteStr(EE_EAP_SSID_ADDR, ssid, sizeof(eapCfg.ssid));
+      eepromWriteStr(EE_EAP_USER_ADDR, user, sizeof(eapCfg.user));
+      eepromWriteStr(EE_EAP_PASS_ADDR, pass, sizeof(eapCfg.pass));
+      EEPROM.write(EE_EAP_FLAG_ADDR, EEPROM_EAP_MARKER);
+      tendEepromCommit();
+      eapApply();
+      // WiFiManager's begin(ssid, pass) may still get through with 802.1X armed;
+      // if it doesn't, leave the portal instead of looping in it, and let
+      // eapConnect() below have its go.
+      wm.setBreakAfterConfig(true);
+      eapFromPortal = true;
+    });
+
+    // Tries the saved network; if it can't connect — first boot, new router, new
+    // password — it opens the "Clawdmeter-setup" hotspot instead: join it from a
+    // phone, pick a network, done. No re-flashing, and /wifi-reset gets you back
+    // here on demand. autoConnect() blocks for the whole portal session, which is
+    // exactly why the reset endpoints reboot into it rather than opening it from a
+    // request handler (that would stall loop() and the web server with it).
+    joined = wm.autoConnect(WIFI_SETUP_AP);
+    if (!joined && eapFromPortal) {
+      tendHeader("starting");
+      printCentered(112, 1, "joining work wifi (802.1X)", C_TND_MUTE, C_TND_PAPER);
+      joined = eapConnect();
+    }
+  }
+  if (!joined) {
+    // Nobody finished the portal in time, or the 802.1X login was refused.
+    // Reboot rather than sit here: the saved network may simply have come back
+    // (router reboot), and if it hasn't, the next pass reopens the portal.
     Serial.println("WiFi setup timed out, restarting...");
     ESP.restart();
   }
