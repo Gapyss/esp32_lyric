@@ -21,7 +21,7 @@ ESP8266WebServer server(80);
 // rather than carrying their own copy -- a second literal in the HTML would
 // be gzipped into index_html_gz.h and drift silently. Bumping this line is
 // the whole change.
-#define FW_VERSION "1.1.0"
+#define FW_VERSION "1.1.1"
 
 // --- GeekMagic HelloCubic Lite / SmallTV-Ultra: ESP8266 + ST7789 240x240 ---
 // Pins/SPI mirror the GeekMagic open firmware. CS is tied to GND, the backlight
@@ -181,16 +181,82 @@ static void eapDisable() {
 // auth threshold, which an enterprise AP need not satisfy. persistent(false)
 // keeps this out of the SDK's flash sector -- nothing to write, and no flash
 // write while the backlight PWM is running (see backlightStopForFlash).
+//
+// Diagnostics: a failed join used to say only "failed". The SDK's disconnect
+// reason says *why*, and the fixes differ completely (wrong band, wrong
+// username format, RADIUS refusing the TLS handshake), so it is captured here,
+// printed to serial, and kept in eapFailText for the panel.
+static volatile uint8_t eapLastReason = 0;
+static char eapFailText[40] = "";
+
+static const char *wifiReasonText(uint8_t r) {
+  switch (r) {
+    case WIFI_DISCONNECT_REASON_AUTH_EXPIRE:            return "auth expired";
+    case WIFI_DISCONNECT_REASON_4WAY_HANDSHAKE_TIMEOUT: return "4-way timeout";
+    case WIFI_DISCONNECT_REASON_802_1X_AUTH_FAILED:     return "802.1X rejected";
+    case WIFI_DISCONNECT_REASON_CIPHER_SUITE_REJECTED:  return "cipher rejected";
+    case WIFI_DISCONNECT_REASON_BEACON_TIMEOUT:         return "beacon timeout";
+    case WIFI_DISCONNECT_REASON_NO_AP_FOUND:            return "ssid not found";
+    case WIFI_DISCONNECT_REASON_AUTH_FAIL:              return "auth failed";
+    case WIFI_DISCONNECT_REASON_ASSOC_FAIL:             return "assoc failed";
+    case WIFI_DISCONNECT_REASON_HANDSHAKE_TIMEOUT:      return "handshake timeout";
+    default:                                            return "other";
+  }
+}
+
+// The ESP8266 is 2.4 GHz only. Office SSIDs are often 5 GHz-only or
+// band-steered, which looks exactly like a bad password unless you scan.
+static bool eapSsidVisible() {
+  const int n = WiFi.scanNetworks(false, true);
+  bool seen = false;
+  for (int i = 0; i < n; i++) {
+    if (WiFi.SSID(i) != eapCfg.ssid) continue;
+    seen = true;
+    Serial.printf("802.1X: '%s' seen ch%d rssi %d enc %d\n",
+                  eapCfg.ssid, WiFi.channel(i), WiFi.RSSI(i), WiFi.encryptionType(i));
+  }
+  WiFi.scanDelete();
+  return seen;
+}
+
 static bool eapConnect() {
   WiFi.persistent(false);
   WiFi.mode(WIFI_STA);
+  // Arm 802.1X *after* the mode switch -- the order Espressif's example uses.
+  // Callers may already have armed it; eapApply() clears and re-sets, so a
+  // second call is harmless.
+  eapApply();
+
+  eapFailText[0] = '\0';
+  if (!eapSsidVisible()) {
+    Serial.printf("802.1X: '%s' not in scan (5 GHz-only? out of range?)\n", eapCfg.ssid);
+    strlcpy(eapFailText, "ssid not seen on 2.4GHz", sizeof(eapFailText));
+    WiFi.persistent(true);
+    return false;
+  }
+
+  eapLastReason = 0;
+  WiFiEventHandler onDisc = WiFi.onStationModeDisconnected(
+      [](const WiFiEventStationModeDisconnected &e) { eapLastReason = e.reason; });
+
+  Serial.printf("802.1X: joining '%s' as '%s', heap %u\n",
+                eapCfg.ssid, eapCfg.user, ESP.getFreeHeap());
   WiFi.begin(eapCfg.ssid);
   const unsigned long start = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - start < WIFI_EAP_CONNECT_MS) {
     delay(100);
   }
+  const bool ok = WiFi.status() == WL_CONNECTED;
+  onDisc = nullptr;   // unregister
   WiFi.persistent(true);
-  return WiFi.status() == WL_CONNECTED;
+
+  if (!ok) {
+    const uint8_t r = eapLastReason;
+    snprintf(eapFailText, sizeof(eapFailText), "reason %u: %s", r, wifiReasonText(r));
+    Serial.printf("802.1X failed: status %d, %s, heap %u\n",
+                  (int)WiFi.status(), eapFailText, ESP.getFreeHeap());
+  }
+  return ok;
 }
 
 // Wipe the stored 802.1X credentials (the /wifi-reset and /factory-reset path).
@@ -1104,7 +1170,13 @@ void setup() {
   if (eapLoad()) {
     eapApply();
     joined = eapConnect();
-    if (!joined) Serial.println("802.1X join failed; falling back to the portal");
+    if (!joined) {
+      Serial.println("802.1X join failed; falling back to the portal");
+      tendHeader("work wifi failed");
+      printCentered(100, 1, eapFailText, C_TND_EMBER, C_TND_PAPER);
+      printCentered(130, 1, "opening setup hotspot...", C_TND_MUTE, C_TND_PAPER);
+      delay(6000);   // long enough to read or photograph
+    }
   }
 
   if (!joined) {
