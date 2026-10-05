@@ -1,7 +1,22 @@
 (() => {
   "use strict";
 
-  const WS_URL = "ws://127.0.0.1:8765/extension";
+  // The daemon socket lives in background.js, not here. A WebSocket opened by a
+  // content script carries the page's origin (https://music.youtube.com), so
+  // Chrome/Edge Local Network Access rules -- and enterprise policies that
+  // enforce them -- can refuse public -> 127.0.0.1 with nothing but
+  // "WebSocket connection failed". Extension-origin sockets with host
+  // permissions are not subject to that, the same reason the board knock
+  // already lives in the worker. This file talks to the worker over a
+  // long-lived port; openBridge() returns a WebSocket-shaped object so the
+  // rest of the script is unchanged.
+  const BRIDGE_PORT = "g4pys-daemon-bridge";
+  // MV3 workers idle out after ~30s without events. While playing, ticks flow
+  // every 500ms; while paused nothing does, so ping the port to keep the
+  // worker (and the socket it holds) alive.
+  const BRIDGE_KEEPALIVE_MS = 20 * 1000;
+  const SOCKET_OPEN = 1;
+  const SOCKET_CLOSED = 3;
   const TICK_MS = 500;
   const TRACK_SCAN_MS = 1000;
   const RECONNECT_MS = 1500;
@@ -155,7 +170,7 @@
   }
 
   function send(type, payload) {
-    if (!ws || ws.readyState !== WebSocket.OPEN) {
+    if (!ws || ws.readyState !== SOCKET_OPEN) {
       return;
     }
     ws.send(JSON.stringify({ type, payload, sentAtMs: Date.now() }));
@@ -284,10 +299,76 @@
     }
   }
 
+  function openBridge() {
+    const listeners = { open: [], close: [], error: [] };
+    let keepAlive = 0;
+    const sock = {
+      readyState: 0,
+      addEventListener(type, fn) {
+        if (listeners[type]) {
+          listeners[type].push(fn);
+        }
+      },
+      send(data) {
+        if (sock.readyState !== SOCKET_OPEN) {
+          return;
+        }
+        try {
+          port.postMessage({ type: "send", data });
+        } catch (_err) {
+          fire("close");
+        }
+      },
+      close() {
+        try {
+          port.disconnect();
+        } catch (_err) {
+          // Already disconnected.
+        }
+        fire("close");
+      }
+    };
+    function fire(type) {
+      if (type === "open") {
+        if (sock.readyState !== 0) {
+          return;
+        }
+        sock.readyState = SOCKET_OPEN;
+      } else if (type === "close") {
+        if (sock.readyState === SOCKET_CLOSED) {
+          return;   // close is delivered exactly once, like a real WebSocket
+        }
+        sock.readyState = SOCKET_CLOSED;
+        window.clearInterval(keepAlive);
+      }
+      for (const fn of listeners[type]) {
+        fn();
+      }
+    }
+    // Throws if the extension context is gone; connect() catches and retries.
+    const port = chrome.runtime.connect({ name: BRIDGE_PORT });
+    port.onMessage.addListener((message) => {
+      if (message && message.type === "open") {
+        fire("open");
+      } else if (message && message.type === "close") {
+        sock.close();
+      }
+    });
+    port.onDisconnect.addListener(() => fire("close"));
+    keepAlive = window.setInterval(() => {
+      try {
+        port.postMessage({ type: "keepalive" });
+      } catch (_err) {
+        fire("close");
+      }
+    }, BRIDGE_KEEPALIVE_MS);
+    return sock;
+  }
+
   function connect() {
     window.clearTimeout(reconnectTimer);
     try {
-      ws = new WebSocket(WS_URL);
+      ws = openBridge();
     } catch (_err) {
       reconnectTimer = window.setTimeout(connect, RECONNECT_MS);
       return;

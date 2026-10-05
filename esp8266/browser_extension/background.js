@@ -178,3 +178,74 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   }
   return false;
 });
+
+// Daemon socket bridge. content_script.js used to open ws://127.0.0.1:8765
+// itself, but a content-script socket carries the page origin, so Local
+// Network Access rules (and enterprise policies enforcing them) can block it
+// outright -- the console shows only "WebSocket connection ... failed". The
+// worker opens it instead, as the extension origin with host permissions, and
+// relays: one port per YouTube Music tab, one socket per port. Either side
+// closing tears down the other, and the content script reconnects as before.
+const BRIDGE_PORT = "g4pys-daemon-bridge";
+const DAEMON_WS_URL = "ws://127.0.0.1:8765/extension";
+
+chrome.runtime.onConnect.addListener((port) => {
+  if (port.name !== BRIDGE_PORT) {
+    return;
+  }
+  let ws = null;
+  let done = false;
+  const finish = () => {
+    if (done) {
+      return;
+    }
+    done = true;
+    try {
+      if (ws) {
+        ws.close();
+      }
+    } catch (_err) {
+      // Socket already gone.
+    }
+    try {
+      port.postMessage({ type: "close" });
+      port.disconnect();
+    } catch (_err) {
+      // Tab already gone.
+    }
+  };
+
+  port.onDisconnect.addListener(() => {
+    done = true;
+    try {
+      if (ws) {
+        ws.close();
+      }
+    } catch (_err) {
+      // Socket already gone.
+    }
+  });
+
+  try {
+    ws = new WebSocket(DAEMON_WS_URL);
+  } catch (_err) {
+    finish();
+    return;
+  }
+  ws.addEventListener("open", () => {
+    try {
+      port.postMessage({ type: "open" });
+    } catch (_err) {
+      finish();
+    }
+  });
+  ws.addEventListener("close", finish);
+  ws.addEventListener("error", finish);
+
+  port.onMessage.addListener((message) => {
+    // "keepalive" needs no handling: receiving it is what keeps the worker up.
+    if (message && message.type === "send" && ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(message.data);
+    }
+  });
+});
