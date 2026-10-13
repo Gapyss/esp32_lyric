@@ -64,6 +64,13 @@ from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
 import uuid
 
+# lyrics_search sits next to this file. Running the daemon as a script already puts this
+# directory on sys.path; tests load the daemon by file path, so make it explicit.
+_DAEMON_DIR = str(Path(__file__).resolve().parent)
+if _DAEMON_DIR not in sys.path:
+    sys.path.insert(0, _DAEMON_DIR)
+import lyrics_search  # noqa: E402
+
 
 DISPLAY_WIDTH = 400
 DISPLAY_HEIGHT = 300
@@ -1068,6 +1075,11 @@ class LyricsStore:
             )
             self.conn.commit()
 
+    def close(self) -> None:
+        """Release the SQLite file. Windows can't delete or replace a file that is still open."""
+        with self.lock:
+            self.conn.close()
+
     def manual_or_cached(self, track: TrackInfo) -> Lyrics | None:
         if not track.key:
             return None
@@ -1397,44 +1409,52 @@ def lrclib_request(path: str, params: dict[str, Any], cancel: threading.Event | 
                 time.sleep(delay)
 
 
+LRCLIB_MAX_REQUESTS_PER_TRACK = 4
+
+
+def _lrclib_records(path: str, params: dict[str, Any], cancel: threading.Event | None = None) -> list[dict[str, Any]]:
+    """lrclib_request for lyrics_search: [] for "not found", other errors propagate."""
+    try:
+        data = lrclib_request(path, params, cancel)
+    except urllib.error.HTTPError as exc:
+        # 404: no exact match. 400: /api/get demands track+artist+album+duration,
+        # so tracks with a missing field can only be found via /api/search.
+        if exc.code in (400, 404):
+            return []
+        raise
+    if isinstance(data, dict):
+        return [data]
+    return [item for item in data if isinstance(item, dict)] if isinstance(data, list) else []
+
+
 def fetch_lrclib(track: TrackInfo, cancel: threading.Event | None = None) -> Lyrics:
     """Resolve lyrics from lrclib, accepting only synced (or instrumental) results.
 
     Plain-only lyrics are treated as not found: the display can't scroll them
     in time, so two static lines would sit on screen for the whole song.
-    """
-    params = {
-        "track_name": track.title,
-        "artist_name": track.artist,
-        "album_name": track.album,
-        "duration": int(track.duration_sec or 0),
-    }
-    try:
-        exact = lrclib_request("/api/get", params, cancel)
-        lyrics = lyrics_from_lrclib_payload(exact)
-        if lyrics.synced or lyrics.instrumental:
-            return lyrics
-    except urllib.error.HTTPError as exc:
-        # 404: no exact match. 400: /api/get demands track+artist+album+duration,
-        # so tracks with a missing field can only be found via /api/search.
-        if exc.code not in (400, 404):
-            raise
 
-    results = lrclib_request("/api/search", params, cancel)
-    candidates = results if isinstance(results, list) else []
-    duration = float(track.duration_sec or 0)
-    best_synced: tuple[float, dict[str, Any]] | None = None
-    for item in candidates:
-        lyrics = lyrics_from_lrclib_payload(item)
-        if not lyrics.synced:
-            continue
-        item_duration = float(item.get("duration") or 0)
-        distance = abs(item_duration - duration) if duration > 0 and item_duration > 0 else 0
-        if duration > 0 and distance > 3:
-            continue
-        if best_synced is None or distance < best_synced[0]:
-            best_synced = (distance, item)
-    return lyrics_from_lrclib_payload(best_synced[1] if best_synced else None)
+    lyrics_search decides which record is the song playing (cleaned-up title,
+    version tags, a shared artist, length): no lyrics beat another recording's.
+    """
+    hit = lyrics_search.find_lyrics(
+        lyrics_search.Track(
+            title=track.title,
+            artist=track.artist,
+            album=track.album or None,
+            duration=float(track.duration_sec) if track.duration_sec and track.duration_sec > 0 else None,
+        ),
+        fetch=lambda path, params: _lrclib_records(path, params, cancel),
+        max_requests=LRCLIB_MAX_REQUESTS_PER_TRACK,
+        require_synced=True,
+    )
+    if hit is None:
+        print(f"lyrics: no confident lrclib match for {track.title!r} / {track.artist!r}")
+        return lyrics_from_lrclib_payload(None)
+    print(
+        f"lyrics: {track.title!r} -> lrclib #{hit.lrclib_id} {hit.track_name!r} / {hit.artist_name!r}"
+        f" ({hit.duration}s) via {hit.matched_by}"
+    )
+    return lyrics_from_lrclib_payload(hit.record)
 
 
 class FrameRenderer:
