@@ -417,6 +417,8 @@ esp8266/
 │   ├── requirements-windows.txt # Pillow renderer packages (Windows / non-Mac only)
 │   └── assets/fonts/            # IBM Plex Sans Thai + Mono (OFL) for the Pillow renderer
 ├── browser_extension/           # feeds YouTube Music playback to the daemon
+├── docs/lyrics-search.md        # how lyrics are matched on LRCLIB, setup, tunables (Thai)
+├── CHANGELOG.md
 ├── tests/
 │   ├── test_lyrics_display_daemon.py
 │   └── test_lyrics_search.py
