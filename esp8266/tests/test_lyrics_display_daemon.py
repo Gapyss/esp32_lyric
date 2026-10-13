@@ -354,20 +354,24 @@ class LrclibTests(unittest.TestCase):
                     fp=None,
                 )
             return [
-                {"duration": 120, "plainLyrics": "plain one\nplain two", "syncedLyrics": ""},
-                {"duration": 130, "plainLyrics": "too far", "syncedLyrics": ""},
+                {"trackName": "Song", "artistName": "Artist", "duration": 120,
+                 "plainLyrics": "plain one\nplain two", "syncedLyrics": ""},
+                {"trackName": "Song", "artistName": "Artist", "duration": 130,
+                 "plainLyrics": "too far", "syncedLyrics": ""},
             ]
 
         original_request = lyrics_display_daemon.lrclib_request
         lyrics_display_daemon.lrclib_request = fake_request
         try:
             result = lyrics_display_daemon.fetch_lrclib(
-                TrackInfo(video_id="video-1", title="Song", artist="Artist", duration_sec=120)
+                TrackInfo(video_id="video-1", title="Song", artist="Artist", album="Album", duration_sec=120)
             )
         finally:
             lyrics_display_daemon.lrclib_request = original_request
 
-        self.assertEqual(calls, ["/api/get", "/api/search"])
+        # /api/get, then /api/search by title+artist, then by title alone (lyrics_search).
+        self.assertEqual(calls[:2], ["/api/get", "/api/search"])
+        self.assertTrue(all(path == "/api/search" for path in calls[1:]))
         self.assertEqual(result.synced, [])
         self.assertEqual(result.plain, [])
         self.assertTrue(result.resolved)
@@ -383,8 +387,10 @@ class LrclibTests(unittest.TestCase):
                     fp=None,
                 )
             return [
-                {"duration": 120, "plainLyrics": "plain", "syncedLyrics": ""},
-                {"duration": 121, "plainLyrics": "synced plain", "syncedLyrics": "[00:01.00]synced"},
+                {"trackName": "Song", "artistName": "Artist", "duration": 120,
+                 "plainLyrics": "plain", "syncedLyrics": ""},
+                {"trackName": "Song", "artistName": "Artist", "duration": 121,
+                 "plainLyrics": "synced plain", "syncedLyrics": "[00:01.00]synced"},
             ]
 
         original_request = lyrics_display_daemon.lrclib_request
@@ -399,6 +405,47 @@ class LrclibTests(unittest.TestCase):
         self.assertEqual(result.synced, [(1000, "synced")])
         self.assertEqual(result.plain, ["synced plain"])
 
+
+    def _fetch_with(self, records: list[dict[str, object]], track: TrackInfo) -> tuple[Lyrics, list[str]]:
+        calls: list[str] = []
+
+        def fake_request(path: str, _params: dict[str, object], _cancel: object = None) -> object:
+            calls.append(path)
+            if path == "/api/get":
+                raise lyrics_display_daemon.urllib.error.HTTPError(
+                    url="https://lrclib.net/api/get", code=404, msg="not found", hdrs=None, fp=None
+                )
+            return records
+
+        original_request = lyrics_display_daemon.lrclib_request
+        lyrics_display_daemon.lrclib_request = fake_request
+        try:
+            return lyrics_display_daemon.fetch_lrclib(track), calls
+        finally:
+            lyrics_display_daemon.lrclib_request = original_request
+
+    def test_synced_candidate_from_another_song_is_refused(self) -> None:
+        # Same length, has times -- the old resolver took it. Wrong artist / live version.
+        result, _ = self._fetch_with(
+            [
+                {"trackName": "Song", "artistName": "Somebody Else", "duration": 120,
+                 "syncedLyrics": "[00:01.00]wrong"},
+                {"trackName": "Song (Live)", "artistName": "Artist", "duration": 121,
+                 "syncedLyrics": "[00:01.00]live"},
+            ],
+            TrackInfo(video_id="video-1", title="Song", artist="Artist", album="Album", duration_sec=120),
+        )
+        self.assertEqual(result.synced, [])
+        self.assertTrue(result.resolved)
+
+    def test_music_video_title_finds_the_song(self) -> None:
+        # MV: no album, "Artist - Song (Official MV)" from a label channel, 20 s of intro.
+        result, calls = self._fetch_with(
+            [{"trackName": "Song", "artistName": "Artist", "duration": 200, "syncedLyrics": "[00:01.00]right"}],
+            TrackInfo(video_id="video-2", title="Artist - Song (Official MV)", artist="Label Records", duration_sec=220),
+        )
+        self.assertEqual(result.synced, [(1000, "right")])
+        self.assertNotIn("/api/get", calls)  # no album: /api/get would only 400
 
 class AppStateTests(unittest.TestCase):
     def test_negative_cache_falls_back_to_now_playing_area(self) -> None:

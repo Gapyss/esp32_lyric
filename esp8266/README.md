@@ -413,11 +413,13 @@ esp8266/
 │   └── index_html_gz.h          # generated — gzipped dashboard served at /
 ├── daemon/
 │   ├── lyrics_display_daemon.py # renders the screen; knocks on /usage. The PC side.
+│   ├── lyrics_search.py         # picks the LRCLIB record that is really the song playing
 │   ├── requirements-windows.txt # Pillow renderer packages (Windows / non-Mac only)
 │   └── assets/fonts/            # IBM Plex Sans Thai + Mono (OFL) for the Pillow renderer
 ├── browser_extension/           # feeds YouTube Music playback to the daemon
 ├── tests/
-│   └── test_lyrics_display_daemon.py
+│   ├── test_lyrics_display_daemon.py
+│   └── test_lyrics_search.py
 └── tools/
     ├── lyrics.sh                # start/stop/status the daemon (macOS)
     ├── lyrics.ps1               # the same, for Windows PowerShell
