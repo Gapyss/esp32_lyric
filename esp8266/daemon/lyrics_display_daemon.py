@@ -1075,6 +1075,11 @@ class LyricsStore:
             )
             self.conn.commit()
 
+    def close(self) -> None:
+        """Release the SQLite file. Windows can't delete or replace a file that is still open."""
+        with self.lock:
+            self.conn.close()
+
     def manual_or_cached(self, track: TrackInfo) -> Lyrics | None:
         if not track.key:
             return None

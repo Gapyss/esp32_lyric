@@ -41,6 +41,9 @@ jobs:
               lines = block.strip().splitlines()
               msg = "%0A".join(line.replace("::", ": :") for line in lines[:30])
               print(f"::error title={lines[0][:120]}::{msg}")
+          failed = re.findall(r"^(?:FAIL|ERROR): (\S+ \([^)]*\))", log, re.M)
+          if failed:
+              print(f"::error title={len(failed)} failing tests::" + "%0A".join(failed))
           if "Ran " not in log:
               print("::error title=unittest did not finish::" + "%0A".join(log.splitlines()[-30:]))
           PY

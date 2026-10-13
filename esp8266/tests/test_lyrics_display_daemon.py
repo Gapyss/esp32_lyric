@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import io
 import importlib.util
 import json
@@ -45,6 +46,28 @@ from esp8266_lyrics_display_daemon import (  # noqa: E402
     parse_lrc_with_syllables,
 )
 
+
+
+@contextlib.contextmanager
+def temp_dir():
+    """A TemporaryDirectory that first closes every LyricsStore opened inside it.
+
+    Windows refuses to delete a SQLite file that still has an open connection, so
+    without this every store test fails at cleanup there (WinError 32).
+    """
+    opened: list[LyricsStore] = []
+    real_init = LyricsStore.__init__
+
+    def tracking_init(self: LyricsStore, *args: object, **kwargs: object) -> None:
+        real_init(self, *args, **kwargs)
+        opened.append(self)
+
+    with tempfile.TemporaryDirectory() as tmpdir, mock.patch.object(LyricsStore, "__init__", tracking_init):
+        try:
+            yield tmpdir
+        finally:
+            for store in opened:
+                store.close()
 
 class FakeWriter:
     def __init__(self) -> None:
@@ -130,7 +153,7 @@ def parse_frame_envelope(payload: bytes) -> dict[str, object]:
 
 class LyricsStoreTests(unittest.TestCase):
     def test_store_can_be_used_from_worker_thread(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with temp_dir() as tmpdir:
             store = LyricsStore(Path(tmpdir) / "lyrics.sqlite3")
             track = TrackInfo(video_id="video-1", title="Song", artist="Artist")
             store.save_lrclib(track, Lyrics(plain=["line one"], resolved=True))
@@ -142,7 +165,7 @@ class LyricsStoreTests(unittest.TestCase):
         self.assertTrue(result.resolved)
 
     def test_store_reads_legacy_clawdmeter_cache_exact_key(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with temp_dir() as tmpdir:
             store = LyricsStore(Path(tmpdir) / "lyrics.sqlite3")
             store.conn.execute(
                 "CREATE TABLE lyrics_cache ("
@@ -166,7 +189,7 @@ class LyricsStoreTests(unittest.TestCase):
         self.assertTrue(result.resolved)
 
     def test_store_reads_legacy_clawdmeter_cache_by_title_and_duration(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with temp_dir() as tmpdir:
             store = LyricsStore(Path(tmpdir) / "lyrics.sqlite3")
             store.conn.execute(
                 "CREATE TABLE lyrics_cache ("
@@ -208,7 +231,7 @@ class LyricsStoreTests(unittest.TestCase):
             daemon = LyricsDisplayDaemon(store, FallbackFrameRenderer())
             return await asyncio.to_thread(daemon._resolve_track_sync, track)
 
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with temp_dir() as tmpdir:
             store = LyricsStore(Path(tmpdir) / "lyrics.sqlite3")
             track = TrackInfo(video_id="video-1", title="Song", artist="Artist")
             original_fetch = lyrics_display_daemon.fetch_lrclib
@@ -232,7 +255,7 @@ class LyricsStoreTests(unittest.TestCase):
             await daemon.resolve_track(track)
             return daemon
 
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with temp_dir() as tmpdir:
             store = LyricsStore(Path(tmpdir) / "lyrics.sqlite3")
             track = TrackInfo(video_id="video-1", title="Song", artist="Artist")
             original_fetch = lyrics_display_daemon.fetch_lrclib
@@ -273,7 +296,7 @@ class LyricsStoreTests(unittest.TestCase):
             await asyncio.gather(*daemon._background_tasks, return_exceptions=True)
             return daemon
 
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with temp_dir() as tmpdir:
             store = LyricsStore(Path(tmpdir) / "lyrics.sqlite3")
             original_fetch = lyrics_display_daemon.fetch_lrclib
             lyrics_display_daemon.fetch_lrclib = fake_fetch
@@ -290,7 +313,7 @@ class LyricsStoreTests(unittest.TestCase):
         self.assertEqual(daemon.state.lyrics.error, "")
 
     def test_negative_cache_row_is_resolved_without_lines(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with temp_dir() as tmpdir:
             store = LyricsStore(Path(tmpdir) / "lyrics.sqlite3")
             track = TrackInfo(video_id="video-1", title="Song", artist="Artist")
             store.save_lrclib(track, Lyrics(resolved=True))
@@ -303,7 +326,7 @@ class LyricsStoreTests(unittest.TestCase):
         self.assertEqual(cached.synced, [])
 
     def test_clear_cache_can_delete_only_lrclib_rows(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with temp_dir() as tmpdir:
             store = LyricsStore(Path(tmpdir) / "lyrics.sqlite3")
             track = TrackInfo(video_id="video-1", title="Song", artist="Artist")
             store.save_manual(track, Lyrics(plain=["manual"], resolved=True))
@@ -318,7 +341,7 @@ class LyricsStoreTests(unittest.TestCase):
 
     def test_set_track_reads_cache_off_event_loop_thread(self) -> None:
         async def run() -> tuple[int, int]:
-            with tempfile.TemporaryDirectory() as tmpdir:
+            with temp_dir() as tmpdir:
                 store = LyricsStore(Path(tmpdir) / "lyrics.sqlite3")
                 loop_thread = threading.get_ident()
                 cache_thread = 0
@@ -501,7 +524,7 @@ class AppStateTests(unittest.TestCase):
 class ExtensionPlaybackTests(unittest.TestCase):
     def test_now_playing_applies_position_before_intro_decision(self) -> None:
         async def run() -> tuple[float, bool]:
-            with tempfile.TemporaryDirectory() as tmpdir:
+            with temp_dir() as tmpdir:
                 store = LyricsStore(Path(tmpdir) / "lyrics.sqlite3")
                 track = TrackInfo(video_id="video-1")
                 store.save_lrclib(track, Lyrics(resolved=True))
@@ -521,7 +544,7 @@ class ExtensionPlaybackTests(unittest.TestCase):
 
     def test_autoplay_tick_normalizes_cumulative_video_timeline_after_ended(self) -> None:
         async def run() -> tuple[float, float]:
-            with tempfile.TemporaryDirectory() as tmpdir:
+            with temp_dir() as tmpdir:
                 store = LyricsStore(Path(tmpdir) / "lyrics.sqlite3")
                 store.save_lrclib(TrackInfo(video_id="video-1"), Lyrics(resolved=True))
                 store.save_lrclib(TrackInfo(video_id="video-2"), Lyrics(resolved=True))
@@ -557,7 +580,7 @@ class ExtensionPlaybackTests(unittest.TestCase):
 
     def test_per_track_tick_resets_autoplay_offset_without_subtracting_duration(self) -> None:
         async def run() -> tuple[float, float]:
-            with tempfile.TemporaryDirectory() as tmpdir:
+            with temp_dir() as tmpdir:
                 store = LyricsStore(Path(tmpdir) / "lyrics.sqlite3")
                 store.save_lrclib(TrackInfo(video_id="video-1"), Lyrics(resolved=True))
                 store.save_lrclib(TrackInfo(video_id="video-2"), Lyrics(resolved=True))
@@ -594,7 +617,7 @@ class ThemeTests(unittest.TestCase):
 
     def test_set_theme_message_inverts_rendered_frame(self) -> None:
         async def run() -> tuple[bytes, bytes, str]:
-            with tempfile.TemporaryDirectory() as tmpdir:
+            with temp_dir() as tmpdir:
                 store = LyricsStore(Path(tmpdir) / "lyrics.sqlite3")
                 daemon = LyricsDisplayDaemon(store, FallbackFrameRenderer())
                 daemon.state.track = TrackInfo(video_id="video-1", title="Song", artist="Artist", duration_sec=120)
@@ -615,7 +638,7 @@ class ThemeTests(unittest.TestCase):
 
     def test_unknown_theme_value_is_ignored(self) -> None:
         async def run() -> str:
-            with tempfile.TemporaryDirectory() as tmpdir:
+            with temp_dir() as tmpdir:
                 store = LyricsStore(Path(tmpdir) / "lyrics.sqlite3")
                 daemon = LyricsDisplayDaemon(store, FallbackFrameRenderer())
                 await daemon.handle_extension_message(
@@ -897,7 +920,7 @@ class WebSocketConnectionTests(unittest.TestCase):
         kill.assert_not_called()
 
     def test_identity_is_stable_and_private(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with temp_dir() as tmpdir:
             path = Path(tmpdir) / ".g4pys" / "lyrics-identity.json"
             first = load_or_create_identity(path)
             second = load_or_create_identity(path)
@@ -949,7 +972,7 @@ class WebSocketConnectionTests(unittest.TestCase):
             reader.feed_data(masked_client_frame(1, response))
             writer = FakeWriter()
             conn = WebSocketConnection(reader, writer)  # type: ignore[arg-type]
-            with tempfile.TemporaryDirectory() as tmpdir:
+            with temp_dir() as tmpdir:
                 daemon = LyricsDisplayDaemon(
                     LyricsStore(Path(tmpdir) / "lyrics.sqlite3"), FallbackFrameRenderer(), identity=identity
                 )
@@ -1012,7 +1035,7 @@ class WebSocketConnectionTests(unittest.TestCase):
     def test_send_frame_uses_single_binary_envelope(self) -> None:
         async def run() -> list[tuple[int, bytes]]:
             conn = WebSocketConnection(asyncio.StreamReader(), FakeWriter())  # type: ignore[arg-type]
-            with tempfile.TemporaryDirectory() as tmpdir:
+            with temp_dir() as tmpdir:
                 daemon = LyricsDisplayDaemon(LyricsStore(Path(tmpdir) / "lyrics.sqlite3"), FallbackFrameRenderer())
                 await daemon.send_frame(conn, bytes(lyrics_display_daemon.FRAME_BYTES), now=True, swap_in_ms=0)
                 return server_frame_payloads(b"".join(conn.writer.writes))
@@ -1030,7 +1053,7 @@ class WebSocketConnectionTests(unittest.TestCase):
         async def run() -> tuple[list[tuple[int, bytes]], bytes | None]:
             conn = WebSocketConnection(asyncio.StreamReader(), FakeWriter())  # type: ignore[arg-type]
             conn.board_frame_base = b"stale"
-            with tempfile.TemporaryDirectory() as tmpdir:
+            with temp_dir() as tmpdir:
                 daemon = LyricsDisplayDaemon(LyricsStore(Path(tmpdir) / "lyrics.sqlite3"), FallbackFrameRenderer())
                 await daemon.send_current_frame(conn, now=True)
                 return server_frame_payloads(b"".join(conn.writer.writes)), conn.board_frame_base
@@ -1044,7 +1067,7 @@ class WebSocketConnectionTests(unittest.TestCase):
         async def run() -> tuple[list[tuple[int, bytes]], bytes | None, bytes | None]:
             conn = WebSocketConnection(asyncio.StreamReader(), FakeWriter())  # type: ignore[arg-type]
             conn.board_frame_base = b"stale"
-            with tempfile.TemporaryDirectory() as tmpdir:
+            with temp_dir() as tmpdir:
                 daemon = LyricsDisplayDaemon(LyricsStore(Path(tmpdir) / "lyrics.sqlite3"), FallbackFrameRenderer())
                 daemon.boards.add(conn)
                 daemon.last_frame = b"previous"
@@ -1059,7 +1082,7 @@ class WebSocketConnectionTests(unittest.TestCase):
 
     def test_board_handshake_auth_accepts_query_token(self) -> None:
         async def run() -> tuple[bool, bool, bool]:
-            with tempfile.TemporaryDirectory() as tmpdir:
+            with temp_dir() as tmpdir:
                 daemon = LyricsDisplayDaemon(
                     LyricsStore(Path(tmpdir) / "lyrics.sqlite3"),
                     FallbackFrameRenderer(),
@@ -1084,7 +1107,7 @@ class WebSocketConnectionTests(unittest.TestCase):
         (identity set) is covered by test_mutual_authentication_derives_secure_session.
         Guards the two halves -- daemon emit and firmware consume -- against drift."""
         async def run() -> tuple[bytes, list[tuple[int, bytes]]]:
-            with tempfile.TemporaryDirectory() as tmpdir:
+            with temp_dir() as tmpdir:
                 daemon = LyricsDisplayDaemon(
                     LyricsStore(Path(tmpdir) / "lyrics.sqlite3"), FallbackFrameRenderer()
                 )  # no identity -> insecure proto=1, same as `serve --insecure`
@@ -1113,7 +1136,7 @@ class WebSocketConnectionTests(unittest.TestCase):
 
     def test_rgb565_board_gets_color_cover_after_mono_frame(self) -> None:
         async def run() -> list[tuple[int, bytes]]:
-            with tempfile.TemporaryDirectory() as tmpdir:
+            with temp_dir() as tmpdir:
                 daemon = LyricsDisplayDaemon(
                     LyricsStore(Path(tmpdir) / "lyrics.sqlite3"), FallbackFrameRenderer()
                 )
@@ -1142,7 +1165,7 @@ class WebSocketConnectionTests(unittest.TestCase):
 class SchedulerTests(unittest.TestCase):
     def test_album_art_intro_schedules_lyrics_at_five_seconds(self) -> None:
         async def run() -> list[dict[str, object]]:
-            with tempfile.TemporaryDirectory() as tmpdir:
+            with temp_dir() as tmpdir:
                 daemon = LyricsDisplayDaemon(
                     LyricsStore(Path(tmpdir) / "lyrics.sqlite3"), FallbackFrameRenderer()
                 )
@@ -1177,7 +1200,7 @@ class SchedulerTests(unittest.TestCase):
 
     def test_synced_playback_queues_next_line_frame_with_swap_delay(self) -> None:
         async def run() -> list[dict[str, object]]:
-            with tempfile.TemporaryDirectory() as tmpdir:
+            with temp_dir() as tmpdir:
                 daemon = LyricsDisplayDaemon(LyricsStore(Path(tmpdir) / "lyrics.sqlite3"), FallbackFrameRenderer())
                 conn = WebSocketConnection(asyncio.StreamReader(), FakeWriter())  # type: ignore[arg-type]
                 daemon.boards.add(conn)
@@ -1204,7 +1227,7 @@ class SchedulerTests(unittest.TestCase):
 
     def test_paused_synced_playback_does_not_queue_next_line(self) -> None:
         async def run() -> list[dict[str, object]]:
-            with tempfile.TemporaryDirectory() as tmpdir:
+            with temp_dir() as tmpdir:
                 daemon = LyricsDisplayDaemon(LyricsStore(Path(tmpdir) / "lyrics.sqlite3"), FallbackFrameRenderer())
                 conn = WebSocketConnection(asyncio.StreamReader(), FakeWriter())  # type: ignore[arg-type]
                 daemon.boards.add(conn)
@@ -1225,7 +1248,7 @@ class SchedulerTests(unittest.TestCase):
 
     def test_immediate_second_frame_uses_dirty_rect(self) -> None:
         async def run() -> list[tuple[int, bytes]]:
-            with tempfile.TemporaryDirectory() as tmpdir:
+            with temp_dir() as tmpdir:
                 daemon = LyricsDisplayDaemon(LyricsStore(Path(tmpdir) / "lyrics.sqlite3"), FallbackFrameRenderer())
                 conn = WebSocketConnection(asyncio.StreamReader(), FakeWriter())  # type: ignore[arg-type]
                 frame1 = bytes(lyrics_display_daemon.FRAME_BYTES)
@@ -1247,7 +1270,7 @@ class SchedulerTests(unittest.TestCase):
         # re-push (and re-flash) a frame the board already shows. A scheduled
         # frame of the same bytes is still sent (it swaps in later).
         async def run() -> tuple[int, int]:
-            with tempfile.TemporaryDirectory() as tmpdir:
+            with temp_dir() as tmpdir:
                 daemon = LyricsDisplayDaemon(LyricsStore(Path(tmpdir) / "lyrics.sqlite3"), FallbackFrameRenderer())
                 conn = WebSocketConnection(asyncio.StreamReader(), FakeWriter())  # type: ignore[arg-type]
                 frame = bytearray(lyrics_display_daemon.FRAME_BYTES)
@@ -1271,7 +1294,7 @@ class SchedulerTests(unittest.TestCase):
         # next now-frame is sent full and resyncs the board -- otherwise a tight
         # rect against a stale base leaves ghost pixels (e.g. long -> short line).
         async def run() -> tuple[bytes | None, int]:
-            with tempfile.TemporaryDirectory() as tmpdir:
+            with temp_dir() as tmpdir:
                 daemon = LyricsDisplayDaemon(LyricsStore(Path(tmpdir) / "lyrics.sqlite3"), FallbackFrameRenderer())
                 conn = WebSocketConnection(asyncio.StreamReader(), FakeWriter())  # type: ignore[arg-type]
                 conn.board_frame_base = bytes(lyrics_display_daemon.FRAME_BYTES)  # stale pre-swap frame
