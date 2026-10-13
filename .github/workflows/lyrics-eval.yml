@@ -1,0 +1,20 @@
+# Temporary: live comparison of the old resolver and lyrics_search. Delete after reading.
+name: lyrics eval
+on:
+  push:
+    branches: [exp/lyrics-eval]
+jobs:
+  eval:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: python esp8266/tools/compare_lyrics_search.py --tracks esp8266/tools/eval/sample_tracks.json --limit 100 | tee eval.txt
+      - if: always()
+        run: |
+          python - <<'PY'
+          lines = open("eval.txt", encoding="utf-8").read().splitlines()
+          for i in range(0, len(lines), 40):
+              print("::notice title=eval part %d::" % (i // 40 + 1) + "%0A".join(l.replace("::", ": :") for l in lines[i:i+40]))
+          PY
