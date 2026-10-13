@@ -477,11 +477,21 @@ def find_lyrics(
 if __name__ == "__main__":  # quick manual check: python lyrics_search.py "Title" "Artist" [album] [seconds]
     import sys
 
+    # Windows writes redirected stdout in the locale code page (cp1252), which can't hold Thai.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="backslashreplace")  # type: ignore[union-attr]
+        except (AttributeError, ValueError):
+            pass
+
     a = sys.argv[1:]
     if len(a) < 2:
         sys.exit('usage: lyrics_search.py "Title" "Artist" [album] [seconds]')
     t = Track(a[0], a[1], a[2] if len(a) > 2 and a[2] else None, float(a[3]) if len(a) > 3 else None)
-    h = find_lyrics(t)
+    try:
+        h = find_lyrics(t)
+    except LrclibError as e:
+        sys.exit(f"lrclib error ({e.kind}): {e}")
     if not h:
         print("not found")
     else:
