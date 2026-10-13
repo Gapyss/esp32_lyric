@@ -78,6 +78,18 @@ python3 esp8266/daemon/lyrics_search.py "ชื่อเพลง" "ศิลป
 #   ไม่มีอัลบั้ม (MV):  python3 esp8266/daemon/lyrics_search.py "Artist - Song (Official MV)" "ช่อง" "" 262
 ```
 
+## วัดผลกับเพลงจริง
+
+`esp8266/tools/compare_lyrics_search.py` รันทั้ง resolver เก่าและใหม่กับ lrclib.net จริง แล้วสรุปผลเพลงต่อเพลง โดยไม่เขียนลง cache
+
+```bash
+# เพลงที่เคยเปิดจริง (อ่านจาก cache ของ daemon) ล่าสุด 40 เพลง
+python3 esp8266/tools/compare_lyrics_search.py --db ~/.g4pys/lyrics-display.sqlite3 --limit 40
+# Windows
+py -3 esp8266\tools\compare_lyrics_search.py --db "$env:USERPROFILE\.g4pys\lyrics-display.sqlite3"
+```
+ผลแต่ละเพลงแบ่งเป็น `same` (ได้ record เดียวกัน), `new_only` (ตัวใหม่หาเจอฝ่ายเดียว), `old_only` (ตัวใหม่ไม่รับ ถ้าตัวเก่าได้ผิดเพลงจริงก็ถือว่าถูก), `different` (ได้เนื้อทั้งคู่แต่คนละ record ต้องดูเองว่าอันไหนถูก) และ `both_miss`
+
 ## Cache
 
 - cache อยู่ที่ `~/.g4pys/lyrics-display.sqlite3` (เปลี่ยนได้ด้วย `--db`) และ**ใช้ร่วมกับ daemon ฝั่ง ESP32** ซึ่งยังใช้ logic เดิม

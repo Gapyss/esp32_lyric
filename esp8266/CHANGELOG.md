@@ -9,6 +9,7 @@
 - อ่านชื่อ MV แบบ `Artist - Song` และ `Song - Artist` ได้ รองรับคลิปจากช่องค่ายเพลง ถ้ายังไม่เจอจะค้นด้วยชื่อเพลงอย่างเดียวเป็นทางสุดท้าย
 - Log หนึ่งบรรทัดต่อเพลง: `lyrics: <title> -> lrclib #id ... via <query>`
 - `LyricsStore.close()`
+- `tools/compare_lyrics_search.py`: เทียบ resolver เก่ากับใหม่บน lrclib.net จริง ใช้ cache ของคุณหรือไฟล์ JSON ก็ได้
 - CI `.github/workflows/esp8266-tests.yml` รัน test บน macOS และ Windows
 - `CLAUDE.md` บันทึกเงื่อนไขว่าต้องรันได้ทั้ง macOS และ Windows
 
@@ -21,6 +22,7 @@
 - ได้เนื้อของศิลปินอื่นหรือเวอร์ชัน live/remix เพราะความยาวบังเอิญใกล้กัน
 - MV ที่มี intro/outro หาเนื้อไม่เจอ
 - Test บน Windows: ปิด SQLite ก่อนลบไฟล์ชั่วคราว (WinError 32) และข้ามการเช็ค mode `0600` บน Windows
+- Test theme บน Windows เคยพังเป็นบางครั้งเพราะนาฬิกาเดินระหว่างการ render สองครั้ง
 - CLI ของ `lyrics_search` พิมพ์ภาษาไทยลง log ที่ redirect บน Windows (cp1252) ได้
 
 ### Upgrade

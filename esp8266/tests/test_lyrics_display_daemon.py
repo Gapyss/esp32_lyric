@@ -622,7 +622,9 @@ class ThemeTests(unittest.TestCase):
                 daemon = LyricsDisplayDaemon(store, FallbackFrameRenderer())
                 daemon.state.track = TrackInfo(video_id="video-1", title="Song", artist="Artist", duration_sec=120)
 
-                await daemon.handle_extension_message('{"type":"tick","payload":{"positionSec":1}}')
+                # Paused, so the clock can't move the progress bar between the two renders
+                # (it did on a slow Windows runner, and the frames differed by a pixel).
+                await daemon.handle_extension_message('{"type":"tick","payload":{"positionSec":1,"paused":true}}')
                 light_frame = daemon.last_frame
                 await daemon.handle_extension_message(
                     '{"type":"set-theme","payload":{"theme":"dark"}}'
