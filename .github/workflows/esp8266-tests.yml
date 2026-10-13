@@ -47,11 +47,3 @@ jobs:
           if "Ran " not in log:
               print("::error title=unittest did not finish::" + "%0A".join(log.splitlines()[-30:]))
           PY
-      - name: lyrics_search CLI prints Thai to a redirected log
-        shell: bash
-        env:
-          PYTHONIOENCODING: ${{ matrix.os == 'windows-latest' && 'cp1252' || 'utf-8' }}
-        run: |
-          python -c "import sys; sys.path.insert(0, 'esp8266/daemon'); import lyrics_search as m; print(m.parse_title('ทางของฝุ่น [Official MV]').clean)"
-          python esp8266/daemon/lyrics_search.py "" "" > cli.log 2>&1 || true
-          cat cli.log

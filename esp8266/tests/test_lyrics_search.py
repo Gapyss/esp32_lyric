@@ -5,6 +5,8 @@ Run from the repo root: python3 -m unittest discover -s esp8266/tests -t .
 
 import importlib.util
 import json
+import os
+import subprocess
 import sys
 import unittest
 import urllib.parse
@@ -201,6 +203,34 @@ class SearchTests(unittest.TestCase):
 
     def test_blank_input(self):
         self.assertIsNone(find_lyrics(Track("", "Coldplay"), FakeLrclib([])))
+
+
+class CliTests(unittest.TestCase):
+    # Windows writes a redirected stdout in cp1252, which can't hold Thai. Force that
+    # code page on every OS so a missing reconfigure() fails here, not on someone's PC.
+    SCRIPT = (
+        "import json, runpy, sys, urllib.request\n"
+        "class R:\n"
+        "    status = 200\n"
+        "    def __init__(self, b): self.b = b\n"
+        "    def read(self, n=-1): return self.b\n"
+        "    def __enter__(self): return self\n"
+        "    def __exit__(self, *a): pass\n"
+        "rec = [{'id': 1, 'trackName': 'ทางของฝุ่น', 'artistName': 'อะตอม ชนกันต์', 'duration': 245.0,"
+        " 'syncedLyrics': '[00:01.00]ทดสอบ'}]\n"
+        "urllib.request.urlopen = lambda req, timeout=0: R(json.dumps(rec).encode())\n"
+        "sys.argv = ['lyrics_search.py', 'ทางของฝุ่น', 'อะตอม ชนกันต์']\n"
+        "runpy.run_path(sys.argv_path, run_name='__main__')\n"
+    )
+
+    def test_cli_prints_thai_into_a_cp1252_pipe(self):
+        script = self.SCRIPT.replace("sys.argv_path", repr(str(_PATH)))
+        env = dict(os.environ, PYTHONIOENCODING="cp1252")
+        out = subprocess.run([sys.executable, "-c", script], capture_output=True, env=env, timeout=60)
+        self.assertEqual(out.returncode, 0, out.stderr.decode("utf-8", "replace"))
+        text = out.stdout.decode("utf-8")
+        self.assertIn("ทางของฝุ่น", text)
+        self.assertIn("synced=True", text)
 
 
 if __name__ == "__main__":
