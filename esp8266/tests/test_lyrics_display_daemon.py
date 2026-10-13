@@ -927,7 +927,10 @@ class WebSocketConnectionTests(unittest.TestCase):
             mode = stat.S_IMODE(path.stat().st_mode)
 
         self.assertEqual(first, second)
-        self.assertEqual(mode, 0o600)
+        if sys.platform != "win32":
+            # Windows has no POSIX mode bits (chmod only toggles read-only); the file is private
+            # there because it lives in the user's profile, whose ACL already excludes others.
+            self.assertEqual(mode, 0o600)
         self.assertEqual(len(first.token), 64)
 
     def test_sec2_directional_record_rejects_tamper_and_replay(self) -> None:
